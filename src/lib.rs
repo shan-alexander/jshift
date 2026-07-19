@@ -188,13 +188,16 @@ mod tests {
     fn test_delete_key() {
         let mut json = b"{\"a\": 1, \"b\": 2, \"c\": 3}".to_vec();
         delete_key(&mut json, &[], "b").unwrap();
+        // Preceding-comma delete + ws expand: space before removed comma is trimmed.
         assert_eq!(json, b"{\"a\": 1, \"c\": 3}");
 
         delete_key(&mut json, &[], "a").unwrap();
-        assert_eq!(json, b"{ \"c\": 3}");
+        // First-member delete: no leftover space after `{`.
+        assert_eq!(json, b"{\"c\": 3}");
 
         delete_key(&mut json, &[], "c").unwrap();
-        assert_eq!(json, b"{ }");
+        // Sole member: collapses to empty object without interior spaces.
+        assert_eq!(json, b"{}");
     }
 
     #[test]
@@ -204,10 +207,32 @@ mod tests {
         assert_eq!(json, b"[10, 30]");
 
         delete_index(&mut json, &[], 0).unwrap();
-        assert_eq!(json, b"[ 30]");
+        assert_eq!(json, b"[30]");
 
         delete_index(&mut json, &[], 0).unwrap();
-        assert_eq!(json, b"[ ]");
+        assert_eq!(json, b"[]");
+    }
+
+    #[test]
+    fn test_pretty_delete_trims_whitespace() {
+        let mut json = br#"{ "a" : 1 , "b" : 2 }"#.to_vec();
+        delete_key(&mut json, &[], "a").unwrap();
+        assert_eq!(json, br#"{"b" : 2 }"#);
+        delete_key(&mut json, &[], "b").unwrap();
+        assert_eq!(json, br#"{}"#);
+
+        let mut json = br#"[ 1 , 2 , 3 ]"#.to_vec();
+        delete_index(&mut json, &[], 1).unwrap();
+        assert_eq!(json, br#"[ 1, 3 ]"#);
+        delete_index(&mut json, &[], 0).unwrap();
+        assert_eq!(json, br#"[3 ]"#);
+        delete_index(&mut json, &[], 0).unwrap();
+        assert_eq!(json, br#"[]"#);
+
+        // Multiline: no blank-line residue after member drop.
+        let mut json = b"{\n  \"a\": 1,\n  \"b\": 2\n}".to_vec();
+        delete_key(&mut json, &[], "a").unwrap();
+        assert_eq!(json, b"{\"b\": 2\n}");
     }
 
     #[derive(JsonMutatorSchema)]

@@ -396,7 +396,9 @@ fn is_object_empty(json: &[u8], start: usize, end: usize) -> Result<bool, Error>
 
 /// Deletes a key-value pair from a JSON object located at the specified path.
 ///
-/// Automatically adjusts commas surrounding the deleted key-value pair.
+/// Automatically adjusts commas surrounding the deleted key-value pair, then
+/// trims adjacent whitespace so results stay tidy (e.g. `{}` instead of `{ }`,
+/// no leading space after `{` / before `}`).
 ///
 /// # Examples
 /// ```
@@ -436,12 +438,14 @@ pub fn delete_key(json: &mut Vec<u8>, path: &[PathSegment], key: &str) -> Result
         }
     }
 
+    let (delete_start, delete_end) = expand_delete_whitespace(json, delete_start, delete_end);
     delete_range(json, delete_start, delete_end)
 }
 
 /// Deletes an element from a JSON array located at the specified path by its index.
 ///
-/// Automatically adjusts commas surrounding the deleted array element.
+/// Automatically adjusts commas surrounding the deleted array element, then
+/// trims adjacent whitespace (pretty delete — same policy as [`delete_key`]).
 ///
 /// # Examples
 /// ```
@@ -479,7 +483,22 @@ pub fn delete_index(json: &mut Vec<u8>, path: &[PathSegment], index: usize) -> R
         }
     }
 
+    let (delete_start, delete_end) = expand_delete_whitespace(json, delete_start, delete_end);
     delete_range(json, delete_start, delete_end)
+}
+
+/// Expand a structural delete span over adjacent whitespace only.
+///
+/// Leaves braces/brackets and other non-ws tokens untouched. This collapses
+/// leftovers like `{ "k":1}` → `{"k":1}` and `{ }` → `{}` after member removal.
+fn expand_delete_whitespace(json: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start > 0 && matches!(json[start - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        start -= 1;
+    }
+    while end < json.len() && matches!(json[end], b' ' | b'\t' | b'\n' | b'\r') {
+        end += 1;
+    }
+    (start, end)
 }
 
 // --- buffer helpers ---------------------------------------------------------
