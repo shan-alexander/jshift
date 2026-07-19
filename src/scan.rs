@@ -185,40 +185,44 @@ fn find_in_object_offsets(
 
         pos = skip_whitespace(json, pos);
         let val_start = pos;
-        let val_end = skip_value(json, val_start)?;
+        if pos >= json.len() {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF before value",
+            });
+        }
 
         if key == target_key {
-            // We found the matching key!
+            // Matching key: only fully skip the value when this is the leaf segment.
+            // Descending into a huge array/object must not scan its entire body first.
             if path.len() == 1 {
+                let val_end = skip_value(json, val_start)?;
                 return Ok((val_start, val_end));
-            } else {
-                // We need to go deeper
-                match &path[1] {
-                    PathSegment::Key(_) => {
-                        if json[val_start] == b'{' {
-                            return find_in_object_offsets(json, val_start + 1, &path[1..]);
-                        } else {
-                            return Err(Error::TypeMismatch {
-                                expected: "object",
-                                found: "primitive/array",
-                            });
-                        }
+            }
+            match &path[1] {
+                PathSegment::Key(_) => {
+                    if json[val_start] == b'{' {
+                        return find_in_object_offsets(json, val_start + 1, &path[1..]);
                     }
-                    PathSegment::Index(_) => {
-                        if json[val_start] == b'[' {
-                            return find_in_array_offsets(json, val_start + 1, &path[1..]);
-                        } else {
-                            return Err(Error::TypeMismatch {
-                                expected: "array",
-                                found: "primitive/object",
-                            });
-                        }
+                    return Err(Error::TypeMismatch {
+                        expected: "object",
+                        found: "primitive/array",
+                    });
+                }
+                PathSegment::Index(_) => {
+                    if json[val_start] == b'[' {
+                        return find_in_array_offsets(json, val_start + 1, &path[1..]);
                     }
+                    return Err(Error::TypeMismatch {
+                        expected: "array",
+                        found: "primitive/object",
+                    });
                 }
             }
         }
 
-        // Key didn't match, skip this value and look for the next comma ',' or object end '}'
+        // Key didn't match — skip this value and continue scanning siblings.
+        let val_end = skip_value(json, val_start)?;
         pos = val_end;
         pos = skip_whitespace(json, pos);
         if pos >= json.len() {
@@ -290,32 +294,31 @@ fn find_in_array_offsets(
     }
 
     let val_start = pos;
-    let val_end = skip_value(json, val_start)?;
-
     if path.len() == 1 {
-        Ok((val_start, val_end))
-    } else {
-        // Go deeper
-        match &path[1] {
-            PathSegment::Key(_) => {
-                if json[val_start] == b'{' {
-                    find_in_object_offsets(json, val_start + 1, &path[1..])
-                } else {
-                    Err(Error::TypeMismatch {
-                        expected: "object",
-                        found: "primitive/array",
-                    })
-                }
+        let val_end = skip_value(json, val_start)?;
+        return Ok((val_start, val_end));
+    }
+
+    // Descend without scanning the rest of this element when nested paths remain.
+    match &path[1] {
+        PathSegment::Key(_) => {
+            if json[val_start] == b'{' {
+                find_in_object_offsets(json, val_start + 1, &path[1..])
+            } else {
+                Err(Error::TypeMismatch {
+                    expected: "object",
+                    found: "primitive/array",
+                })
             }
-            PathSegment::Index(_) => {
-                if json[val_start] == b'[' {
-                    find_in_array_offsets(json, val_start + 1, &path[1..])
-                } else {
-                    Err(Error::TypeMismatch {
-                        expected: "array",
-                        found: "primitive/object",
-                    })
-                }
+        }
+        PathSegment::Index(_) => {
+            if json[val_start] == b'[' {
+                find_in_array_offsets(json, val_start + 1, &path[1..])
+            } else {
+                Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: "primitive/object",
+                })
             }
         }
     }

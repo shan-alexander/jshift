@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-19
+
+### Fixed
+- Path descent no longer fully `skip_value`s a matching container before walking into
+  it. Looking up `products[0].title` on a multi-hundred-MiB array no longer scans the
+  entire `products` value first (was ~500 ms; now microseconds for early keys).
+
 ## [0.2.1] - 2026-07-19
 
 ### Added

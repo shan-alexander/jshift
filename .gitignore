@@ -4,3 +4,5 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
+benches/*.json
+/benches/*_products*.json
