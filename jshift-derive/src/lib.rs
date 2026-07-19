@@ -37,6 +37,7 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
 
     let mut field_reads = Vec::new();
     let mut mutator_setters = Vec::new();
+    let mut path_statics = Vec::new();
 
     for field in fields {
         let field_name = field.ident.as_ref().ok_or_else(|| {
@@ -45,32 +46,68 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         let field_type = &field.ty;
         let raw_path = get_json_path(field)?;
 
-        if let Err(msg) = validate_path_str(&raw_path) {
-            return Err(syn::Error::new_spanned(
+        let path_segments = parse_path_segments(&raw_path).map_err(|msg| {
+            syn::Error::new_spanned(
                 field,
                 format!("invalid #[json(path = ...)] value `{raw_path}`: {msg}"),
-            ));
-        }
+            )
+        })?;
 
+        let path_const_name = Ident::new(
+            &format!("__JSHIFT_PATH_{}", field_name.to_string().to_uppercase()),
+            field_name.span(),
+        );
+
+        let seg_tokens: Vec<_> = path_segments
+            .iter()
+            .map(|s| match s {
+                DerSegment::Key(k) => quote! { jshift::PathSegment::Key(#k) },
+                DerSegment::Index(i) => quote! { jshift::PathSegment::Index(#i) },
+            })
+            .collect();
+
+        path_statics.push(quote! {
+            const #path_const_name: &'static [jshift::PathSegment<'static>] = &[
+                #(#seg_tokens),*
+            ];
+        });
+
+        let is_option = is_option_type(field_type);
         let setter_name = Ident::new(&format!("set_{}", field_name), field_name.span());
 
-        field_reads.push(quote! {
-            #field_name: {
-                let path = jshift::parse_path(#raw_path);
-                let slice = jshift::find_value(json, &path)?;
-                jshift::FromJsonSlice::from_json_slice(slice)
-                    .ok_or(jshift::Error::TypeMismatch {
-                        expected: stringify!(#field_type),
-                        found: "invalid format",
-                    })?
-            }
-        });
+        if is_option {
+            field_reads.push(quote! {
+                #field_name: {
+                    match jshift::find_value(json, Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => None,
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
+        } else {
+            field_reads.push(quote! {
+                #field_name: {
+                    let slice = jshift::find_value(json, Self::#path_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(slice)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
+                }
+            });
+        }
 
         mutator_setters.push(quote! {
             pub fn #setter_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
                 let bytes = jshift::ToJsonBytes::to_json_bytes(val);
-                let path = jshift::parse_path(#raw_path);
-                jshift::mutate_value(self.json, &path, &bytes)
+                jshift::mutate_value(self.json, #struct_name::#path_const_name, &bytes)
             }
         });
 
@@ -79,8 +116,7 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             mutator_setters.push(quote! {
                 pub fn #append_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
                     let bytes = jshift::ToJsonBytes::to_json_bytes(val);
-                    let path = jshift::parse_path(#raw_path);
-                    jshift::append_to_array(self.json, &path, &bytes)
+                    jshift::append_to_array(self.json, #struct_name::#path_const_name, &bytes)
                 }
             });
         }
@@ -88,6 +124,8 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
 
     Ok(quote! {
         impl #struct_name {
+            #(#path_statics)*
+
             pub fn read_from_json(json: &[u8]) -> Result<Self, jshift::Error> {
                 Ok(Self {
                     #(#field_reads),*
@@ -136,17 +174,30 @@ fn get_json_path(field: &syn::Field) -> Result<String, syn::Error> {
 }
 
 fn is_vec_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return segment.ident == "Vec";
-        }
-    }
-    false
+    type_last_ident(ty).is_some_and(|id| id == "Vec")
 }
 
-/// Mirror of jshift::try_parse_path strict rules (derive cannot depend on jshift).
-fn validate_path_str(s: &str) -> Result<(), &'static str> {
+fn is_option_type(ty: &Type) -> bool {
+    type_last_ident(ty).is_some_and(|id| id == "Option")
+}
+
+fn type_last_ident(ty: &Type) -> Option<&syn::Ident> {
+    if let Type::Path(type_path) = ty {
+        type_path.path.segments.last().map(|s| &s.ident)
+    } else {
+        None
+    }
+}
+
+enum DerSegment {
+    Key(String),
+    Index(usize),
+}
+
+/// Strict path parse for compile-time constants (mirrors `try_parse_path`).
+fn parse_path_segments(s: &str) -> Result<Vec<DerSegment>, &'static str> {
     let mut rest = s;
+    let mut segments = Vec::new();
     while !rest.is_empty() {
         if rest.starts_with('.') {
             rest = &rest[1..];
@@ -162,17 +213,22 @@ fn validate_path_str(s: &str) -> Result<(), &'static str> {
                     if !idx_str.bytes().all(|b| b.is_ascii_digit()) {
                         return Err("non-numeric array index");
                     }
-                    if idx_str.parse::<usize>().is_err() {
-                        return Err("array index out of range for usize");
-                    }
+                    let idx = idx_str
+                        .parse::<usize>()
+                        .map_err(|_| "array index out of range for usize")?;
+                    segments.push(DerSegment::Index(idx));
                     rest = &rest[end_idx + 1..];
                 }
                 None => return Err("unclosed array index bracket '['"),
             }
         } else {
             let end_key = rest.find(['.', '[']).unwrap_or(rest.len());
+            let key = &rest[..end_key];
+            if !key.is_empty() {
+                segments.push(DerSegment::Key(key.to_string()));
+            }
             rest = &rest[end_key..];
         }
     }
-    Ok(())
+    Ok(segments)
 }
