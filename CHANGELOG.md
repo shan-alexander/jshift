@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Indexed benches vs **gjson / sonic-rs / serde_json** (array mid/last + wide object);
+  README documents **opt-in** indexing (no tax on default paths).
+
 ## [0.3.1] - 2026-07-19
 
 ### Added

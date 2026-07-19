@@ -10,7 +10,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use rayon::prelude::*;
-use sonic_rs::{get as sonic_get, pointer};
+use sonic_rs::{get as sonic_get, pointer, JsonValueTrait};
 
 /// ~10MB JSON with `target` **after** a large array (original layout).
 fn generate_large_json_target_last() -> Vec<u8> {
@@ -473,10 +473,15 @@ fn bench_compete_path_engines(c: &mut Criterion) {
     }
 }
 
-/// Structural array side-table vs linear skip (same buffer).
+/// Structural array side-table vs linear skip + peer path engines + serde.
+///
+/// Index build is **opt-in** and timed separately (`index_build_*`). Query benches for
+/// `jshift_indexed_*` assume a prebuilt index (amortized over many random accesses).
 fn bench_indexed_array(c: &mut Criterion) {
     // ~50k small objects — enough to make mid-array skip expensive without multi-second builds.
     let n = 50_000usize;
+    let mid = n / 2;
+    let last = n - 1;
     let mut s = String::from(r#"{"products":["#);
     for i in 0..n {
         if i > 0 {
@@ -486,19 +491,33 @@ fn bench_indexed_array(c: &mut Criterion) {
     }
     s.push_str("]}");
     let json = s.into_bytes();
-    let path_mid_s = format!("products[{}].title", n / 2);
-    let path_last_s = format!("products[{}].title", n - 1);
+    let json_str = std::str::from_utf8(&json).unwrap();
+
+    let path_mid_s = format!("products[{mid}].title");
+    let path_last_s = format!("products[{last}].title");
     let path_mid = jshift::parse_path(&path_mid_s);
     let path_last = jshift::parse_path(&path_last_s);
     let path_first = jshift::parse_path("products[0].title");
 
+    // gjson: products.N.title
+    let gjson_mid = format!("products.{mid}.title");
+    let gjson_last = format!("products.{last}.title");
+
+    // sonic pointer paths
+    let sonic_mid = pointer!["products", mid, "title"];
+    let sonic_last = pointer!["products", last, "title"];
+    let sonic_first = pointer!["products", 0, "title"];
+
     let doc = jshift::IndexedDocument::build(&json, &["products"]).unwrap();
-    let expect_mid = format!("\"item_{}\"", n / 2);
-    let expect_last = format!("\"item_{}\"", n - 1);
+    let expect_mid = format!("\"item_{mid}\"");
+    let expect_last = format!("\"item_{last}\"");
+    let expect_mid_str = format!("item_{mid}");
+    let expect_last_str = format!("item_{last}");
 
     let mut group = c.benchmark_group("Indexed array mid/last find");
     group.sample_size(30);
 
+    // --- mid element ---
     group.bench_function("jshift_linear_mid", |b| {
         b.iter(|| {
             assert_eq!(
@@ -512,6 +531,33 @@ fn bench_indexed_array(c: &mut Criterion) {
             assert_eq!(doc.find(&path_mid).unwrap(), expect_mid.as_bytes());
         })
     });
+    group.bench_function("gjson_mid", |b| {
+        b.iter(|| {
+            assert_eq!(gjson::get(json_str, &gjson_mid).str(), expect_mid_str);
+        })
+    });
+    group.bench_function("sonic_rs_mid", |b| {
+        b.iter(|| {
+            assert_eq!(
+                sonic_get(json.as_slice(), &sonic_mid)
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                expect_mid_str
+            );
+        })
+    });
+    group.bench_function("serde_json_mid", |b| {
+        b.iter(|| {
+            let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(
+                val["products"][mid]["title"].as_str().unwrap(),
+                expect_mid_str
+            );
+        })
+    });
+
+    // --- last element ---
     group.bench_function("jshift_linear_last", |b| {
         b.iter(|| {
             assert_eq!(
@@ -525,6 +571,33 @@ fn bench_indexed_array(c: &mut Criterion) {
             assert_eq!(doc.find(&path_last).unwrap(), expect_last.as_bytes());
         })
     });
+    group.bench_function("gjson_last", |b| {
+        b.iter(|| {
+            assert_eq!(gjson::get(json_str, &gjson_last).str(), expect_last_str);
+        })
+    });
+    group.bench_function("sonic_rs_last", |b| {
+        b.iter(|| {
+            assert_eq!(
+                sonic_get(json.as_slice(), &sonic_last)
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                expect_last_str
+            );
+        })
+    });
+    group.bench_function("serde_json_last", |b| {
+        b.iter(|| {
+            let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(
+                val["products"][last]["title"].as_str().unwrap(),
+                expect_last_str
+            );
+        })
+    });
+
+    // --- first element (linear is already cheap; index should not regress) ---
     group.bench_function("jshift_linear_first", |b| {
         b.iter(|| {
             assert_eq!(
@@ -538,10 +611,113 @@ fn bench_indexed_array(c: &mut Criterion) {
             assert_eq!(doc.find(&path_first).unwrap(), br#""item_0""#);
         })
     });
-    group.bench_function("index_build_products", |b| {
+    group.bench_function("gjson_first", |b| {
+        b.iter(|| {
+            assert_eq!(gjson::get(json_str, "products.0.title").str(), "item_0");
+        })
+    });
+    group.bench_function("sonic_rs_first", |b| {
+        b.iter(|| {
+            assert_eq!(
+                sonic_get(json.as_slice(), &sonic_first)
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+                "item_0"
+            );
+        })
+    });
+    group.bench_function("serde_json_first", |b| {
+        b.iter(|| {
+            let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(val["products"][0]["title"].as_str().unwrap(), "item_0");
+        })
+    });
+
+    // Opt-in cost: build index only when the caller asks.
+    group.bench_function("jshift_index_build_products", |b| {
         b.iter(|| {
             let d = jshift::IndexedDocument::build(&json, &["products"]).unwrap();
             assert_eq!(d.array_len(&jshift::parse_path("products")).unwrap(), n);
+        })
+    });
+    group.bench_function("jshift_index_build_full_struct_plus_array", |b| {
+        b.iter(|| {
+            let d = jshift::IndexedDocument::build_full(&json, &["products"], &[]).unwrap();
+            assert_eq!(d.array_len(&jshift::parse_path("products")).unwrap(), n);
+            assert!(d.structural().is_some());
+        })
+    });
+
+    group.finish();
+}
+
+/// Object key map vs linear object scan + peers (wide object, many keys).
+fn bench_indexed_object(c: &mut Criterion) {
+    let n_keys = 2_000usize;
+    let mut s = String::from("{");
+    for i in 0..n_keys {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(r#""k{i}":{i}"#));
+    }
+    s.push('}');
+    let json = s.into_bytes();
+    let json_str = std::str::from_utf8(&json).unwrap();
+    let hot = n_keys - 1;
+    let path_s = format!("k{hot}");
+    let path = jshift::parse_path(&path_s);
+    let gjson_path = path_s.clone();
+    let sonic_seg = [path_s.as_str()];
+
+    let mut doc = jshift::IndexedDocument::empty(&json);
+    doc.index_object(&[]).unwrap(); // root object — opt-in
+    let expect = format!("{hot}");
+
+    let mut group = c.benchmark_group("Indexed object key map");
+    group.sample_size(40);
+
+    group.bench_function("jshift_linear_last_key", |b| {
+        b.iter(|| {
+            assert_eq!(
+                jshift::find_value(&json, &path).unwrap(),
+                expect.as_bytes()
+            );
+        })
+    });
+    group.bench_function("jshift_indexed_last_key", |b| {
+        b.iter(|| {
+            assert_eq!(doc.find(&path).unwrap(), expect.as_bytes());
+        })
+    });
+    group.bench_function("gjson_last_key", |b| {
+        b.iter(|| {
+            assert_eq!(gjson::get(json_str, &gjson_path).u64() as usize, hot);
+        })
+    });
+    group.bench_function("sonic_rs_last_key", |b| {
+        b.iter(|| {
+            assert_eq!(
+                sonic_get(json.as_slice(), &sonic_seg)
+                    .unwrap()
+                    .as_u64()
+                    .unwrap() as usize,
+                hot
+            );
+        })
+    });
+    group.bench_function("serde_json_last_key", |b| {
+        b.iter(|| {
+            let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            assert_eq!(val[&path_s].as_u64().unwrap() as usize, hot);
+        })
+    });
+    group.bench_function("jshift_index_build_root_object", |b| {
+        b.iter(|| {
+            let mut d = jshift::IndexedDocument::empty(&json);
+            d.index_object(&[]).unwrap();
+            assert_eq!(d.object_index(&[]).unwrap().len(), n_keys);
         })
     });
 
@@ -558,5 +734,6 @@ criterion_group!(
     bench_fair_mutate_small,
     bench_compete_path_engines,
     bench_indexed_array,
+    bench_indexed_object,
 );
 criterion_main!(benches);

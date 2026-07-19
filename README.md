@@ -38,7 +38,7 @@ A common pattern in platform / integration teams looks like this:
 
 1. **Pull** a large JSON payload from a partner or SaaS API (catalog, events, orders, product dump—often multi‑MB or hundreds of MB).
 2. **Ingest** into an internal service: validate a couple of fields, stamp metadata (`ingested_at`, `source`, `tenant_id`), maybe drop or rewrite a status flag, then forward the body to a queue, object store, or downstream microservice.
-3. **Today’s default stack** is almost always: `HTTP body → serde_json::from_slice` (or equivalent) → walk a full in-memory tree → change one or two fields → `to_vec` / re-serialize → publish. That is simple to write and easy to reason about—but on a **300 MB catalog** you still allocate and walk the entire tree, then allocate and write another ~300 MB of output, even if you only needed `products[0].title` and a top-level `status`. Under bursty multi-worker ingestion, that becomes CPU, memory, and GC (or allocator) pressure, not “JSON is slow because HTTP is slow.”
+3. **Today’s default stack** is almost always: `HTTP body → serde_json::from_slice` (or equivalent) → walk a full in-memory tree → change one or two fields → `to_vec` / re-serialize → publish. That is simple to write and easy to reason about—but on a **300 MB json catalog** you still allocate and walk the entire tree, then allocate and write another ~300 MB of output, even if you only needed `products[0].title` and a top-level `status`. Under bursty multi-worker ingestion, that becomes CPU, memory, and GC (or allocator) pressure, not “JSON is slow because HTTP is slow.”
 4. **With jshift**, the same job is: keep the body as `Vec<u8>` → path-scan only the fields you need → **splice** stamps or flags in place with safe byte rotations → hand the same buffer downstream. Peers that only need a header field never pay for the giant `products` array. Teams that must stay on **safe Rust** (no `unsafe` hot loops) get selective R/W without becoming a second full parser.
 
 Impact in practice: lower p99 on hot ingestion paths, less memory headroom for concurrent workers, and fewer “we only touch three fields but clone the whole document” incidents—while serde remains the right tool when you truly need a full typed domain model.
@@ -142,7 +142,7 @@ If the document is 10MB and you change six bytes near the end, serde still rebui
 | Failure mode on bad input | `Result` / syntax errors along the path | Often best-effort on malformed JSON |
 | Dependency / trust surface | One crate, auditable safe code | Speed via unsafe assumptions |
 
-We **did** steal the *ideas* that transfer cleanly to safe Rust:
+We **do** absorb a few *ideas* that transfer cleanly to safe Rust:
 
 * bulk “squash” of nested containers,
 * tight string skipping,
@@ -152,9 +152,9 @@ We **did** steal the *ideas* that transfer cleanly to safe Rust:
 
 ---
 
-## Performance (illustrative — with marketing multipliers)
+## Performance
 
-**Fresh Criterion run** on this repo’s `benches/json_benchmark.rs` (quiet machine, release, ~6 s measurement windows). Means below are the criterion mid estimate. Re-run before putting numbers on a slide deck—absolute times vary by CPU, but **ratios** are the story.
+**Fresh Criterion run** on this repo’s `benches/json_benchmark.rs` (quiet machine, release, ~6 s measurement windows). Means below are the criterion mid estimate. Re-run before putting numbers on a slide deck, the absolute times vary by CPU, but **ratios** are the story.
 
 **Legend**
 
@@ -172,7 +172,7 @@ We **did** steal the *ideas* that transfer cleanly to safe Rust:
 | **Small ~1KB** top-level key | ~39 ns | ~89 ns | ~96 ns | ~6.1 µs | **~160× faster** | **~2.3× faster** | **~2.5× faster** |
 | **Small ~1KB** nested `meta.ver` | ~80 ns | ~143 ns | ~153 ns | ~6.4 µs | **~80× faster** | **~1.8× faster** | **~1.9× faster** |
 
-**One-liner:** *On selective finds, jshift is typically **~20×–millions×** faster than full `serde_json` parse, and on most shapes here **~2×** faster than gjson/sonic—while remaining 100% safe Rust; gjson can still win pure “skip a giant trailing array” finds (~2×).*
+**Interpretation:** *On selective finds, jshift is typically **~20×–millions×** faster than full `serde_json` parse, and on most shapes here **~2×** faster than gjson/sonic—while remaining 100% safe Rust; gjson can still win pure “skip a giant trailing array” finds (~2×).*
 
 Yes, the key-first row looks absurd—that is the point. Serde still parses the entire multi‑megabyte document. jshift matches the first key and stops.
 
@@ -189,7 +189,7 @@ Yes, the key-first row looks absurd—that is the point. Serde still parses the 
 | **Key-last ~10MB** (same-length overwrite) | ~11.3 ms | ~198 ms | **~18× faster** |
 | **Small ~1KB** | ~76 ns | ~7.3 µs | **~95× faster** |
 
-**One-liner:** *Selective in-place mutate is where jshift shines—about **~18×** (large) to **~100×** (small) versus “parse whole tree, change one field, re-serialize.”*
+**Interpretation:** *Selective in-place mutate is where jshift shines—about **~18×** (large) to **~100×** (small) versus “parse whole tree, change one field, re-serialize.”*
 
 This is the “gateway / JSONL cleaner / feature-flag rewrite” workload: change a field, keep shipping the rest of the bytes.
 
@@ -205,7 +205,7 @@ Same model for every engine: **eight workers**, each extracts `target` from a **
 | jshift ×8 | ~20.1 ms | **~22× faster** | ~2.0× slower |
 | serde_json ×8 | ~442 ms | 1× | — |
 
-**One-liner:** *Under 8-way key-last load, jshift is still **~22×** faster than parallel full parses; gjson leads pure read (~2×) on this shape.*
+**Interpretation:** *Under 8-way key-last load, jshift is still **~22×** faster than parallel full parses; gjson leads pure read (~2×) on this shape.*
 
 #### Key-first ~10MB (early exit)
 
@@ -215,7 +215,7 @@ Same model for every engine: **eight workers**, each extracts `target` from a **
 | gjson ×8 | ~19.1 µs | **~21,000× faster** | 1× |
 | serde_json ×8 | ~404 ms | 1× | — |
 
-**One-liner:** *When the hot field is near the front—the common API case—eight workers finish in **~19 µs** with jshift vs **~400 ms** of full re-parses (**~22,000×**).*
+**Interpretation:** *When the hot field is near the front—the common API case—eight workers finish in **~19 µs** with jshift vs serde's **~400 ms** of full re-parses (ie jshift is **~22,000×** faster than serde).*
 
 ```bash
 # Full suite
@@ -228,56 +228,76 @@ cargo bench --bench json_benchmark -- "Compete Find"
 cargo bench --bench json_benchmark -- "JSON Concurrent"
 ```
 
-Large optional real-world fixtures (100MB+) belong **outside** crates.io and preferably outside this git history—see [benches/README.md](benches/README.md).
-
-These numbers are not a claim that jshift is always fastest for every JSON task. For full typed deserialization and schema validation of entire documents, use serde.
+These numbers are not a claim that jshift is always fastest for every JSON task. Serde, gjson, and other crates still have purpose.
 
 ---
 
 
-### Structural indexing (0.3) — mid-array access
+### Structural indexing — opt-in mid-array / wide-object access
 
-Linear path scans must `skip_value` every sibling before `products[12500]`. That is correct and fine for streaming “touch once” work; it is wrong for **random / multi-query** access into huge arrays.
+**Indexing is never forced.** Default APIs (`find_value`, `mutate_value`, `read_from_json`, …) do **not** build indexes and pay **no** index tax. You only build metadata when you call `IndexedDocument::build`, `index_array`, `index_object`, `index_structural`, `indexed_document()`, or `read_from_json_indexed()`.
 
-**jshift 0.3+** adds **safe** structural indexing (not a full simdjson DOM): array
-side-tables, optional Stage-1 structural lists, object key maps, and derive auto-index:
+Linear path scans must `skip_value` every sibling before `products[12500]`. That is correct and fine for streaming “touch once” work; it is wrong for **random / multi-query** access into huge arrays. Structural indexing is the lever for the second case.
+
+**jshift 0.3+** adds **safe** structural indexing (not a full simdjson DOM): array side-tables, optional Stage-1 structural lists, object key maps, and derive helpers that *offer* auto-index without changing the default path.
 
 ```rust
-use jshift::{IndexedDocument, parse_path};
+use jshift::{IndexedDocument, parse_path, find_value};
 
+// Default path — no index, no build cost:
+let _ = find_value(&json, &parse_path("status"));
+
+// Opt-in: pay build once, then many random hops:
 let doc = IndexedDocument::build(&json, &["products"])?;
-// O(1) jump to element 12500, then local object scan for `title`
 let title = doc.find(&parse_path("products[12500].title"))?;
-
-doc.for_each_element(&parse_path("products"), |i, elem| {
-    // elem is a zero-copy slice of products[i]
-    let _ = (i, elem);
-    Ok(())
-})?;
 ```
 
-| Phase | Cost class |
-| :--- | :--- |
-| `IndexedDocument::build` for one array | One linear pass (similar to a full walk of that array) |
-| `doc.find(products[i].…)` after index | **O(1)** to element start + small local scan |
-| Unindexed `find_value(products[i].…)` | **O(i)** sibling skips |
+| Phase | Cost class | When you pay |
+| :--- | :--- | :--- |
+| Default `find_value` / `read_from_json` | Same as always | **Never** builds an index |
+| `IndexedDocument::build` / `index_*` | One linear pass over chosen arrays/objects | **Only if you call it** |
+| `doc.find(products[i].…)` after index | **O(1)** jump + small local scan | After opt-in build |
+| Unindexed `find_value(products[i].…)` | **O(i)** sibling skips | Default |
 
-**Illustrative (50k small products, mid element, quiet Criterion run):** linear `find_value` ~1.1 ms vs indexed `doc.find` ~71 ns — about **~15,000×** for that hop. Index build ~4.4 ms once, then many cheap random accesses.
+#### Compete: mid/last array element (50k products, quiet Criterion)
+
+Prebuilt jshift index vs peers on the **same** buffer (index build timed separately).
+
+| Access | jshift **indexed** | jshift linear | gjson | sonic-rs | serde_json | **indexed vs serde** | **indexed vs gjson** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Mid** `products[25000].title` | **~76 ns** | ~1.02 ms | ~974 µs | ~2.42 ms | ~52.9 ms | **~700,000×** | **~13,000×** |
+| **Last** `products[49999].title` | **~76 ns** | ~2.06 ms | ~1.98 ms | ~4.81 ms | ~52.7 ms | **~690,000×** | **~26,000×** |
+| **First** `products[0].title` | **~68 ns** | ~83 ns | ~202 ns | ~160 ns | ~53.1 ms | **~780,000×** | **~3×** |
+
+**One-liner:** *With an opt-in array index, mid/last element hops are **~10⁴–10⁶×** faster than full parse and **~10³–10⁴×** faster than linear path engines that must walk siblings—while default jshift paths stay zero-overhead if you never build an index.*
+
+| Index build (opt-in, once) | Mean |
+| :--- | ---: |
+| Array side-table `products` only | ~4.3 ms |
+| Stage-1 structural + array | ~8.5 ms |
+
+#### Compete: wide object last key (2 000 keys at root)
+
+| Access | jshift **key map** | jshift linear | gjson | sonic-rs | serde_json | **map vs serde** | **map vs gjson** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Last key `k1999` | **~47 ns** | ~52.6 µs | ~49.4 µs | ~98.7 µs | ~554 µs | **~12,000×** | **~1,050×** |
+| Build root object map (once) | ~328 µs | — | — | — | — | — | — |
+
+**One-liner:** *Object key maps are also opt-in: pay ~0.3 ms once on a 2k-key object, then last-key lookup at **~47 ns** instead of tens of microseconds of linear scan.*
 
 Indexes bind to a fixed byte snapshot. After in-place mutate/delete, **rebuild** (or drop) the index. Best ETL pattern: **index → many reads / project → write a new buffer → optional reindex**.
 
-This stays `forbid(unsafe_code)`: `Vec<u32>` offsets, `HashMap` key tables, Stage-1
-structural lists, and existing safe cursors.
+This stays `forbid(unsafe_code)`: `Vec<u32>` offsets, `HashMap` key tables, Stage-1 structural lists, and existing safe cursors.
 
-| Layer | API | Helps |
-| :--- | :--- | :--- |
-| Array side-table | `index_array` / `build` | `products[i].field` mid/last access |
-| Object key map | `index_object` | wide roots / hot config objects |
-| Stage-1 structurals | `index_structural` | faster container skip while building tables |
-| Derive | `indexed_document` / `read_from_json_indexed` | auto-index array prefixes from schema paths |
+| Layer | API | Helps | Forced? |
+| :--- | :--- | :--- | :--- |
+| Array side-table | `index_array` / `build` | `products[i].field` mid/last | **No** |
+| Object key map | `index_object` | wide roots / hot config | **No** |
+| Stage-1 structurals | `index_structural` | faster container skip while building tables | **No** |
+| Derive | `indexed_document` / `read_from_json_indexed` | auto-index array prefixes when *you* call it | **No** (`read_from_json` unchanged) |
 
 ```bash
-cargo bench --bench json_benchmark -- "Indexed array"
+cargo bench --bench json_benchmark -- "Indexed"
 ```
 
 

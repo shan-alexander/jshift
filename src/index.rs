@@ -1,5 +1,10 @@
 //! Structural indexing for fast path navigation (safe Rust).
 //!
+//! **Opt-in only:** default [`crate::find_value`] / mutate APIs never build an index.
+//! Call [`IndexedDocument::build`], [`IndexedDocument::index_array`],
+//! [`IndexedDocument::index_object`], or derive helpers like `indexed_document()` when
+//! you want to pay a one-time scan for many random hops.
+//!
 //! This is **not** a full simdjson-style DOM. It builds read-only metadata that
 //! accelerates jshift's own job: path finds and bulk iteration.
 //!
