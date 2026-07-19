@@ -271,6 +271,112 @@ pub fn upsert_object_key(
     Ok(())
 }
 
+/// Upsert `new_value` at `path`, creating missing **object** parents as `{}`.
+///
+/// - If the full path already exists, behaves like [`mutate_value`].
+/// - Intermediate segments must be object keys ([`PathSegment::Key`]); array indexes
+///   are only allowed as the **final** segment (and the parent array must already exist).
+/// - Root document must be an object when creating top-level keys (`{}` is fine).
+///
+/// # Examples
+/// ```
+/// use jshift::{upsert_at_path, parse_path, find_value};
+///
+/// let mut json = b"{}".to_vec();
+/// upsert_at_path(&mut json, &parse_path("a.b.c"), b"1").unwrap();
+/// assert_eq!(find_value(&json, &parse_path("a.b.c")).unwrap(), b"1");
+/// ```
+pub fn upsert_at_path(
+    json: &mut Vec<u8>,
+    path: &[PathSegment],
+    new_value: &[u8],
+) -> Result<(), Error> {
+    if path.is_empty() {
+        return mutate_value(json, path, new_value);
+    }
+    if new_value.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "Upsert value must not be empty",
+        });
+    }
+
+    // Already present → plain mutate.
+    if find_value_offsets(json, path).is_ok() {
+        return mutate_value(json, path, new_value);
+    }
+
+    // Ensure each prefix exists and has the container type required by the next segment.
+    for i in 0..path.len() - 1 {
+        let prefix = &path[..=i];
+        let next = &path[i + 1];
+        match find_value_offsets(json, prefix) {
+            Ok((start, _end)) => match next {
+                PathSegment::Key(_) => {
+                    if byte_at(json, start)? != b'{' {
+                        return Err(Error::TypeMismatch {
+                            expected: "object",
+                            found: "primitive/array",
+                        });
+                    }
+                }
+                PathSegment::Index(_) => {
+                    if byte_at(json, start)? != b'[' {
+                        return Err(Error::TypeMismatch {
+                            expected: "array",
+                            found: "primitive/object",
+                        });
+                    }
+                }
+            },
+            Err(Error::PathNotFound) => {
+                // Only auto-create object parents for a following key.
+                let PathSegment::Key(k) = &path[i] else {
+                    return Err(Error::InvalidPath {
+                        msg: "upsert_at_path cannot create missing array indexes",
+                    });
+                };
+                match next {
+                    PathSegment::Key(_) => {
+                        upsert_object_key(json, &path[..i], k, b"{}")?;
+                    }
+                    PathSegment::Index(_) => {
+                        return Err(Error::InvalidPath {
+                            msg: "upsert_at_path cannot create array parents; only object keys",
+                        });
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let parent = &path[..path.len() - 1];
+    match &path[path.len() - 1] {
+        PathSegment::Key(k) => upsert_object_key(json, parent, k, new_value),
+        PathSegment::Index(idx) => {
+            // Parent array must already exist; only in-range mutate or append if idx == len.
+            let (start, _end) = find_value_offsets(json, parent)?;
+            if byte_at(json, start)? != b'[' {
+                return Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: "primitive/object",
+                });
+            }
+            let len = array_len(json, parent)?;
+            if *idx < len {
+                let mut full = parent.to_vec();
+                full.push(PathSegment::Index(*idx));
+                mutate_value(json, &full, new_value)
+            } else if *idx == len {
+                append_to_array(json, parent, new_value)
+            } else {
+                Err(Error::IndexOutOfBounds { index: *idx })
+            }
+        }
+    }
+}
+
 fn is_object_empty(json: &[u8], start: usize, end: usize) -> Result<bool, Error> {
     if start + 1 >= end {
         return Err(Error::InvalidJsonSyntax {
