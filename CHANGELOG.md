@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `delete_key` / `delete_index` pretty-delete: expand the removed span over adjacent
   whitespace so empties become `{}` / `[]` and first-member deletes do not leave a
   leading space after `{` / `[`.
+- Faster container skip in `skip_value` (gjson-style 8-byte unroll + char class table;
+  still `forbid(unsafe_code)`). Improves key-after-large-array finds.
+- Concurrent bench compares jshift / gjson / serde_json (8 independent workers each
+  re-extract `target` — serde re-parses per worker).
 
 ## [0.2.0] - 2026-07-19
 
