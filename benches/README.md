@@ -12,6 +12,25 @@ Criterion builds multi-MB synthetic documents in memory. No huge files are requi
 
 ## Optional real-world fixtures (local only)
 
+### TeeFury Shopify catalog (projection integration tests)
+
+```bash
+./scripts/fetch_teefury.sh 4   # pages 1..4 → benches/data/teefury_products_p*.json
+cargo test --test teefury_project -- --nocapture
+```
+
+Fixtures are gitignored. Without them, `teefury_project` tests **skip** (CI stays green offline).
+
+Example measured on a quiet machine (live API, sizes vary):
+
+| Workload | Input | Output | Notes |
+| :--- | ---: | ---: | :--- |
+| Path keep-list (variants/images/ids) | ~386 KiB p1 | ~73 KiB (~19%) | nested `products[]` wrapper kept |
+| JMESPath listing cards | ~386 KiB p1 | ~7.6 KiB | `products[*].{id,title,handle,price,image}` |
+| JMESPath cards ×4 pages | ~1.9 MiB | ~15 KiB | 120 product cards |
+
+### Other large dumps
+
 Drop large files under:
 
 ```text

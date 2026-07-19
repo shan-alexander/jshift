@@ -8,11 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Field projection:** `project`, `project_paths`, `project_into`, `project_write`,
-  `ProjectPlan`, `SelectExpr` AST, `parse_project_path` (`[]` / `[*]` wildcards),
-  styles (`Compact`, `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
+- **Field projection:** `project`, `project_paths`, `project_jmespath`, `project_into`,
+  `project_write`, `ProjectPlan`, `SelectExpr` AST (`Field`, multi-select hash/list,
+  pipe, flatten, slices, literals), `parse_project_path` / `parse_jmespath_expr`,
+  styles (`Compact`, richer `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
   Derive / `JsonView`: `schema_project_plan`, `project_json` / `project_bytes`.
-  Architecture reserved for future JMESPath, transforms, richer whitespace fidelity.
+- **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
+  (gitignored fixtures under `benches/data/`; skips when absent).
 
 ## [0.4.0] - 2026-07-19
 

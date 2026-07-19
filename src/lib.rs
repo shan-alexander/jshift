@@ -43,7 +43,8 @@
 //! * **Macro-generated schemas:** `#[derive(JsonView)]` / `JsonMutatorSchema`.
 //! * **Shared buffers:** [`SharedDocument`] (`Arc<[u8]>`) for read-heavy fan-out.
 //! * **JSONL helpers:** [`json_lines`], message-at-a-time indexing.
-//! * **Field projection:** [`project`] / [`project_paths`] / [`ProjectPlan`] (keep-list → new JSON).
+//! * **Field projection:** [`project`] / [`project_paths`] / [`project_jmespath`] /
+//!   [`ProjectPlan`] (keep-list + JMESPath subset → new JSON).
 //! * **Projection estimates:** [`estimate_projected_len`] / [`projected_len`].
 //! * **Structural array indexes:** [`IndexedDocument`] side-tables for large arrays.
 //!
@@ -94,18 +95,26 @@
 //! # }
 //! ```
 //!
-//! # Project: keep-list → smaller JSON
+//! # Project: keep-list / JMESPath subset → smaller JSON
 //! ```
-//! use jshift::{project_paths, ProjectPlan, ProjectStyle};
+//! use jshift::{project_jmespath, project_paths, ProjectPlan, ProjectStyle};
 //!
 //! let json = br#"{"id":7,"title":"Hat","images":[1,2,3],"meta":{"x":1}}"#;
 //! let out = project_paths(json, &["id", "title", "meta.x"]).unwrap();
 //! assert_eq!(out, br#"{"id":7,"title":"Hat","meta":{"x":1}}"#);
 //!
-//! // Array wildcards: products[].sku
+//! // Keep-list wildcards preserve ancestor keys:
 //! let catalog = br#"{"products":[{"sku":"A","blob":1},{"sku":"B","blob":2}]}"#;
-//! let cards = project_paths(catalog, &["products[].sku"]).unwrap();
-//! assert_eq!(cards, br#"{"products":[{"sku":"A"},{"sku":"B"}]}"#);
+//! assert_eq!(
+//!     project_paths(catalog, &["products[].sku"]).unwrap(),
+//!     br#"{"products":[{"sku":"A"},{"sku":"B"}]}"#
+//! );
+//!
+//! // JMESPath subset: multi-select hash + rename (result is the projected array):
+//! assert_eq!(
+//!     project_jmespath(catalog, "products[*].{sku: sku}").unwrap(),
+//!     br#"[{"sku":"A"},{"sku":"B"}]"#
+//! );
 //!
 //! let pretty = ProjectPlan::from_paths(&["id"]).unwrap().style(ProjectStyle::Pretty { indent: 2 });
 //! let _ = jshift::project(json, &pretty).unwrap();
@@ -174,9 +183,10 @@ pub use mutate::{
 };
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
-    estimate_projected_len, estimate_values_len, parse_project_path, project, project_into,
-    project_paths, project_write, projected_len, ArraySelect, MissingPolicy, ObjectSelect,
-    ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr,
+    estimate_projected_len, estimate_values_len, parse_jmespath_expr, parse_project_path, project,
+    project_into, project_jmespath, project_paths, project_write, projected_len, ArraySelect,
+    HashField, MissingPolicy, ObjectSelect, ProjectPathSegment, ProjectPlan, ProjectStyle,
+    SelectExpr,
 };
 pub use scan::find_value;
 pub use view::{read_view, write_view, JsonView};
