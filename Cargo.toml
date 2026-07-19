@@ -1,6 +1,6 @@
 [package]
 name = "jshift"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Shan Alexander Newton"]
 description = "Schema-guided, safe in-place JSON path reader and mutator for raw byte buffers."
@@ -11,11 +11,11 @@ documentation = "https://docs.rs/jshift"
 readme = "README.md"
 keywords = ["json", "in-place", "mutator", "parser", "zero-copy"]
 categories = ["parser-implementations", "data-structures"]
-exclude = ["/docs/", "/target/"]
+exclude = ["/docs/", "/target/", "/fuzz/"]
 
 [dependencies]
 memchr = "2.7"
-jshift-derive = { version = "0.1.0", path = "./jshift-derive" }
+jshift-derive = { version = "0.1.1", path = "./jshift-derive" }
 
 [dev-dependencies]
 serde_json = "1.0"
