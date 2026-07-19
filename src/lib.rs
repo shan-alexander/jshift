@@ -429,4 +429,69 @@ mod tests {
             Err(Error::PathNotFound)
         );
     }
+
+    #[test]
+    fn test_empty_buffer_and_empty_payload_are_errors() {
+        let mut empty = Vec::new();
+        assert!(matches!(
+            mutate_value(&mut empty, &[], b"1"),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert!(matches!(
+            append_to_array(&mut empty, &[], b"1"),
+            Err(Error::InvalidJsonSyntax { .. } | Error::TypeMismatch { .. })
+        ));
+        assert!(matches!(
+            upsert_object_key(&mut empty, &[], "a", b"1"),
+            Err(Error::InvalidJsonSyntax { .. } | Error::TypeMismatch { .. })
+        ));
+
+        let mut json = br#"{"a":1}"#.to_vec();
+        assert!(matches!(
+            mutate_value(&mut json, &parse_path("a"), b""),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert!(matches!(
+            append_to_array(&mut json, &parse_path("a"), b""),
+            Err(Error::InvalidJsonSyntax { .. } | Error::TypeMismatch { .. })
+        ));
+        // Empty payload rejected before type checks when path is object root.
+        let mut obj = br#"{}"#.to_vec();
+        assert!(matches!(
+            upsert_object_key(&mut obj, &[], "k", b""),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+    }
+
+    #[test]
+    fn test_unescape_rejects_controls_and_lone_surrogates() {
+        assert_eq!(String::from_json_slice(b"\"\t\""), None); // raw tab
+        assert_eq!(String::from_json_slice(br#""\uDC00""#), None); // lone low surrogate
+        // Surrogate pair for U+1F600 😀
+        assert_eq!(
+            String::from_json_slice(br#""\uD83D\uDE00""#).as_deref(),
+            Some("\u{1F600}")
+        );
+    }
+
+    #[test]
+    fn test_find_on_empty_and_whitespace() {
+        assert!(matches!(
+            find_value(b"", &parse_path("a")),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert!(matches!(
+            find_value(b"   ", &parse_path("a")),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert_eq!(find_value(b"{}", &[]), Ok(&b"{}"[..]));
+    }
+
+    #[test]
+    fn test_escaped_slash_and_quotes_in_strings() {
+        let json = br#"{"p":"a\/b","q":"\\"}"#;
+        assert_eq!(find_value(json, &parse_path("p")), Ok(&br#""a\/b""#[..]));
+        assert_eq!(find_value(json, &parse_path("q")), Ok(&br#""\\""#[..]));
+        assert_eq!(String::from_json_slice(br#""a\/b""#).as_deref(), Some("a/b"));
+    }
 }
