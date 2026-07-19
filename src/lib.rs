@@ -69,15 +69,16 @@ mod path;
 mod scan;
 
 pub use convert::{
-    escape_json_key, escape_json_string, write_json_string, write_json_string_content,
-    FromJsonSlice, ToJsonBytes,
+    escape_json_key, escape_json_string, from_json_string, write_json_string,
+    write_json_string_content, FromJsonSlice, ToJsonBytes,
 };
 pub use error::Error;
 pub use jshift_derive::JsonMutatorSchema;
 pub use mutate::{
-    append_to_array, array_len, delete_index, delete_key, mutate_value, upsert_object_key,
+    append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,
+    upsert_object_key,
 };
-pub use path::{parse_path, PathSegment};
+pub use path::{parse_path, try_parse_path, PathSegment};
 pub use scan::find_value;
 
 #[cfg(test)]
@@ -493,5 +494,148 @@ mod tests {
         assert_eq!(find_value(json, &parse_path("p")), Ok(&br#""a\/b""#[..]));
         assert_eq!(find_value(json, &parse_path("q")), Ok(&br#""\\""#[..]));
         assert_eq!(String::from_json_slice(br#""a\/b""#).as_deref(), Some("a/b"));
+    }
+
+    // --- Wave B / hardening coverage -----------------------------------------
+
+    #[test]
+    fn test_try_parse_path_rejects_bad_segments() {
+        assert!(matches!(
+            try_parse_path("a[x]"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            try_parse_path("a[]"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            try_parse_path("a[1"),
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            try_parse_path("a[1a]"),
+            Err(Error::InvalidPath { .. })
+        ));
+        // Lenient parse_path still drops bad index without error.
+        assert_eq!(
+            parse_path("a[x].b"),
+            vec![PathSegment::Key("a"), PathSegment::Key("b")]
+        );
+        assert_eq!(
+            try_parse_path("a[0].b").unwrap(),
+            vec![
+                PathSegment::Key("a"),
+                PathSegment::Index(0),
+                PathSegment::Key("b")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_delete_key_tracks_forward_key_start_not_reverse_scan() {
+        // Multiple escaped quotes: reverse-scan would stop on the wrong `"`.
+        let mut json = br#"{"a\"b\"c":1,"z":2}"#.to_vec();
+        delete_key(&mut json, &[], r#"a"b"c"#).unwrap();
+        assert_eq!(json, br#"{"z":2}"#);
+
+        let mut json = br#"{"first":0,"x\\\"y":1,"last":2}"#.to_vec();
+        delete_key(&mut json, &[], r#"x\"y"#).unwrap();
+        assert_eq!(
+            find_value(&json, &parse_path("first")),
+            Ok(&b"0"[..])
+        );
+        assert_eq!(find_value(&json, &parse_path("last")), Ok(&b"2"[..]));
+        assert!(find_value(&json, &parse_path(r#"x\\\"y"#)).is_err());
+    }
+
+    #[test]
+    fn test_from_json_string_requires_quotes() {
+        assert_eq!(from_json_string(br#""ok""#).as_deref(), Some("ok"));
+        assert_eq!(from_json_string(b"ok"), None);
+        assert_eq!(from_json_string(br#""a\nb""#).as_deref(), Some("a\nb"));
+    }
+
+    #[test]
+    fn test_mutate_value_checked_sniffs_value() {
+        let mut json = br#"{"n":1,"s":"a"}"#.to_vec();
+        mutate_value_checked(&mut json, &parse_path("n"), b"99").unwrap();
+        mutate_value_checked(&mut json, &parse_path("s"), br#""hi""#).unwrap();
+        assert_eq!(json, br#"{"n":99,"s":"hi"}"#);
+
+        assert!(matches!(
+            mutate_value_checked(&mut json, &parse_path("n"), b"1,2"),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert!(matches!(
+            mutate_value_checked(&mut json, &parse_path("n"), b"{"),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        assert!(matches!(
+            mutate_value_checked(&mut json, &parse_path("n"), b""),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+        // Raw mutate_value still accepts non-JSON garbage (documented contract).
+        mutate_value(&mut json, &parse_path("n"), b"@@@").unwrap();
+        assert!(json.windows(3).any(|w| w == b"@@@"));
+    }
+
+    #[test]
+    fn test_container_delimiter_and_empty_primitive() {
+        // Truncated array span should not panic.
+        let mut bad = br#"{"a":[1,2}"#.to_vec(); // missing ]
+        // find may still locate something depending on skip_value balance — append
+        // must not panic even if structure is wrong.
+        let _ = append_to_array(&mut bad, &parse_path("a"), b"3");
+
+        // Empty primitive after colon.
+        let json = br#"{"a":,"b":1}"#;
+        assert!(matches!(
+            find_value(json, &parse_path("a")),
+            Err(Error::InvalidJsonSyntax { .. })
+        ));
+    }
+
+    #[test]
+    fn test_mismatched_container_on_array_ops() {
+        // Value is a number, not array.
+        let json = br#"{"a":1}"#;
+        assert!(matches!(
+            array_len(json, &parse_path("a")),
+            Err(Error::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_property_safe_ops_keep_serde_json_valid() {
+        fn assert_still_valid(json: &[u8]) {
+            let v: serde_json::Value = serde_json::from_slice(json).unwrap_or_else(|e| {
+                panic!(
+                    "serde_json rejected result after op: {e}; bytes={}",
+                    String::from_utf8_lossy(json)
+                )
+            });
+            let _ = v.is_object() || v.is_array();
+        }
+
+        let mut json = br#"{"a":1,"b":[true,"x"],"c":{"d":null}}"#.to_vec();
+        mutate_value_checked(&mut json, &parse_path("a"), b"2").unwrap();
+        assert_still_valid(&json);
+
+        let mut json = br#"{"a":1,"b":[1,2,3]}"#.to_vec();
+        append_to_array(&mut json, &parse_path("b"), b"4").unwrap();
+        delete_index(&mut json, &parse_path("b"), 0).unwrap();
+        assert_still_valid(&json);
+
+        let mut json = br#"{"k":1}"#.to_vec();
+        upsert_object_key(&mut json, &[], "m", b"true").unwrap();
+        delete_key(&mut json, &[], "k").unwrap();
+        upsert_object_key(&mut json, &[], r#"q"w"#, b"0").unwrap();
+        delete_key(&mut json, &[], r#"q"w"#).unwrap();
+        assert_still_valid(&json);
+
+        let mut json = br#"[0,1,2]"#.to_vec();
+        delete_index(&mut json, &[], 1).unwrap();
+        mutate_value_checked(&mut json, &parse_path("[0]"), b"9").unwrap();
+        assert_still_valid(&json);
     }
 }

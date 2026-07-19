@@ -12,7 +12,10 @@ use crate::scan::{
 /// this function shifts the remaining part of the JSON buffer using an
 /// optimized, safe slice rotation.
 ///
-/// Returns `Ok(())` on success, or `Err(Error)` on failure.
+/// **Contract:** `new_value` is spliced **raw** — jshift does not validate that it is a
+/// well-formed JSON value. Garbage bytes will corrupt the surrounding document. Use
+/// [`mutate_value_checked`] when you want a structural sniff of `new_value`, or
+/// [`crate::ToJsonBytes`] to build values safely.
 ///
 /// # Examples
 /// ```
@@ -32,6 +35,53 @@ pub fn mutate_value(json: &mut Vec<u8>, path: &[PathSegment], new_value: &[u8]) 
     let (start, end) = find_value_offsets(json, path)?;
     validate_span(json, start, end)?;
     splice_range(json, start, end, new_value)
+}
+
+/// Like [`mutate_value`], but requires `new_value` to parse as exactly one complete
+/// JSON value (object, array, string, number, `true`/`false`/`null`) with no trailing
+/// junk after optional whitespace.
+///
+/// This is a **structural sniff**, not full RFC 8259 validation (e.g. number grammar
+/// is not fully checked). It still rejects empty payloads, unclosed containers, and
+/// multi-value garbage such as `1 2` or `{}}`.
+///
+/// # Examples
+/// ```
+/// use jshift::{mutate_value_checked, parse_path, Error};
+///
+/// let mut json = b"{\"n\":1}".to_vec();
+/// mutate_value_checked(&mut json, &parse_path("n"), b"2").unwrap();
+/// assert!(matches!(
+///     mutate_value_checked(&mut json, &parse_path("n"), b"1,2"),
+///     Err(Error::InvalidJsonSyntax { .. })
+/// ));
+/// ```
+pub fn mutate_value_checked(
+    json: &mut Vec<u8>,
+    path: &[PathSegment],
+    new_value: &[u8],
+) -> Result<(), Error> {
+    assert_single_json_value(new_value)?;
+    mutate_value(json, path, new_value)
+}
+
+/// Ensure `bytes` is exactly one complete JSON value (sniff via [`skip_value`]).
+pub(crate) fn assert_single_json_value(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "JSON value must not be empty",
+        });
+    }
+    let end = skip_value(bytes, 0)?;
+    let after = skip_whitespace(bytes, end);
+    if after != bytes.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: after,
+            msg: "Trailing junk after JSON value",
+        });
+    }
+    Ok(())
 }
 
 /// Appends a new value to the end of a JSON array located at the specified path.

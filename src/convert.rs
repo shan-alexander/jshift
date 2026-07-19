@@ -1,6 +1,12 @@
 use crate::scan::{skip_value, skip_whitespace};
 
 /// Trait implemented by types that can be parsed directly from a raw JSON byte slice.
+///
+/// # String decoding
+/// For `String`, a JSON string literal (leading/trailing `"`) is **unescaped**
+/// (`\"`, `\\`, `\n`, `\uXXXX`, surrogate pairs, …). Non-string slices are decoded
+/// as UTF-8 text as-is (useful for numbers and bare tokens). Prefer
+/// [`from_json_string`] when you only want quoted-string semantics.
 pub trait FromJsonSlice: Sized {
     /// Attempts to parse an instance of `Self` from the provided raw JSON byte slice.
     fn from_json_slice(slice: &[u8]) -> Option<Self>;
@@ -14,6 +20,22 @@ impl FromJsonSlice for String {
             std::str::from_utf8(slice).ok().map(String::from)
         }
     }
+}
+
+/// Parse a JSON string literal (including surrounding quotes) into an unescaped `String`.
+///
+/// Returns `None` if `slice` is not a well-formed quoted string (raw controls, bad
+/// escapes, lone surrogates, missing quotes).
+///
+/// # Examples
+/// ```
+/// use jshift::from_json_string;
+///
+/// assert_eq!(from_json_string(br#""say \"hi\"""#).as_deref(), Some(r#"say "hi""#));
+/// assert_eq!(from_json_string(b"not-a-string"), None);
+/// ```
+pub fn from_json_string(slice: &[u8]) -> Option<String> {
+    unescape_json_string_literal(slice)
 }
 
 impl FromJsonSlice for bool {
