@@ -311,6 +311,105 @@ fn bench_fair_mutate_small(c: &mut Criterion) {
     group.finish();
 }
 
+/// Head-to-head path-engine showcase (higher sample count for tighter CIs).
+fn bench_compete_path_engines(c: &mut Criterion) {
+    let last = generate_large_json_target_last();
+    let first = generate_large_json_target_first();
+    let small = generate_small_json();
+    let path = jshift::parse_path("target");
+    let nested = jshift::parse_path("meta.ver");
+    let last_str = std::str::from_utf8(&last).unwrap();
+    let first_str = std::str::from_utf8(&first).unwrap();
+    let small_str = std::str::from_utf8(&small).unwrap();
+    let sonic_target = pointer!["target"];
+    let sonic_nested = pointer!["meta", "ver"];
+
+    // --- key last: must skip ~10MB array ---
+    {
+        let mut group = c.benchmark_group("Compete Find key-last 10MB");
+        group.sample_size(20);
+        group.bench_function("jshift", |b| {
+            b.iter(|| assert_eq!(jshift::find_value(&last, &path).unwrap(), b"123456"))
+        });
+        group.bench_function("gjson", |b| {
+            b.iter(|| assert_eq!(gjson::get(last_str, "target").u64(), 123456))
+        });
+        group.bench_function("sonic_rs", |b| {
+            b.iter(|| {
+                assert_eq!(
+                    sonic_get(last.as_slice(), &sonic_target)
+                        .unwrap()
+                        .as_raw_str(),
+                    "123456"
+                )
+            })
+        });
+        group.finish();
+    }
+
+    // --- key first: early exit ---
+    {
+        let mut group = c.benchmark_group("Compete Find key-first 10MB");
+        group.sample_size(50);
+        group.bench_function("jshift", |b| {
+            b.iter(|| assert_eq!(jshift::find_value(&first, &path).unwrap(), b"123456"))
+        });
+        group.bench_function("gjson", |b| {
+            b.iter(|| assert_eq!(gjson::get(first_str, "target").u64(), 123456))
+        });
+        group.bench_function("sonic_rs", |b| {
+            b.iter(|| {
+                assert_eq!(
+                    sonic_get(first.as_slice(), &sonic_target)
+                        .unwrap()
+                        .as_raw_str(),
+                    "123456"
+                )
+            })
+        });
+        group.finish();
+    }
+
+    // --- small + nested ---
+    {
+        let mut group = c.benchmark_group("Compete Find small+nested");
+        group.sample_size(100);
+        group.bench_function("jshift_top", |b| {
+            b.iter(|| assert_eq!(jshift::find_value(&small, &path).unwrap(), b"123456"))
+        });
+        group.bench_function("gjson_top", |b| {
+            b.iter(|| assert_eq!(gjson::get(small_str, "target").u64(), 123456))
+        });
+        group.bench_function("sonic_top", |b| {
+            b.iter(|| {
+                assert_eq!(
+                    sonic_get(small.as_slice(), &sonic_target)
+                        .unwrap()
+                        .as_raw_str(),
+                    "123456"
+                )
+            })
+        });
+        group.bench_function("jshift_nested", |b| {
+            b.iter(|| assert_eq!(jshift::find_value(&small, &nested).unwrap(), b"1"))
+        });
+        group.bench_function("gjson_nested", |b| {
+            b.iter(|| assert_eq!(gjson::get(small_str, "meta.ver").u64(), 1))
+        });
+        group.bench_function("sonic_nested", |b| {
+            b.iter(|| {
+                assert_eq!(
+                    sonic_get(small.as_slice(), &sonic_nested)
+                        .unwrap()
+                        .as_raw_str(),
+                    "1"
+                )
+            })
+        });
+        group.finish();
+    }
+}
+
 criterion_group!(
     benches,
     bench_find,
@@ -319,5 +418,6 @@ criterion_group!(
     bench_fair_find_key_first,
     bench_fair_find_small,
     bench_fair_mutate_small,
+    bench_compete_path_engines,
 );
 criterion_main!(benches);

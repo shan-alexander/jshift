@@ -343,15 +343,10 @@ pub(crate) fn skip_value(json: &[u8], mut pos: usize) -> Result<usize, Error> {
     }
 
     match json[pos] {
-        b'"' => {
-            let end = find_string_end(json, pos + 1)?;
-            Ok(end + 1)
-        }
-        b'{' => skip_container(json, pos, b'{', b'}', "Unclosed object brace '}'"),
-        b'[' => skip_container(json, pos, b'[', b']', "Unclosed array bracket ']'"),
+        b'"' => skip_string(json, pos),
+        b'{' | b'[' => skip_squash(json, pos),
         _ => {
             // Primitive (number, true, false, null)
-            // Stop at structural JSON characters or whitespace.
             let start = pos;
             while pos < json.len() {
                 match json[pos] {
@@ -359,7 +354,6 @@ pub(crate) fn skip_value(json: &[u8], mut pos: usize) -> Result<usize, Error> {
                     _ => pos += 1,
                 }
             }
-            // Empty primitive (e.g. value starts with `,` or `}`) is invalid.
             if pos == start {
                 return Err(Error::InvalidJsonSyntax {
                     pos: start,
@@ -371,135 +365,190 @@ pub(crate) fn skip_value(json: &[u8], mut pos: usize) -> Result<usize, Error> {
     }
 }
 
-// Structural bytes that must interrupt a bulk container skip (gjson-style).
-// Bit 0: quote or backslash (string boundary / escape)
-// Bit 1: container open `{` or `[`
-// Bit 2: container close `}` or `]`
-const CH_STR: u8 = 1;
-const CH_OPEN: u8 = 2;
-const CH_CLOSE: u8 = 4;
-const CH_ANY: u8 = CH_STR | CH_OPEN | CH_CLOSE;
+/// True for bytes that must interrupt a bulk container/string skip.
+#[inline(always)]
+fn is_squash_stop(ch: u8) -> bool {
+    matches!(ch, b'"' | b'\\' | b'{' | b'}' | b'[' | b']')
+}
 
-static CH_CLASS: [u8; 256] = {
-    let mut t = [0u8; 256];
-    t[b'"' as usize] = CH_STR;
-    t[b'\\' as usize] = CH_STR;
-    t[b'{' as usize] = CH_OPEN;
-    t[b'[' as usize] = CH_OPEN;
-    t[b'}' as usize] = CH_CLOSE;
-    t[b']' as usize] = CH_CLOSE;
-    t
-};
-
-/// Skip a `{...}` or `[...]` value starting at the opening delimiter.
+/// Skip `{...}` / `[...]` with unified nesting depth (gjson `scan_squash`).
 ///
-/// Inspired by gjson `scan_squash`: walk with an 8-byte unrolled hot loop and a
-/// character class table, only handling `"`, open, and close specially. Safe Rust
-/// only (`forbid(unsafe_code)`); bounds proven by the loop condition so LLVM can
-/// elide many checks.
-fn skip_container(
-    json: &[u8],
-    open_pos: usize,
-    open: u8,
-    close: u8,
-    unclosed_msg: &'static str,
-) -> Result<usize, Error> {
+/// Continuous 16-byte unrolled scan keeps the CPU in one tight loop — important when
+/// skipping large arrays of short-string objects (memchr call overhead adds up).
+/// Safe Rust only (`forbid(unsafe_code)`).
+fn skip_squash(json: &[u8], open_pos: usize) -> Result<usize, Error> {
     let mut depth = 1isize;
     let mut i = open_pos + 1;
     let len = json.len();
 
     while depth > 0 {
-        // Fast path: process 8 bytes at a time until a structural class hits.
-        while i + 8 <= len {
-            let mut hit = false;
-            let mut k = 0usize;
-            while k < 8 {
-                let ch = json[i + k];
-                if CH_CLASS[ch as usize] & CH_ANY != 0 {
-                    i += k;
-                    hit = true;
-                    break;
+        // Bulk: advance until a structural stop byte.
+        'bulk: loop {
+            while i + 16 <= len {
+                // Manual unroll helps LLVM keep this in registers.
+                if is_squash_stop(json[i])
+                    || is_squash_stop(json[i + 1])
+                    || is_squash_stop(json[i + 2])
+                    || is_squash_stop(json[i + 3])
+                    || is_squash_stop(json[i + 4])
+                    || is_squash_stop(json[i + 5])
+                    || is_squash_stop(json[i + 6])
+                    || is_squash_stop(json[i + 7])
+                    || is_squash_stop(json[i + 8])
+                    || is_squash_stop(json[i + 9])
+                    || is_squash_stop(json[i + 10])
+                    || is_squash_stop(json[i + 11])
+                    || is_squash_stop(json[i + 12])
+                    || is_squash_stop(json[i + 13])
+                    || is_squash_stop(json[i + 14])
+                    || is_squash_stop(json[i + 15])
+                {
+                    // Step to the first stop in this window.
+                    while !is_squash_stop(json[i]) {
+                        i += 1;
+                    }
+                    break 'bulk;
                 }
-                k += 1;
+                i += 16;
             }
-            if !hit {
-                i += 8;
-                continue;
+            while i < len && !is_squash_stop(json[i]) {
+                i += 1;
             }
-            break;
+            break 'bulk;
         }
 
         if i >= len {
             return Err(Error::InvalidJsonSyntax {
                 pos: i,
-                msg: unclosed_msg,
+                msg: "Unclosed container",
             });
         }
 
-        // Slow path for remaining tail or after a structural hit.
-        let ch = json[i];
-        let class = CH_CLASS[ch as usize];
-        if class == 0 {
-            i += 1;
-            // Drain non-structural bytes one-by-one until next candidate or 8-byte region.
-            while i < len && CH_CLASS[json[i] as usize] == 0 {
+        match json[i] {
+            b'"' => i = skip_string(json, i)?,
+            b'{' | b'[' => {
+                depth += 1;
                 i += 1;
             }
-            continue;
-        }
-
-        if ch == b'"' {
-            i = find_string_end(json, i + 1)? + 1;
-            continue;
-        }
-        if ch == b'\\' {
-            // Outside a string a lone `\` is invalid JSON; skip one byte to stay robust.
-            i += 1;
-            if i < len {
+            b'}' | b']' => {
+                depth -= 1;
                 i += 1;
             }
-            continue;
-        }
-        // Only the matching open/close pair for *this* container type adjusts depth
-        // (same rule as before: array skip ignores `{`/`}`, object skip ignores `[`/`]`).
-        if ch == open {
-            depth += 1;
-            i += 1;
-        } else if ch == close {
-            depth -= 1;
-            i += 1;
-        } else {
-            // Opposite bracket type (e.g. `{` while skipping an array) — ignore.
-            i += 1;
+            b'\\' => {
+                i += 1;
+                if i < len {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
         }
     }
     Ok(i)
 }
 
+/// Skip a JSON string starting at the opening `"`. Returns index after the closer.
+///
+/// gjson-style: unrolled scan for `"` / `\`; on `\`, skip the next byte. Correct for
+/// locating the terminator in valid JSON (including `\\` and `\"`).
+#[inline]
+fn skip_string(json: &[u8], quote_pos: usize) -> Result<usize, Error> {
+    let mut i = quote_pos + 1;
+    let len = json.len();
+    loop {
+        while i + 8 <= len {
+            let c0 = json[i];
+            if c0 == b'"' || c0 == b'\\' {
+                break;
+            }
+            let c1 = json[i + 1];
+            if c1 == b'"' || c1 == b'\\' {
+                i += 1;
+                break;
+            }
+            let c2 = json[i + 2];
+            if c2 == b'"' || c2 == b'\\' {
+                i += 2;
+                break;
+            }
+            let c3 = json[i + 3];
+            if c3 == b'"' || c3 == b'\\' {
+                i += 3;
+                break;
+            }
+            let c4 = json[i + 4];
+            if c4 == b'"' || c4 == b'\\' {
+                i += 4;
+                break;
+            }
+            let c5 = json[i + 5];
+            if c5 == b'"' || c5 == b'\\' {
+                i += 5;
+                break;
+            }
+            let c6 = json[i + 6];
+            if c6 == b'"' || c6 == b'\\' {
+                i += 6;
+                break;
+            }
+            let c7 = json[i + 7];
+            if c7 == b'"' || c7 == b'\\' {
+                i += 7;
+                break;
+            }
+            i += 8;
+        }
+        while i < len && json[i] != b'"' && json[i] != b'\\' {
+            i += 1;
+        }
+        if i >= len {
+            return Err(Error::InvalidJsonSyntax {
+                pos: quote_pos,
+                msg: "Unclosed string literal",
+            });
+        }
+        if json[i] == b'"' {
+            return Ok(i + 1);
+        }
+        // `\` + following byte
+        i += 2;
+        if i > len {
+            return Err(Error::InvalidJsonSyntax {
+                pos: quote_pos,
+                msg: "Unclosed string literal",
+            });
+        }
+    }
+}
+
 /// Finds the end of a JSON string starting *after* the opening double-quote.
 /// Returns the index of the closing double-quote.
+///
+/// Fast path: if the slice up to the next `"` contains no `\`, accept immediately
+/// (common for keys/values without escapes). Otherwise fall back to backslash-parity.
 pub(crate) fn find_string_end(json: &[u8], mut pos: usize) -> Result<usize, Error> {
     while pos < json.len() {
-        // Fast scan for next quote
-        if let Some(next_pos) = memchr(b'"', &json[pos..]) {
-            let found_idx = pos + next_pos;
-            // Quote is escaped iff an odd number of consecutive backslashes precede it.
-            let mut backslashes = 0usize;
-            let mut check = found_idx;
-            while check > 0 && json[check - 1] == b'\\' {
-                backslashes += 1;
-                check -= 1;
-            }
-            if backslashes % 2 == 0 {
-                return Ok(found_idx); // unescaped quote
-            }
-            pos = found_idx + 1; // escaped quote, keep scanning
-        } else {
+        let Some(next_pos) = memchr(b'"', &json[pos..]) else {
             return Err(Error::InvalidJsonSyntax {
                 pos,
                 msg: "Unclosed string literal",
             });
+        };
+        let found_idx = pos + next_pos;
+        // No backslash in this span ⇒ the quote cannot be escaped.
+        if memchr(b'\\', &json[pos..found_idx]).is_none() {
+            return Ok(found_idx);
         }
+        // Escape present: classic odd/even backslash run before the quote.
+        let mut backslashes = 0usize;
+        let mut check = found_idx;
+        while check > 0 && json[check - 1] == b'\\' {
+            backslashes += 1;
+            check -= 1;
+        }
+        if backslashes % 2 == 0 {
+            return Ok(found_idx);
+        }
+        pos = found_idx + 1;
     }
     Err(Error::InvalidJsonSyntax {
         pos,
