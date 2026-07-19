@@ -1,0 +1,36 @@
+[package]
+name = "jshift-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+jshift = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_path"
+path = "fuzz_targets/parse_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mutate_ops"
+path = "fuzz_targets/mutate_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "find_value"
+path = "fuzz_targets/find_value.rs"
+test = false
+doc = false
+bench = false
