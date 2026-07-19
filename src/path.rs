@@ -1,3 +1,5 @@
+use crate::error::Error;
+
 /// Represents a segment in a JSON path (either a string key or a zero-indexed array index).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathSegment<'a> {
@@ -12,7 +14,11 @@ pub enum PathSegment<'a> {
     Index(usize),
 }
 
-/// Parses a dot-and-bracket notation path string into a vector of zero-copy path segments.
+/// Parses a dot-and-bracket notation path string into zero-copy path segments.
+///
+/// This is the **lenient** parser: invalid index brackets (`[x]`, `[]`, unclosed `[`)
+/// are skipped or stop parsing rather than returning an error. Prefer
+/// [`try_parse_path`] when you need to detect bad path strings.
 ///
 /// Rules:
 /// * `.` separates object keys.
@@ -33,7 +39,38 @@ pub enum PathSegment<'a> {
 ///     PathSegment::Key("name")
 /// ]);
 /// ```
-pub fn parse_path(mut s: &str) -> Vec<PathSegment<'_>> {
+pub fn parse_path(s: &str) -> Vec<PathSegment<'_>> {
+    parse_path_inner(s, false).unwrap_or_default()
+}
+
+/// Strict path parser. Returns [`Error::InvalidPath`] for malformed path syntax
+/// instead of silently dropping segments.
+///
+/// Rejects:
+/// * Non-numeric index brackets (`[x]`, `[1a]`, `[]`)
+/// * Unclosed `[`
+/// * Index values that overflow `usize`
+///
+/// Empty key segments from consecutive dots are still skipped (not an error).
+///
+/// # Examples
+/// ```
+/// use jshift::{try_parse_path, PathSegment, Error};
+///
+/// assert_eq!(
+///     try_parse_path("a[0].b").unwrap(),
+///     vec![PathSegment::Key("a"), PathSegment::Index(0), PathSegment::Key("b")]
+/// );
+/// assert!(matches!(
+///     try_parse_path("a[x]"),
+///     Err(Error::InvalidPath { .. })
+/// ));
+/// ```
+pub fn try_parse_path(s: &str) -> Result<Vec<PathSegment<'_>>, Error> {
+    parse_path_inner(s, true)
+}
+
+fn parse_path_inner(mut s: &str, strict: bool) -> Result<Vec<PathSegment<'_>>, Error> {
     let mut segments = Vec::new();
     while !s.is_empty() {
         if s.starts_with('.') {
@@ -47,17 +84,38 @@ pub fn parse_path(mut s: &str) -> Vec<PathSegment<'_>> {
             match s.find(']') {
                 Some(end_idx) => {
                     let idx_str = &s[1..end_idx];
-                    // Accept only non-empty ASCII digit runs so we never emit a segment for
-                    // `[foo]`, `[]`, or `[1x]`.
-                    if !idx_str.is_empty() && idx_str.bytes().all(|b| b.is_ascii_digit()) {
-                        if let Ok(idx) = idx_str.parse::<usize>() {
-                            segments.push(PathSegment::Index(idx));
+                    if idx_str.is_empty() {
+                        if strict {
+                            return Err(Error::InvalidPath {
+                                msg: "Empty array index brackets",
+                            });
+                        }
+                    } else if !idx_str.bytes().all(|b| b.is_ascii_digit()) {
+                        if strict {
+                            return Err(Error::InvalidPath {
+                                msg: "Non-numeric array index",
+                            });
+                        }
+                    } else {
+                        match idx_str.parse::<usize>() {
+                            Ok(idx) => segments.push(PathSegment::Index(idx)),
+                            Err(_) if strict => {
+                                return Err(Error::InvalidPath {
+                                    msg: "Array index out of range for usize",
+                                });
+                            }
+                            Err(_) => {}
                         }
                     }
                     s = &s[end_idx + 1..];
                 }
                 None => {
-                    // Unclosed bracket — stop rather than silently consuming the rest.
+                    if strict {
+                        return Err(Error::InvalidPath {
+                            msg: "Unclosed array index bracket '['",
+                        });
+                    }
+                    // Lenient: stop rather than silently consuming the rest as a key.
                     break;
                 }
             }
@@ -70,5 +128,5 @@ pub fn parse_path(mut s: &str) -> Vec<PathSegment<'_>> {
             s = &s[end_key..];
         }
     }
-    segments
+    Ok(segments)
 }

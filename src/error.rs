@@ -10,6 +10,11 @@ pub enum Error {
         /// Informative message describing the syntax error.
         msg: &'static str,
     },
+    /// The path string could not be parsed (see [`crate::try_parse_path`]).
+    InvalidPath {
+        /// Informative message describing the path error.
+        msg: &'static str,
+    },
     /// The array index is larger than the number of elements in the array.
     IndexOutOfBounds {
         /// The index that was queried.
@@ -31,6 +36,7 @@ impl std::fmt::Display for Error {
             Error::InvalidJsonSyntax { pos, msg } => {
                 write!(f, "Invalid JSON syntax at position {}: {}", pos, msg)
             }
+            Error::InvalidPath { msg } => write!(f, "Invalid JSON path: {}", msg),
             Error::IndexOutOfBounds { index } => {
                 write!(f, "Array index out of bounds: {}", index)
             }
