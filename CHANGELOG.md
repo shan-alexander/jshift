@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/jmespath_compliance.rs` + vendored `tests/fixtures/jmespath/` (tier A
   strict; full suite floors ≥650 pass). CI job runs compliance.
 - **Fuzz:** `fuzz/fuzz_targets/project_jmespath.rs`, `project_paths.rs`.
+- **Projector product APIs:**
+  - Streaming `project_write` via `WriteSink` (no full-output `Vec`)
+  - Exact `projected_len` via `CountingSink` (no retained output)
+  - `project_indexed` for shared `IndexedDocument` snapshots
+  - `Transform` / `TransformPipeline` (KeepPaths, Jmes, Rename, Drop, Inject, Style)
+  - Richer `PreserveSource` for arrays
+  - Derive: `#[json(jmes = "...")]` + `FIELD_JMES` multi-select project plan
 - **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
   (gitignored fixtures under `benches/data/`; skips when absent).
 - **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).

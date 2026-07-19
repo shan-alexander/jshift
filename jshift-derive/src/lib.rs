@@ -58,6 +58,8 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     let mut path_statics = Vec::new();
     let mut write_fields = Vec::new();
     let mut field_path_lits = Vec::new();
+    let mut field_jmes_lits = Vec::new();
+    let mut has_any_jmes = false;
     let mut array_prefixes: BTreeSet<String> = BTreeSet::new();
 
     for field in fields {
@@ -65,8 +67,13 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             syn::Error::new_spanned(field, "JsonMutatorSchema requires named fields")
         })?;
         let field_type = &field.ty;
-        let raw_path = get_json_path(field)?;
+        let (raw_path, jmes_opt) = get_json_attrs(field)?;
         field_path_lits.push(raw_path.clone());
+        let jmes_expr = jmes_opt.clone().unwrap_or_else(|| raw_path.clone());
+        field_jmes_lits.push(jmes_expr.clone());
+        if jmes_opt.is_some() {
+            has_any_jmes = true;
+        }
 
         let path_segments = parse_path_segments(&raw_path).map_err(|msg| {
             syn::Error::new_spanned(
@@ -83,6 +90,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             &format!("__JSHIFT_PATH_{}", field_name.to_string().to_uppercase()),
             field_name.span(),
         );
+        let jmes_const_name = Ident::new(
+            &format!("__JSHIFT_JMES_{}", field_name.to_string().to_uppercase()),
+            field_name.span(),
+        );
 
         let seg_tokens: Vec<_> = path_segments
             .iter()
@@ -96,27 +107,51 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             const #path_const_name: &'static [jshift::PathSegment<'static>] = &[
                 #(#seg_tokens),*
             ];
+            const #jmes_const_name: &'static str = #jmes_expr;
         });
 
         let is_option = is_option_type(field_type);
         let setter_name = Ident::new(&format!("set_{}", field_name), field_name.span());
+        let uses_jmes_read = jmes_opt.is_some();
 
         if is_option {
-            field_reads.push(quote! {
-                #field_name: {
-                    match jshift::find_value(json, Self::#path_const_name) {
-                        Ok(slice) => {
-                            jshift::FromJsonSlice::from_json_slice(slice)
-                                .ok_or(jshift::Error::TypeMismatch {
-                                    expected: stringify!(#field_type),
-                                    found: "invalid format",
-                                })?
+            if uses_jmes_read {
+                field_reads.push(quote! {
+                    #field_name: {
+                        match jshift::project_jmespath(json, Self::#jmes_const_name) {
+                            Ok(bytes) => {
+                                if bytes == b"null" {
+                                    None
+                                } else {
+                                    jshift::FromJsonSlice::from_json_slice(&bytes)
+                                        .ok_or(jshift::Error::TypeMismatch {
+                                            expected: stringify!(#field_type),
+                                            found: "invalid format",
+                                        })?
+                                }
+                            }
+                            Err(jshift::Error::PathNotFound) => None,
+                            Err(e) => return Err(e),
                         }
-                        Err(jshift::Error::PathNotFound) => None,
-                        Err(e) => return Err(e),
                     }
-                }
-            });
+                });
+            } else {
+                field_reads.push(quote! {
+                    #field_name: {
+                        match jshift::find_value(json, Self::#path_const_name) {
+                            Ok(slice) => {
+                                jshift::FromJsonSlice::from_json_slice(slice)
+                                    .ok_or(jshift::Error::TypeMismatch {
+                                        expected: stringify!(#field_type),
+                                        found: "invalid format",
+                                    })?
+                            }
+                            Err(jshift::Error::PathNotFound) => None,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                });
+            }
             field_reads_indexed.push(quote! {
                 #field_name: {
                     match doc.find(Self::#path_const_name) {
@@ -145,6 +180,38 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                         Err(jshift::Error::PathNotFound) => None,
                         Err(e) => return Err(e),
                     }
+                }
+            });
+        } else if uses_jmes_read {
+            field_reads.push(quote! {
+                #field_name: {
+                    let bytes = jshift::project_jmespath(json, Self::#jmes_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(&bytes)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
+                }
+            });
+            // Indexed find still uses path segments when available.
+            field_reads_indexed.push(quote! {
+                #field_name: {
+                    let bytes = jshift::project_jmespath(doc.as_bytes(), Self::#jmes_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(&bytes)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
+                }
+            });
+            field_reads_doc.push(quote! {
+                #field_name: {
+                    let bytes = jshift::project_jmespath(doc.as_bytes(), Self::#jmes_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(&bytes)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
                 }
             });
         } else {
@@ -207,6 +274,34 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
 
     let array_path_lits: Vec<_> = array_prefixes.iter().map(|s| quote! { #s }).collect();
     let field_path_tokens: Vec<_> = field_path_lits.iter().map(|s| quote! { #s }).collect();
+    let field_jmes_tokens: Vec<_> = field_jmes_lits.iter().map(|s| quote! { #s }).collect();
+    let field_names: Vec<_> = fields
+        .iter()
+        .filter_map(|f| f.ident.as_ref())
+        .map(|id| id.to_string())
+        .collect();
+    let field_name_tokens: Vec<_> = field_names.iter().map(|s| quote! { #s }).collect();
+
+    let project_plan_body = if has_any_jmes {
+        quote! {
+            {
+                let mut fields = Vec::new();
+                let names: &[&str] = &[#(#field_name_tokens),*];
+                let exprs: &[&str] = Self::FIELD_JMES;
+                for (name, expr) in names.iter().zip(exprs.iter()) {
+                    let sel = jshift::parse_jmespath_expr(expr)
+                        .expect("FIELD_JMES entries must be valid JMESPath");
+                    fields.push(jshift::HashField::new((*name).to_string(), sel));
+                }
+                jshift::ProjectPlan::from_select(jshift::SelectExpr::MultiSelectHash(fields))
+            }
+        }
+    } else {
+        quote! {
+            jshift::ProjectPlan::from_paths(Self::FIELD_PATHS)
+                .expect("FIELD_PATHS must be valid project paths")
+        }
+    };
 
     Ok(quote! {
         impl #struct_name {
@@ -215,6 +310,13 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             /// All `#[json(path = ...)]` paths for this view (schema surface).
             pub const FIELD_PATHS: &'static [&'static str] = &[
                 #(#field_path_tokens),*
+            ];
+
+            /// Per-field JMESPath (or path fallback) used for schema projection.
+            ///
+            /// Set with `#[json(jmes = "...")]`. When unset, equals the path string.
+            pub const FIELD_JMES: &'static [&'static str] = &[
+                #(#field_jmes_tokens),*
             ];
 
             /// Static array path prefixes inferred from field paths (for auto-index).
@@ -279,15 +381,20 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 jshift::estimate_projected_len(json, Self::FIELD_PATHS)
             }
 
-            /// Keep-list plan for [`jshift::project`] (merged [`Self::FIELD_PATHS`]).
+            /// Schema project plan: keep-list paths, or multi-select hash when any
+            /// field uses `#[json(jmes = "...")]`.
             pub fn schema_project_plan() -> jshift::ProjectPlan {
-                jshift::ProjectPlan::from_paths(Self::FIELD_PATHS)
-                    .expect("FIELD_PATHS must be valid project paths")
+                #project_plan_body
             }
 
-            /// Project a document down to this schema's paths (new buffer).
+            /// Project a document down to this schema (new buffer).
             pub fn project_json(json: &[u8]) -> Result<Vec<u8>, jshift::Error> {
                 jshift::project(json, &Self::schema_project_plan())
+            }
+
+            /// Project using a shared [`jshift::IndexedDocument`] snapshot.
+            pub fn project_indexed(doc: &jshift::IndexedDocument<'_>) -> Result<Vec<u8>, jshift::Error> {
+                jshift::project_indexed(doc, &Self::schema_project_plan())
             }
 
             pub fn mutator(json: &mut Vec<u8>) -> #mutator_name {
@@ -337,8 +444,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     })
 }
 
-fn get_json_path(field: &syn::Field) -> Result<String, syn::Error> {
+/// Returns `(path, optional jmes)`. Path defaults to the field name.
+fn get_json_attrs(field: &syn::Field) -> Result<(String, Option<String>), syn::Error> {
     let mut path_str = None;
+    let mut jmes_str = None;
     for attr in &field.attrs {
         if attr.path().is_ident("json") {
             attr.parse_nested_meta(|meta| {
@@ -347,20 +456,28 @@ fn get_json_path(field: &syn::Field) -> Result<String, syn::Error> {
                     let lit: syn::LitStr = value.parse()?;
                     path_str = Some(lit.value());
                     Ok(())
+                } else if meta.path.is_ident("jmes") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    jmes_str = Some(lit.value());
+                    Ok(())
                 } else {
-                    Err(meta.error("unsupported json attribute; expected `path = \"...\"`"))
+                    Err(meta.error(
+                        "unsupported json attribute; expected `path = \"...\"` or `jmes = \"...\"`",
+                    ))
                 }
             })?;
         }
     }
 
-    Ok(path_str.unwrap_or_else(|| {
+    let path = path_str.unwrap_or_else(|| {
         field
             .ident
             .as_ref()
             .expect("named field")
             .to_string()
-    }))
+    });
+    Ok((path, jmes_str))
 }
 
 fn is_vec_type(ty: &Type) -> bool {

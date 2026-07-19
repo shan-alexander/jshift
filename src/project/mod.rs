@@ -17,20 +17,26 @@ mod emit;
 mod jmespath;
 mod plan;
 mod select;
+mod sink;
+mod transform;
 
 pub use jmespath::{parse_jmespath_expr, parse_project_path, select_from_project_path};
 pub use plan::{MissingPolicy, ProjectPlan, ProjectStyle};
 pub use select::{
     ArraySelect, CmpOp, HashField, ObjectSelect, ProjectPathSegment, SelectExpr,
 };
+pub use sink::{CountingSink, WriteSink};
+pub use transform::{Transform, TransformPipeline};
 
 use std::io::Write;
 
 use crate::error::Error;
+use crate::index::IndexedDocument;
 use crate::path::{parse_path, PathSegment};
 use crate::scan::{find_value, skip_value, skip_whitespace};
 
 use emit::{emit_value, EmitCtx};
+use sink::{CountingSink as CountSink, EmitOut, WriteSink as WSink};
 
 /// Project `json` according to `plan`, returning a new buffer.
 ///
@@ -49,6 +55,42 @@ pub fn project(json: &[u8], plan: &ProjectPlan) -> Result<Vec<u8>, Error> {
 
 /// Project into an existing buffer (appends).
 pub fn project_into(json: &[u8], plan: &ProjectPlan, out: &mut Vec<u8>) -> Result<(), Error> {
+    project_to_sink(json, plan, out)
+}
+
+/// Project using a pre-built [`IndexedDocument`].
+///
+/// Today this is semantically identical to `project(doc.as_bytes(), plan)` but is
+/// the stable entry point for index-aware projection. Keep-list plans that only
+/// need array hops can share one index build across many `project_indexed` calls
+/// on the same snapshot.
+pub fn project_indexed(doc: &IndexedDocument<'_>, plan: &ProjectPlan) -> Result<Vec<u8>, Error> {
+    project(doc.as_bytes(), plan)
+}
+
+/// Stream projection into any [`Write`] without buffering the full output.
+///
+/// Intermediate values (pipes, function args, multi-select field eval) still use
+/// temporary `Vec`s; the **final** document is written incrementally.
+///
+/// Returns the number of bytes written.
+pub fn project_write<W: Write>(json: &[u8], plan: &ProjectPlan, w: W) -> Result<usize, Error> {
+    let mut sink = WSink::new(w);
+    project_to_sink(json, plan, &mut sink)?;
+    Ok(sink.written)
+}
+
+/// Exact projected byte length without retaining the output (counting sink).
+///
+/// Prefer this over allocating a full `Vec` when only capacity / size ratio matters.
+/// Intermediate pipe/function buffers may still allocate.
+pub fn projected_len(json: &[u8], plan: &ProjectPlan) -> Result<usize, Error> {
+    let mut c = CountSink::default();
+    project_to_sink(json, plan, &mut c)?;
+    Ok(c.len)
+}
+
+fn project_to_sink(json: &[u8], plan: &ProjectPlan, out: &mut impl EmitOut) -> Result<(), Error> {
     let start = skip_whitespace(json, 0);
     if start >= json.len() {
         return Err(Error::InvalidJsonSyntax {
@@ -69,21 +111,6 @@ pub fn project_paths(json: &[u8], paths: &[&str]) -> Result<Vec<u8>, Error> {
 /// Convenience: [`ProjectPlan::from_jmespath`] then [`project`].
 pub fn project_jmespath(json: &[u8], expr: &str) -> Result<Vec<u8>, Error> {
     project(json, &ProjectPlan::from_jmespath(expr)?)
-}
-
-/// Project to any [`Write`].
-pub fn project_write<W: Write>(json: &[u8], plan: &ProjectPlan, mut w: W) -> Result<(), Error> {
-    let buf = project(json, plan)?;
-    w.write_all(&buf).map_err(|_| Error::InvalidJsonSyntax {
-        pos: 0,
-        msg: "I/O error while writing projected JSON",
-    })?;
-    Ok(())
-}
-
-/// Exact projected size (runs the projector).
-pub fn projected_len(json: &[u8], plan: &ProjectPlan) -> Result<usize, Error> {
-    project(json, plan).map(|v| v.len())
 }
 
 /// Ballpark capacity hint for flat keep-lists (not exact projector output).
@@ -262,6 +289,64 @@ mod tests {
             project_paths(json, &["user.name", "user.age"]).unwrap(),
             br#"{"user":{"name":"a","age":9}}"#
         );
+    }
+
+    #[test]
+    fn project_write_streams_and_counts() {
+        let json = br#"{"id":1,"title":"x","blob":[1,2,3]}"#;
+        let plan = ProjectPlan::from_paths(&["id", "title"]).unwrap();
+        let mut buf = Vec::new();
+        let n = project_write(json, &plan, &mut buf).unwrap();
+        assert_eq!(n, buf.len());
+        assert_eq!(buf, br#"{"id":1,"title":"x"}"#);
+        assert_eq!(projected_len(json, &plan).unwrap(), n);
+    }
+
+    #[test]
+    fn project_indexed_matches_project() {
+        let json = br#"{"products":[{"id":1},{"id":2}]}"#;
+        let plan = ProjectPlan::from_paths(&["products[].id"]).unwrap();
+        let doc = crate::IndexedDocument::build(json, &["products"]).unwrap();
+        assert_eq!(
+            project_indexed(&doc, &plan).unwrap(),
+            project(json, &plan).unwrap()
+        );
+    }
+
+    #[test]
+    fn transform_pipeline_rename_drop_inject() {
+        use crate::project::transform::{Transform, TransformPipeline};
+        let json = br#"{"id":1,"title":"Hat","noise":true}"#;
+        let out = TransformPipeline::new()
+            .then(Transform::KeepPaths(&["id", "title"]))
+            .then(Transform::Rename {
+                from: "title",
+                to: "name",
+            })
+            .then(Transform::Inject {
+                key: "source",
+                value: br#""api""#,
+            })
+            .then(Transform::Drop("id"))
+            .apply(json)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["name"], "Hat");
+        assert_eq!(v["source"], "api");
+        assert!(v.get("id").is_none());
+        assert!(v.get("noise").is_none());
+    }
+
+    #[test]
+    fn preserve_source_array_spacing() {
+        let json = br#"[ 1 , 2 , 3 ]"#;
+        // Identity array projection via jmes
+        let plan = ProjectPlan::from_jmespath("@")
+            .unwrap()
+            .style(ProjectStyle::PreserveSource);
+        // Full identity copies raw span including spaces
+        let out = project(json, &plan).unwrap();
+        assert_eq!(out, json);
     }
 
     #[test]

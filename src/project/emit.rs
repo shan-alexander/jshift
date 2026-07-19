@@ -6,6 +6,7 @@ use crate::project::plan::{MissingPolicy, ProjectPlan, ProjectStyle};
 use crate::project::select::{
     resolve_index, resolve_slice, ArraySelect, CmpOp, HashField, ObjectSelect, SelectExpr,
 };
+use crate::project::sink::EmitOut;
 use crate::scan::{find_string_end, skip_value, skip_whitespace};
 
 pub(crate) struct EmitCtx<'a> {
@@ -19,11 +20,11 @@ pub(crate) fn emit_value(
     end: usize,
     expr: &SelectExpr,
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
     match expr {
         SelectExpr::Identity | SelectExpr::Current => {
-            out.extend_from_slice(&json[start..end]);
+            out.emit_bytes(&json[start..end])?;
             Ok(())
         }
         SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
@@ -31,19 +32,19 @@ pub(crate) fn emit_value(
             let wire = escape_json_key(key);
             match find_object_value_span(json, start, end, wire.as_bytes()) {
                 Ok((s, e)) => {
-                    out.extend_from_slice(&json[s..e]);
+                    out.emit_bytes(&json[s..e])?;
                     Ok(())
                 }
                 // JMESPath: missing field / non-object → null (when soft policy).
                 Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-                    out.extend_from_slice(b"null");
+                    out.emit_bytes(b"null")?;
                     Ok(())
                 }
                 Err(e) => Err(e),
             }
         }
         SelectExpr::Literal(bytes) => {
-            out.extend_from_slice(bytes);
+            out.emit_bytes(bytes)?;
             Ok(())
         }
         SelectExpr::Object(sel) => emit_object(json, start, end, sel, ctx, out),
@@ -72,12 +73,12 @@ pub(crate) fn emit_value(
             Ok(Some((s, e))) => emit_value(json, s, e, right, ctx, out),
             Ok(None) if soft_null(ctx) => {
                 // Missing intermediate (JMESPath → null).
-                out.extend_from_slice(b"null");
+                out.emit_bytes(b"null")?;
                 Ok(())
             }
             Ok(None) => Err(Error::PathNotFound),
             Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-                out.extend_from_slice(b"null");
+                out.emit_bytes(b"null")?;
                 Ok(())
             }
             Err(e) => Err(e),
@@ -88,11 +89,11 @@ pub(crate) fn emit_value(
             // JMESPath: incomparable types → null (not false).
             match cmp_values(&lv, &rv, *op) {
                 Some(t) => {
-                    out.extend_from_slice(if t { b"true" } else { b"false" });
+                    out.emit_bytes(if t { b"true" } else { b"false" })?;
                     Ok(())
                 }
                 None => {
-                    out.extend_from_slice(b"null");
+                    out.emit_bytes(b"null")?;
                     Ok(())
                 }
             }
@@ -101,7 +102,7 @@ pub(crate) fn emit_value(
             // JMESPath && : if left is falsey return **left value**; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if !is_truthy(&av) {
-                out.extend_from_slice(trim_json(&av));
+                out.emit_bytes(trim_json(&av))?;
                 return Ok(());
             }
             emit_value(json, start, end, b, ctx, out)
@@ -110,14 +111,14 @@ pub(crate) fn emit_value(
             // JMESPath || : if left is truthy return left; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if is_truthy(&av) {
-                out.extend_from_slice(trim_json(&av));
+                out.emit_bytes(trim_json(&av))?;
                 return Ok(());
             }
             emit_value(json, start, end, b, ctx, out)
         }
         SelectExpr::Not(inner) => {
             let v = eval_buf(json, start, end, inner, ctx)?;
-            out.extend_from_slice(if is_truthy(&v) { b"false" } else { b"true" });
+            out.emit_bytes(if is_truthy(&v) { b"false" } else { b"true" })?;
             Ok(())
         }
         SelectExpr::Call { name, args } => emit_call(json, start, end, name, args, ctx, out),
@@ -143,12 +144,12 @@ fn emit_object_projection(
     end: usize,
     each: &SelectExpr,
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
     let (_, members, _) = match collect_object_members(json, start, end) {
         Ok(x) => x,
         Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-            out.extend_from_slice(b"null");
+            out.emit_bytes(b"null")?;
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -170,9 +171,9 @@ fn emit_projection_list(
     spans: Vec<(&[u8], usize, usize)>,
     each: &SelectExpr,
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     let mut first = true;
     for (buf, s, e) in spans {
         let mut piece = Vec::new();
@@ -181,15 +182,15 @@ fn emit_projection_list(
             continue;
         }
         if !first {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        maybe_pretty_newline_indent(ctx, out, true);
+        maybe_pretty_newline_indent(ctx, out, true)?;
         ctx.depth += 1;
-        out.extend_from_slice(&piece);
+        out.emit_bytes(&piece)?;
         ctx.depth -= 1;
         first = false;
     }
-    emit_close_array(ctx, out);
+    emit_close_array(ctx, out)?;
     Ok(())
 }
 
@@ -597,12 +598,12 @@ fn emit_object(
     end: usize,
     sel: &ObjectSelect,
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
     let (obj_start, members, close_pos) = match collect_object_members(json, start, end) {
         Ok(x) => x,
         Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-            out.extend_from_slice(b"null");
+            out.emit_bytes(b"null")?;
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -627,7 +628,7 @@ fn emit_object(
         }
     }
 
-    out.push(b'{');
+    out.emit_byte(b'{')?;
     // PreserveSource: leading ws after `{` when first kept is first member.
     if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
         && let Some((first_m, _)) = kept.first()
@@ -637,16 +638,16 @@ fn emit_object(
     {
         let between = &json[obj_start + 1..first_m.member_start];
         if is_ws_only(between) {
-            out.extend_from_slice(between);
+            out.emit_bytes(between)?;
         }
     }
 
     for (i, (m, child)) in kept.iter().enumerate() {
         if i > 0 {
-            emit_member_sep(json, &kept, i, ctx, out);
+            emit_member_sep(json, &kept, i, ctx, out)?;
         }
-        emit_object_key(json, m, ctx, out);
-        emit_colon(json, m, ctx, out);
+        emit_object_key(json, m, ctx, out)?;
+        emit_colon(json, m, ctx, out)?;
         ctx.depth += 1;
         emit_value(json, m.val_start, m.val_end, child, ctx, out)?;
         ctx.depth -= 1;
@@ -656,7 +657,7 @@ fn emit_object(
             if let Some(c) = m.comma {
                 let mid = &json[m.after_value..c];
                 if is_ws_only(mid) {
-                    out.extend_from_slice(mid);
+                    out.emit_bytes(mid)?;
                 }
             }
         }
@@ -669,17 +670,17 @@ fn emit_object(
         if let Some(c) = last_m.comma {
             let between = &json[last_m.after_value..c];
             if is_ws_only(between) {
-                out.extend_from_slice(between);
+                out.emit_bytes(between)?;
             }
         } else {
             let between = &json[last_m.after_value..close_pos];
             if is_ws_only(between) {
-                out.extend_from_slice(between);
+                out.emit_bytes(between)?;
             }
         }
     }
 
-    emit_close_object(ctx, out);
+    emit_close_object(ctx, out)?;
     let _ = end;
     Ok(())
 }
@@ -689,8 +690,8 @@ fn emit_member_sep(
     kept: &[(&Member<'_>, &SelectExpr)],
     i: usize,
     ctx: &EmitCtx<'_>,
-    out: &mut Vec<u8>,
-) {
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
     match ctx.plan.style {
         ProjectStyle::PreserveSource => {
             // Prefer original comma between adjacent original neighbors.
@@ -698,18 +699,18 @@ fn emit_member_sep(
             let curr = kept[i].0;
             if let Some(c) = prev.comma {
                 // from comma through whitespace before curr key
-                out.push(b',');
+                out.emit_byte(b',')?;
                 let between = &json[c + 1..curr.member_start];
                 if is_ws_only(between) {
-                    out.extend_from_slice(between);
+                    out.emit_bytes(between)?;
                 }
             } else {
-                out.push(b',');
+                out.emit_byte(b',')?;
             }
         }
-        ProjectStyle::Compact => out.push(b','),
-        ProjectStyle::Pretty { .. } => out.push(b','),
+        ProjectStyle::Compact | ProjectStyle::Pretty { .. } => out.emit_byte(b',')?,
     }
+    Ok(())
 }
 
 fn emit_array(
@@ -718,12 +719,12 @@ fn emit_array(
     end: usize,
     sel: &ArraySelect,
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
     let elems = match collect_array_elems(json, start, end) {
         Ok(e) => e,
         Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-            out.extend_from_slice(b"null");
+            out.emit_bytes(b"null")?;
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -750,7 +751,7 @@ fn emit_array(
                         return Err(Error::PathNotFound);
                     }
                     None => {
-                        out.extend_from_slice(b"null");
+                        out.emit_bytes(b"null")?;
                         return Ok(());
                     }
                 }
@@ -795,8 +796,20 @@ fn emit_array(
         sel,
         ArraySelect::Each(_) | ArraySelect::Slice { .. } | ArraySelect::Filter { .. }
     );
-    out.push(b'[');
+    let arr_open = skip_whitespace(json, start);
+    out.emit_byte(b'[')?;
+    // PreserveSource: whitespace after `[` when first kept is first element.
+    if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
+        && let Some((fs, _, _)) = kept.first()
+        && elems.first().is_some_and(|&(s, _)| s == *fs)
+    {
+        let between = &json[arr_open + 1..*fs];
+        if is_ws_only(between) {
+            out.emit_bytes(between)?;
+        }
+    }
     let mut first = true;
+    let mut prev_end: Option<usize> = None;
     for (s, e, child) in &kept {
         let mut piece = Vec::new();
         emit_value(json, *s, *e, child, ctx, &mut piece)?;
@@ -804,15 +817,32 @@ fn emit_array(
             continue;
         }
         if !first {
-            out.push(b',');
+            if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
+                && let Some(pe) = prev_end
+            {
+                // Copy original comma + whitespace between consecutive source elements.
+                let p = skip_whitespace(json, pe);
+                if p < json.len() && json[p] == b',' {
+                    out.emit_byte(b',')?;
+                    let between = &json[p + 1..*s];
+                    if is_ws_only(between) {
+                        out.emit_bytes(between)?;
+                    }
+                } else {
+                    out.emit_byte(b',')?;
+                }
+            } else {
+                out.emit_byte(b',')?;
+            }
         }
-        maybe_pretty_newline_indent(ctx, out, true);
+        maybe_pretty_newline_indent(ctx, out, true)?;
         ctx.depth += 1;
-        out.extend_from_slice(&piece);
+        out.emit_bytes(&piece)?;
         ctx.depth -= 1;
         first = false;
+        prev_end = Some(*e);
     }
-    emit_close_array(ctx, out);
+    emit_close_array(ctx, out)?;
     let _ = end;
     Ok(())
 }
@@ -824,7 +854,7 @@ fn emit_call(
     name: &str,
     args: &[SelectExpr],
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
     let name = name.to_ascii_lowercase();
     match name.as_str() {
@@ -832,7 +862,7 @@ fn emit_call(
             require_arity(&name, args, 1)?;
             let v = eval_buf(json, start, end, &args[0], ctx)?;
             let n = length_of(&v)?;
-            out.extend_from_slice(n.to_string().as_bytes());
+            out.emit_bytes(n.to_string().as_bytes())?;
             Ok(())
         }
         "keys" => {
@@ -849,7 +879,7 @@ fn emit_call(
             require_arity(&name, args, 1)?;
             let v = eval_buf(json, start, end, &args[0], ctx)?;
             let t = type_name_json(&v);
-            write_json_string_out(out, t);
+            write_json_string_out(out, t)?;
             Ok(())
         }
         "to_string" => {
@@ -858,10 +888,10 @@ fn emit_call(
             let t = trim_json(&v);
             if t.starts_with(b"\"") {
                 // Already a JSON string.
-                out.extend_from_slice(t);
+                out.emit_bytes(t)?;
             } else {
                 // Numbers, bools, null, objects, arrays → JSON text as a string value.
-                write_json_string_out(out, std::str::from_utf8(t).unwrap_or(""));
+                write_json_string_out(out, std::str::from_utf8(t).unwrap_or(""))?;
             }
             Ok(())
         }
@@ -873,15 +903,15 @@ fn emit_call(
                 // Unescape for parse (simple path: raw content without escapes common in suite).
                 if let Ok(s) = std::str::from_utf8(s) {
                     if s.parse::<f64>().is_ok() {
-                        out.extend_from_slice(s.as_bytes());
+                        out.emit_bytes(s.as_bytes())?;
                         return Ok(());
                     }
                 }
             } else if parse_f64(t).is_ok() {
-                out.extend_from_slice(t);
+                out.emit_bytes(t)?;
                 return Ok(());
             }
-            out.extend_from_slice(b"null");
+            out.emit_bytes(b"null")?;
             Ok(())
         }
         "starts_with" | "ends_with" => {
@@ -904,7 +934,7 @@ fn emit_call(
             } else {
                 as_u.ends_with(&bs_u)
             };
-            out.extend_from_slice(if ok { b"true" } else { b"false" });
+            out.emit_bytes(if ok { b"true" } else { b"false" })?;
             Ok(())
         }
         "contains" => {
@@ -927,7 +957,7 @@ fn emit_call(
                     msg: "contains requires string or array subject",
                 });
             };
-            out.extend_from_slice(if ok { b"true" } else { b"false" });
+            out.emit_bytes(if ok { b"true" } else { b"false" })?;
             Ok(())
         }
         "not_null" => {
@@ -939,11 +969,11 @@ fn emit_call(
             for a in args {
                 let v = eval_buf(json, start, end, a, ctx)?;
                 if trim_json(&v) != b"null" {
-                    out.extend_from_slice(trim_json(&v));
+                    out.emit_bytes(trim_json(&v))?;
                     return Ok(());
                 }
             }
-            out.extend_from_slice(b"null");
+            out.emit_bytes(b"null")?;
             Ok(())
         }
         "reverse" => {
@@ -981,7 +1011,7 @@ fn emit_call(
                 "ceil" => n.ceil(),
                 _ => n.floor(),
             };
-            out.extend_from_slice(format_number(r).as_bytes());
+            out.emit_bytes(format_number(r).as_bytes())?;
             Ok(())
         }
         "to_array" => {
@@ -989,17 +1019,17 @@ fn emit_call(
             let v = eval_buf(json, start, end, &arg, ctx)?;
             let t = trim_json(&v);
             if t.starts_with(b"[") {
-                out.extend_from_slice(t);
+                out.emit_bytes(t)?;
             } else {
-                out.push(b'[');
-                out.extend_from_slice(t);
-                out.push(b']');
+                out.emit_byte(b'[')?;
+                out.emit_bytes(t)?;
+                out.emit_byte(b']')?;
             }
             Ok(())
         }
         "merge" => {
             // shallow merge of objects
-            out.push(b'{');
+            out.emit_byte(b'{')?;
             let mut first = true;
             for a in args {
                 let v = eval_buf(json, start, end, a, ctx)?;
@@ -1010,15 +1040,15 @@ fn emit_call(
                 let (_, members, _) = collect_object_members(t, 0, t.len())?;
                 for m in members {
                     if !first {
-                        out.push(b',');
+                        out.emit_byte(b',')?;
                     }
-                    out.extend_from_slice(&t[m.key_span.0..m.key_span.1]);
-                    out.push(b':');
-                    out.extend_from_slice(&t[m.val_start..m.val_end]);
+                    out.emit_bytes(&t[m.key_span.0..m.key_span.1])?;
+                    out.emit_byte(b':')?;
+                    out.emit_bytes(&t[m.val_start..m.val_end])?;
                     first = false;
                 }
             }
-            out.push(b'}');
+            out.emit_byte(b'}')?;
             Ok(())
         }
         // map(&expr, array) — apply expr to each element
@@ -1032,19 +1062,19 @@ fn emit_call(
             let arr_v = eval_buf(json, start, end, &args[1], ctx)?;
             let arr = trim_json(&arr_v);
             let elems = collect_array_elems(arr, 0, arr.len())?;
-            out.push(b'[');
+            out.emit_byte(b'[')?;
             for (i, &(s, e)) in elems.iter().enumerate() {
                 if i > 0 {
-                    out.push(b',');
+                    out.emit_byte(b',')?;
                 }
                 let mut piece = Vec::new();
                 match emit_value(arr, s, e, &mapper, ctx, &mut piece) {
-                    Ok(()) => out.extend_from_slice(&piece),
-                    Err(Error::PathNotFound) => out.extend_from_slice(b"null"),
+                    Ok(()) => out.emit_bytes(&piece)?,
+                    Err(Error::PathNotFound) => out.emit_bytes(b"null")?,
                     Err(err) => return Err(err),
                 }
             }
-            out.push(b']');
+            out.emit_byte(b']')?;
             Ok(())
         }
         // sort_by(array, &expr)
@@ -1059,7 +1089,7 @@ fn emit_call(
             let arr = trim_json(&arr_v);
             if !arr.starts_with(b"[") {
                 if soft_null(ctx) {
-                    out.extend_from_slice(b"null");
+                    out.emit_bytes(b"null")?;
                     return Ok(());
                 }
                 return Err(Error::TypeMismatch {
@@ -1088,14 +1118,14 @@ fn emit_call(
                     (false, false) => cmp_sort_keys(&a.0, &b.0),
                 }
             });
-            out.push(b'[');
+            out.emit_byte(b'[')?;
             for (i, (_, s, e)) in keyed.iter().enumerate() {
                 if i > 0 {
-                    out.push(b',');
+                    out.emit_byte(b',')?;
                 }
-                out.extend_from_slice(&arr[*s..*e]);
+                out.emit_bytes(&arr[*s..*e])?;
             }
-            out.push(b']');
+            out.emit_byte(b']')?;
             Ok(())
         }
         // group_by(array, &expr) → array of groups (arrays of original elements)
@@ -1110,7 +1140,7 @@ fn emit_call(
             let arr = trim_json(&arr_v);
             if !arr.starts_with(b"[") {
                 if soft_null(ctx) {
-                    out.extend_from_slice(b"null");
+                    out.emit_bytes(b"null")?;
                     return Ok(());
                 }
                 return Err(Error::TypeMismatch {
@@ -1132,22 +1162,22 @@ fn emit_call(
                 }
                 groups.get_mut(&key).unwrap().push((s, e));
             }
-            out.push(b'[');
+            out.emit_byte(b'[')?;
             for (gi, k) in order.iter().enumerate() {
                 if gi > 0 {
-                    out.push(b',');
+                    out.emit_byte(b',')?;
                 }
-                out.push(b'[');
+                out.emit_byte(b'[')?;
                 let g = groups.get(k).unwrap();
                 for (i, &(s, e)) in g.iter().enumerate() {
                     if i > 0 {
-                        out.push(b',');
+                        out.emit_byte(b',')?;
                     }
-                    out.extend_from_slice(&arr[s..e]);
+                    out.emit_bytes(&arr[s..e])?;
                 }
-                out.push(b']');
+                out.emit_byte(b']')?;
             }
-            out.push(b']');
+            out.emit_byte(b']')?;
             Ok(())
         }
         // max_by(array, &expr) / min_by(array, &expr) → single element or null
@@ -1163,7 +1193,7 @@ fn emit_call(
             let arr = trim_json(&arr_v);
             if !arr.starts_with(b"[") {
                 if soft_null(ctx) {
-                    out.extend_from_slice(b"null");
+                    out.emit_bytes(b"null")?;
                     return Ok(());
                 }
                 return Err(Error::TypeMismatch {
@@ -1173,7 +1203,7 @@ fn emit_call(
             }
             let elems = collect_array_elems(arr, 0, arr.len())?;
             if elems.is_empty() {
-                out.extend_from_slice(b"null");
+                out.emit_bytes(b"null")?;
                 return Ok(());
             }
             let mut best_i = 0usize;
@@ -1204,11 +1234,11 @@ fn emit_call(
                 }
             }
             if best_key.is_none() {
-                out.extend_from_slice(b"null");
+                out.emit_bytes(b"null")?;
                 return Ok(());
             }
             let (s, e) = elems[best_i];
-            out.extend_from_slice(&arr[s..e]);
+            out.emit_bytes(&arr[s..e])?;
             Ok(())
         }
         _ => Err(Error::Jmespath {
@@ -1240,19 +1270,22 @@ fn cmp_sort_keys_strict(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering, Error>
     })
 }
 
-fn write_json_string_out(out: &mut Vec<u8>, s: &str) {
-    out.push(b'"');
+fn write_json_string_out(out: &mut impl EmitOut, s: &str) -> Result<(), Error> {
+    out.emit_byte(b'"')?;
     for b in s.bytes() {
         match b {
             b'"' | b'\\' => {
-                out.push(b'\\');
-                out.push(b);
+                out.emit_byte(b'\\')?;
+                out.emit_byte(b)?;
             }
-            c if c < 0x20 => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
-            c => out.push(c),
+            c if c < 0x20 => {
+                out.emit_bytes(format!("\\u{c:04x}").as_bytes())?;
+            }
+            c => out.emit_byte(c)?,
         }
     }
-    out.push(b'"');
+    out.emit_byte(b'"')?;
+    Ok(())
 }
 
 fn require_arity(name: &str, args: &[SelectExpr], n: usize) -> Result<(), Error> {
@@ -1325,7 +1358,7 @@ fn unescape_string_content(content: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn keys_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn keys_of(v: &[u8], out: &mut impl EmitOut) -> Result<(), Error> {
     let t = trim_json(v);
     if !t.starts_with(b"{") {
         return Err(Error::Jmespath {
@@ -1333,18 +1366,18 @@ fn keys_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         });
     }
     let (_, members, _) = collect_object_members(t, 0, t.len())?;
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     for (i, m) in members.iter().enumerate() {
         if i > 0 {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        out.extend_from_slice(&t[m.key_span.0..m.key_span.1]);
+        out.emit_bytes(&t[m.key_span.0..m.key_span.1])?;
     }
-    out.push(b']');
+    out.emit_byte(b']')?;
     Ok(())
 }
 
-fn values_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn values_of(v: &[u8], out: &mut impl EmitOut) -> Result<(), Error> {
     let t = trim_json(v);
     if !t.starts_with(b"{") {
         return Err(Error::Jmespath {
@@ -1352,14 +1385,14 @@ fn values_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         });
     }
     let (_, members, _) = collect_object_members(t, 0, t.len())?;
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     for (i, m) in members.iter().enumerate() {
         if i > 0 {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        out.extend_from_slice(&t[m.val_start..m.val_end]);
+        out.emit_bytes(&t[m.val_start..m.val_end])?;
     }
-    out.push(b']');
+    out.emit_byte(b']')?;
     Ok(())
 }
 
@@ -1383,28 +1416,28 @@ fn array_contains(arr: &[u8], item: &[u8]) -> Result<bool, Error> {
         .any(|&(s, e)| trim_json(&arr[s..e]) == item))
 }
 
-fn reverse_array_or_string(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn reverse_array_or_string(v: &[u8], out: &mut impl EmitOut) -> Result<(), Error> {
     let t = trim_json(v);
     if t.starts_with(b"\"") {
         let s = json_string_content(t).unwrap_or(b"");
         let rev: Vec<u8> = s.iter().rev().copied().collect();
-        write_json_string_out(out, std::str::from_utf8(&rev).unwrap_or(""));
+        write_json_string_out(out, std::str::from_utf8(&rev).unwrap_or(""))?;
         return Ok(());
     }
     let elems = collect_array_elems(t, 0, t.len())?;
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     for (i, &(s, e)) in elems.iter().rev().enumerate() {
         if i > 0 {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        out.extend_from_slice(&t[s..e]);
+        out.emit_bytes(&t[s..e])?;
     }
-    out.push(b']');
+    out.emit_byte(b']')?;
     Ok(())
 }
 
 
-fn sort_array(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn sort_array(v: &[u8], out: &mut impl EmitOut) -> Result<(), Error> {
     let t = trim_json(v);
     if !t.starts_with(b"[") {
         return Err(Error::Jmespath {
@@ -1446,18 +1479,18 @@ fn sort_array(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             ta.cmp(tb)
         }
     });
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     for (i, p) in pieces.iter().enumerate() {
         if i > 0 {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        out.extend_from_slice(p);
+        out.emit_bytes(p)?;
     }
-    out.push(b']');
+    out.emit_byte(b']')?;
     Ok(())
 }
 
-fn join_array(arr: &[u8], sep: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+fn join_array(arr: &[u8], sep: &[u8], out: &mut impl EmitOut) -> Result<(), Error> {
     if !arr.starts_with(b"[") {
         return Err(Error::Jmespath {
             msg: "join requires an array",
@@ -1478,11 +1511,11 @@ fn join_array(arr: &[u8], sep: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
         let cu = unescape_string_content(c).unwrap_or_else(|| c.to_vec());
         s.extend_from_slice(&cu);
     }
-    write_json_string_out(out, std::str::from_utf8(&s).unwrap_or(""));
+    write_json_string_out(out, std::str::from_utf8(&s).unwrap_or(""))?;
     Ok(())
 }
 
-fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+fn array_reduce(arr: &[u8], which: &str, out: &mut impl EmitOut) -> Result<(), Error> {
     if !arr.starts_with(b"[") {
         return Err(Error::Jmespath {
             msg: "max/min/sum/avg require an array",
@@ -1493,11 +1526,11 @@ fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error>
         // JMESPath: max/min of empty → null; sum of empty → 0; avg of empty → null
         match which {
             "sum" => {
-                out.extend_from_slice(b"0");
+                out.emit_bytes(b"0")?;
                 return Ok(());
             }
             _ => {
-                out.extend_from_slice(b"null");
+                out.emit_bytes(b"null")?;
                 return Ok(());
             }
         }
@@ -1541,7 +1574,7 @@ fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error>
             } else {
                 sum
             };
-            out.extend_from_slice(format_number(r).as_bytes());
+            out.emit_bytes(format_number(r).as_bytes())?;
         }
         "max" | "min" => {
             if saw_num {
@@ -1550,7 +1583,7 @@ fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error>
                 } else {
                     nums.iter().cloned().fold(f64::INFINITY, f64::min)
                 };
-                out.extend_from_slice(format_number(r).as_bytes());
+                out.emit_bytes(format_number(r).as_bytes())?;
             } else {
                 let best = if which == "max" {
                     strs.iter().max().cloned()
@@ -1558,12 +1591,12 @@ fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error>
                     strs.iter().min().cloned()
                 };
                 match best {
-                    Some(s) => write_json_string_out(out, std::str::from_utf8(&s).unwrap_or("")),
-                    None => out.extend_from_slice(b"null"),
+                    Some(s) => write_json_string_out(out, std::str::from_utf8(&s).unwrap_or(""))?,
+                    None => out.emit_bytes(b"null")?,
                 }
             }
         }
-        _ => out.extend_from_slice(b"null"),
+        _ => out.emit_bytes(b"null")?,
     }
     Ok(())
 }
@@ -1582,9 +1615,9 @@ fn emit_multi_hash(
     end: usize,
     fields: &[HashField],
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
-    out.push(b'{');
+    out.emit_byte(b'{')?;
     let mut wrote = false;
     for f in fields {
         let mut val = Vec::new();
@@ -1597,21 +1630,21 @@ fn emit_multi_hash(
             // treat empty as skip only if PathNotFound was converted — keep empty literals
         }
         if wrote {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        maybe_pretty_newline_indent(ctx, out, true);
+        maybe_pretty_newline_indent(ctx, out, true)?;
         // key
-        write_json_key(out, &f.output_key);
+        write_json_key(out, &f.output_key)?;
         match ctx.plan.style {
-            ProjectStyle::Pretty { .. } => out.extend_from_slice(b": "),
-            _ => out.push(b':'),
+            ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
+            _ => out.emit_byte(b':')?,
         }
         ctx.depth += 1;
-        out.extend_from_slice(&val);
+        out.emit_bytes(&val)?;
         ctx.depth -= 1;
         wrote = true;
     }
-    emit_close_object(ctx, out);
+    emit_close_object(ctx, out)?;
     let _ = end;
     Ok(())
 }
@@ -1622,9 +1655,9 @@ fn emit_multi_list(
     end: usize,
     items: &[SelectExpr],
     ctx: &mut EmitCtx<'_>,
-    out: &mut Vec<u8>,
+    out: &mut impl EmitOut,
 ) -> Result<(), Error> {
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     let mut wrote = false;
     for expr in items {
         let mut val = Vec::new();
@@ -1634,30 +1667,30 @@ fn emit_multi_list(
             Err(e) => return Err(e),
         }
         if wrote {
-            out.push(b',');
+            out.emit_byte(b',')?;
         }
-        maybe_pretty_newline_indent(ctx, out, true);
+        maybe_pretty_newline_indent(ctx, out, true)?;
         ctx.depth += 1;
-        out.extend_from_slice(&val);
+        out.emit_bytes(&val)?;
         ctx.depth -= 1;
         wrote = true;
     }
-    emit_close_array(ctx, out);
+    emit_close_array(ctx, out)?;
     let _ = end;
     Ok(())
 }
 
-fn flatten_emit(mid: &[u8], ctx: &mut EmitCtx<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+fn flatten_emit(mid: &[u8], ctx: &mut EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     let start = skip_whitespace(mid, 0);
     let end = skip_value(mid, start)?;
     let start = skip_whitespace(mid, start);
     if start >= mid.len() || mid[start] != b'[' {
         // non-array: identity
-        out.extend_from_slice(&mid[start..end]);
+        out.emit_bytes(&mid[start..end])?;
         return Ok(());
     }
     let outer = collect_array_elems(mid, start, end)?;
-    out.push(b'[');
+    out.emit_byte(b'[')?;
     let mut first = true;
     for (s, e) in outer {
         let s = skip_whitespace(mid, s);
@@ -1665,87 +1698,80 @@ fn flatten_emit(mid: &[u8], ctx: &mut EmitCtx<'_>, out: &mut Vec<u8>) -> Result<
             let inner = collect_array_elems(mid, s, e)?;
             for (is, ie) in inner {
                 if !first {
-                    out.push(b',');
+                    out.emit_byte(b',')?;
                 }
-                maybe_pretty_newline_indent(ctx, out, true);
-                out.extend_from_slice(&mid[is..ie]);
+                maybe_pretty_newline_indent(ctx, out, true)?;
+                out.emit_bytes(&mid[is..ie])?;
                 first = false;
             }
         } else {
             if !first {
-                out.push(b',');
+                out.emit_byte(b',')?;
             }
-            maybe_pretty_newline_indent(ctx, out, true);
-            out.extend_from_slice(&mid[s..e]);
+            maybe_pretty_newline_indent(ctx, out, true)?;
+            out.emit_bytes(&mid[s..e])?;
             first = false;
         }
     }
-    emit_close_array(ctx, out);
+    emit_close_array(ctx, out)?;
     Ok(())
 }
 
-fn write_json_key(out: &mut Vec<u8>, key: &str) {
-    out.push(b'"');
-    for b in key.bytes() {
-        match b {
-            b'"' | b'\\' => {
-                out.push(b'\\');
-                out.push(b);
-            }
-            c if c < 0x20 => {
-                out.extend_from_slice(format!("\\u{c:04x}").as_bytes());
-            }
-            c => out.push(c),
-        }
-    }
-    out.push(b'"');
+fn write_json_key(out: &mut impl EmitOut, key: &str) -> Result<(), Error> {
+    write_json_string_out(out, key)
 }
 
-fn emit_object_key(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut Vec<u8>) {
+
+fn emit_object_key(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { .. }) {
-        out.push(b'\n');
-        write_indent(ctx.depth + 1, pretty_indent(ctx), out);
+        out.emit_byte(b'\n')?;
+        write_indent(ctx.depth + 1, pretty_indent(ctx), out)?;
     }
-    out.extend_from_slice(&json[m.key_span.0..m.key_span.1]);
+    out.emit_bytes(&json[m.key_span.0..m.key_span.1])?;
+    Ok(())
 }
 
-fn emit_colon(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut Vec<u8>) {
+fn emit_colon(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     match ctx.plan.style {
-        ProjectStyle::Compact => out.push(b':'),
+        ProjectStyle::Compact => out.emit_byte(b':')?,
         ProjectStyle::PreserveSource => {
-            out.extend_from_slice(&json[m.key_span.1..m.colon]);
-            out.push(b':');
-            out.extend_from_slice(&json[m.colon + 1..m.val_start]);
+            out.emit_bytes(&json[m.key_span.1..m.colon])?;
+            out.emit_byte(b':')?;
+            out.emit_bytes(&json[m.colon + 1..m.val_start])?;
         }
-        ProjectStyle::Pretty { .. } => out.extend_from_slice(b": "),
+        ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
     }
+    Ok(())
 }
 
-fn emit_close_object(ctx: &EmitCtx<'_>, out: &mut Vec<u8>) {
+fn emit_close_object(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { indent: n } if n > 0)
-        && out.last() != Some(&b'{')
+        && out.last_byte() != Some(b'{')
     {
-        out.push(b'\n');
-        write_indent(ctx.depth, pretty_indent(ctx), out);
+        out.emit_byte(b'\n')?;
+        write_indent(ctx.depth, pretty_indent(ctx), out)?;
     }
-    out.push(b'}');
+    out.emit_byte(b'}')?;
+    Ok(())
 }
 
-fn emit_close_array(ctx: &EmitCtx<'_>, out: &mut Vec<u8>) {
+fn emit_close_array(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { indent: n } if n > 0)
-        && out.last() != Some(&b'[')
+        && out.last_byte() != Some(b'[')
     {
-        out.push(b'\n');
-        write_indent(ctx.depth, pretty_indent(ctx), out);
+        out.emit_byte(b'\n')?;
+        write_indent(ctx.depth, pretty_indent(ctx), out)?;
     }
-    out.push(b']');
+    out.emit_byte(b']')?;
+    Ok(())
 }
 
-fn maybe_pretty_newline_indent(ctx: &EmitCtx<'_>, out: &mut Vec<u8>, for_element: bool) {
+fn maybe_pretty_newline_indent(ctx: &EmitCtx<'_>, out: &mut impl EmitOut, for_element: bool) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { .. }) && for_element {
-        out.push(b'\n');
-        write_indent(ctx.depth + 1, pretty_indent(ctx), out);
+        out.emit_byte(b'\n')?;
+        write_indent(ctx.depth + 1, pretty_indent(ctx), out)?;
     }
+    Ok(())
 }
 
 fn pretty_indent(ctx: &EmitCtx<'_>) -> usize {
@@ -1755,9 +1781,16 @@ fn pretty_indent(ctx: &EmitCtx<'_>) -> usize {
     }
 }
 
-fn write_indent(depth: usize, per_level: usize, out: &mut Vec<u8>) {
+fn write_indent(depth: usize, per_level: usize, out: &mut impl EmitOut) -> Result<(), Error> {
     let n = depth.saturating_mul(per_level);
-    out.resize(out.len() + n, b' ');
+    let spaces = [b' '; 64];
+    let mut left = n;
+    while left > 0 {
+        let chunk = left.min(spaces.len());
+        out.emit_bytes(&spaces[..chunk])?;
+        left -= chunk;
+    }
+    Ok(())
 }
 
 fn is_ws_only(s: &[u8]) -> bool {

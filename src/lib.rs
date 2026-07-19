@@ -184,9 +184,10 @@ pub use mutate::{
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
     estimate_projected_len, estimate_values_len, parse_jmespath_expr, parse_project_path, project,
-    project_into, project_jmespath, project_paths, project_write, projected_len,
-    select_from_project_path, ArraySelect, CmpOp, HashField, MissingPolicy, ObjectSelect,
-    ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr,
+    project_indexed, project_into, project_jmespath, project_paths, project_write, projected_len,
+    select_from_project_path, ArraySelect, CmpOp, CountingSink, HashField, MissingPolicy,
+    ObjectSelect, ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr, Transform,
+    TransformPipeline, WriteSink,
 };
 pub use scan::find_value;
 pub use view::{read_view, write_view, JsonView};
@@ -863,6 +864,35 @@ mod tests {
         let n2 = Nested::read_from_json_indexed(&json).unwrap();
         assert_eq!(n2.first_tag, "a");
         assert_eq!(Nested::FIELD_PATHS, &["meta.ver", "tags[0]"]);
+    }
+
+    #[cfg(feature = "derive")]
+    #[test]
+    fn test_derive_jmes_project_and_read() {
+        #[derive(JsonMutatorSchema)]
+        struct Card {
+            #[json(path = "id")]
+            id: u64,
+            #[json(path = "title", jmes = "title")]
+            title: String,
+            #[json(path = "price", jmes = "variants[0].price")]
+            price: String,
+        }
+
+        let json = br#"{"id":1,"title":"Hat","variants":[{"price":"9.99"},{"price":"1.00"}],"noise":true}"#;
+        let c = Card::read_from_json(json).unwrap();
+        assert_eq!(c.id, 1);
+        assert_eq!(c.title, "Hat");
+        assert_eq!(c.price, "9.99");
+
+        let slim = Card::project_json(json).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&slim).unwrap();
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["title"], "Hat");
+        assert_eq!(v["price"], "9.99");
+        assert!(v.get("noise").is_none());
+        assert!(v.get("variants").is_none());
+        assert!(Card::FIELD_JMES.iter().any(|s| s.contains("variants")));
     }
 
     #[cfg(feature = "derive")]
