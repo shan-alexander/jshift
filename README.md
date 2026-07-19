@@ -56,6 +56,8 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 * **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
 * **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
 * **Option / null:** first-class for training JSONL and partial records.
+* **Structural array indexes (0.3):** [`IndexedDocument`] builds safe element side-tables so
+  mid/last `products[i].field` jumps instead of scanning every sibling (see below).
 
 > **Contract:** jshift is a **non-validating** path engine. It assumes mostly well-formed JSON along the path you traverse. Callers must supply complete JSON value bytes for raw mutations (or use `ToJsonBytes` / `mutate_value_checked`).
 
@@ -232,11 +234,49 @@ These numbers are not a claim that jshift is always fastest for every JSON task.
 
 ---
 
+
+### Structural indexing (0.3) — mid-array access
+
+Linear path scans must `skip_value` every sibling before `products[12500]`. That is correct and fine for streaming “touch once” work; it is wrong for **random / multi-query** access into huge arrays.
+
+**jshift 0.3** adds a **safe** array side-table (not a full simdjson DOM):
+
+```rust
+use jshift::{IndexedDocument, parse_path};
+
+let doc = IndexedDocument::build(&json, &["products"])?;
+// O(1) jump to element 12500, then local object scan for `title`
+let title = doc.find(&parse_path("products[12500].title"))?;
+
+doc.for_each_element(&parse_path("products"), |i, elem| {
+    // elem is a zero-copy slice of products[i]
+    let _ = (i, elem);
+    Ok(())
+})?;
+```
+
+| Phase | Cost class |
+| :--- | :--- |
+| `IndexedDocument::build` for one array | One linear pass (similar to a full walk of that array) |
+| `doc.find(products[i].…)` after index | **O(1)** to element start + small local scan |
+| Unindexed `find_value(products[i].…)` | **O(i)** sibling skips |
+
+**Illustrative (50k small products, mid element, quiet Criterion run):** linear `find_value` ~1.1 ms vs indexed `doc.find` ~71 ns — about **~15,000×** for that hop. Index build ~4.4 ms once, then many cheap random accesses.
+
+Indexes bind to a fixed byte snapshot. After in-place mutate/delete, **rebuild** (or drop) the index. Best ETL pattern: **index → many reads / project → write a new buffer → optional reindex**.
+
+This stays `forbid(unsafe_code)`: `Vec<u32>` offsets + existing safe cursors. Full Stage-1 SIMD bitmaps can layer later; array side-tables already rewrite the mid/last-element story.
+
+```bash
+cargo bench --bench json_benchmark -- "Indexed array"
+```
+
+
 ## Installation
 
 ```toml
 [dependencies]
-jshift = "0.2"
+jshift = "0.3"
 ```
 
 Requires a recent stable Rust (see `rust-version` in `Cargo.toml`; edition 2024).
@@ -374,6 +414,7 @@ Deletes:
 * Dot / bracket: `metadata.tags[0].name` via `parse_path` / `try_parse_path` / `Path`  
 * JSON Pointer: `Path::from_json_pointer("/a~1b/0")`  
 * Derive validates paths at compile time and caches segment tables  
+* **`IndexedDocument`**: array side-tables for O(1) element jumps (`build`, `find`, `for_each_element`)  
 
 ### Convert
 

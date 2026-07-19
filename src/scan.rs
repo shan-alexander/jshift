@@ -134,6 +134,47 @@ pub(crate) fn find_value_offsets(json: &[u8], path: &[PathSegment]) -> Result<(u
     }
 }
 
+/// Resolve `path` starting from a value that begins at `val_start` (absolute offset).
+///
+/// Used by structural indexes to jump into an array element (or other sub-value)
+/// without re-scanning siblings.
+pub(crate) fn find_from_value(
+    json: &[u8],
+    val_start: usize,
+    path: &[PathSegment],
+) -> Result<(usize, usize), Error> {
+    if path.is_empty() {
+        let end = skip_value(json, val_start)?;
+        return Ok((val_start, end));
+    }
+    if val_start >= json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: val_start,
+            msg: "Unexpected EOF",
+        });
+    }
+    match &path[0] {
+        PathSegment::Key(_) => {
+            if json[val_start] != b'{' {
+                return Err(Error::TypeMismatch {
+                    expected: "object",
+                    found: "primitive/array",
+                });
+            }
+            find_in_object_offsets(json, val_start + 1, path)
+        }
+        PathSegment::Index(_) => {
+            if json[val_start] != b'[' {
+                return Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: "primitive/object",
+                });
+            }
+            find_in_array_offsets(json, val_start + 1, path)
+        }
+    }
+}
+
 /// Recursively or iteratively scans an object starting after the '{' or after a key-value comma.
 fn find_in_object_offsets(
     json: &[u8],
@@ -385,39 +426,34 @@ fn skip_squash(json: &[u8], open_pos: usize) -> Result<usize, Error> {
     let len = json.len();
 
     while depth > 0 {
-        // Bulk: advance until a structural stop byte.
-        'bulk: loop {
-            while i + 16 <= len {
-                // Manual unroll helps LLVM keep this in registers.
-                if is_squash_stop(json[i])
-                    || is_squash_stop(json[i + 1])
-                    || is_squash_stop(json[i + 2])
-                    || is_squash_stop(json[i + 3])
-                    || is_squash_stop(json[i + 4])
-                    || is_squash_stop(json[i + 5])
-                    || is_squash_stop(json[i + 6])
-                    || is_squash_stop(json[i + 7])
-                    || is_squash_stop(json[i + 8])
-                    || is_squash_stop(json[i + 9])
-                    || is_squash_stop(json[i + 10])
-                    || is_squash_stop(json[i + 11])
-                    || is_squash_stop(json[i + 12])
-                    || is_squash_stop(json[i + 13])
-                    || is_squash_stop(json[i + 14])
-                    || is_squash_stop(json[i + 15])
-                {
-                    // Step to the first stop in this window.
-                    while !is_squash_stop(json[i]) {
-                        i += 1;
-                    }
-                    break 'bulk;
+        // Bulk: advance until a structural stop byte (16-byte windows).
+        while i + 16 <= len {
+            if is_squash_stop(json[i])
+                || is_squash_stop(json[i + 1])
+                || is_squash_stop(json[i + 2])
+                || is_squash_stop(json[i + 3])
+                || is_squash_stop(json[i + 4])
+                || is_squash_stop(json[i + 5])
+                || is_squash_stop(json[i + 6])
+                || is_squash_stop(json[i + 7])
+                || is_squash_stop(json[i + 8])
+                || is_squash_stop(json[i + 9])
+                || is_squash_stop(json[i + 10])
+                || is_squash_stop(json[i + 11])
+                || is_squash_stop(json[i + 12])
+                || is_squash_stop(json[i + 13])
+                || is_squash_stop(json[i + 14])
+                || is_squash_stop(json[i + 15])
+            {
+                while !is_squash_stop(json[i]) {
+                    i += 1;
                 }
-                i += 16;
+                break;
             }
-            while i < len && !is_squash_stop(json[i]) {
-                i += 1;
-            }
-            break 'bulk;
+            i += 16;
+        }
+        while i < len && !is_squash_stop(json[i]) {
+            i += 1;
         }
 
         if i >= len {

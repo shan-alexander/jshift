@@ -13,6 +13,8 @@
 //! * **Macro-generated schemas:** `#[derive(JsonMutatorSchema)]` for typed readers and mutators.
 //! * **Array and object CRUD:** Insert, update, append, and delete dynamically.
 //! * **JSON string escaping:** `ToJsonBytes` and key upserts escape special characters.
+//! * **Structural array indexes:** [`IndexedDocument`] builds safe side-tables so
+//!   `products[i].field` jumps in O(1) instead of skipping `i` siblings.
 //!
 //! # Quick Start
 //! ```
@@ -64,6 +66,7 @@
 
 mod convert;
 mod error;
+mod index;
 mod mutate;
 mod path;
 mod scan;
@@ -73,6 +76,7 @@ pub use convert::{
     write_json_string_content, FromJsonSlice, ToJsonBytes,
 };
 pub use error::Error;
+pub use index::{build_array_index, ArrayIndex, IndexedDocument};
 pub use jshift_derive::JsonMutatorSchema;
 pub use mutate::{
     append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,

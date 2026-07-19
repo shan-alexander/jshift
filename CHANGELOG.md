@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-19
+
+### Added
+- **Structural array indexing (safe Rust):** [`IndexedDocument`] / [`ArrayIndex`] build
+  per-array element start side-tables so `products[i].field` jumps in O(1) instead of
+  linearly skipping siblings. `find`, `for_each_element`, multi-array `build`.
+- Bench group **Indexed array mid/last find** (linear vs indexed on 50k elements).
+- `find_from_value` path continuation helper for index jumps.
+
+### Notes
+- Indexes bind to a `&[u8]` snapshot; rebuild after in-place mutations (documented).
+- Not a full simdjson DOM — metadata in service of path navigation / projection.
+
 ## [0.2.2] - 2026-07-19
 
 ### Fixed
@@ -93,7 +106,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/shan-alexander/jshift/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/shan-alexander/jshift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/shan-alexander/jshift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/shan-alexander/jshift/compare/v0.1.0...v0.2.0

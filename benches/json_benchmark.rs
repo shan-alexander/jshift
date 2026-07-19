@@ -473,6 +473,81 @@ fn bench_compete_path_engines(c: &mut Criterion) {
     }
 }
 
+/// Structural array side-table vs linear skip (same buffer).
+fn bench_indexed_array(c: &mut Criterion) {
+    // ~50k small objects — enough to make mid-array skip expensive without multi-second builds.
+    let n = 50_000usize;
+    let mut s = String::from(r#"{"products":["#);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(r#"{{"id":{i},"title":"item_{i}"}}"#));
+    }
+    s.push_str("]}");
+    let json = s.into_bytes();
+    let path_mid_s = format!("products[{}].title", n / 2);
+    let path_last_s = format!("products[{}].title", n - 1);
+    let path_mid = jshift::parse_path(&path_mid_s);
+    let path_last = jshift::parse_path(&path_last_s);
+    let path_first = jshift::parse_path("products[0].title");
+
+    let doc = jshift::IndexedDocument::build(&json, &["products"]).unwrap();
+    let expect_mid = format!("\"item_{}\"", n / 2);
+    let expect_last = format!("\"item_{}\"", n - 1);
+
+    let mut group = c.benchmark_group("Indexed array mid/last find");
+    group.sample_size(30);
+
+    group.bench_function("jshift_linear_mid", |b| {
+        b.iter(|| {
+            assert_eq!(
+                jshift::find_value(&json, &path_mid).unwrap(),
+                expect_mid.as_bytes()
+            );
+        })
+    });
+    group.bench_function("jshift_indexed_mid", |b| {
+        b.iter(|| {
+            assert_eq!(doc.find(&path_mid).unwrap(), expect_mid.as_bytes());
+        })
+    });
+    group.bench_function("jshift_linear_last", |b| {
+        b.iter(|| {
+            assert_eq!(
+                jshift::find_value(&json, &path_last).unwrap(),
+                expect_last.as_bytes()
+            );
+        })
+    });
+    group.bench_function("jshift_indexed_last", |b| {
+        b.iter(|| {
+            assert_eq!(doc.find(&path_last).unwrap(), expect_last.as_bytes());
+        })
+    });
+    group.bench_function("jshift_linear_first", |b| {
+        b.iter(|| {
+            assert_eq!(
+                jshift::find_value(&json, &path_first).unwrap(),
+                br#""item_0""#
+            );
+        })
+    });
+    group.bench_function("jshift_indexed_first", |b| {
+        b.iter(|| {
+            assert_eq!(doc.find(&path_first).unwrap(), br#""item_0""#);
+        })
+    });
+    group.bench_function("index_build_products", |b| {
+        b.iter(|| {
+            let d = jshift::IndexedDocument::build(&json, &["products"]).unwrap();
+            assert_eq!(d.array_len(&jshift::parse_path("products")).unwrap(), n);
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_find,
@@ -482,5 +557,6 @@ criterion_group!(
     bench_fair_find_small,
     bench_fair_mutate_small,
     bench_compete_path_engines,
+    bench_indexed_array,
 );
 criterion_main!(benches);
