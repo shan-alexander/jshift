@@ -76,9 +76,9 @@ pub use error::Error;
 pub use jshift_derive::JsonMutatorSchema;
 pub use mutate::{
     append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,
-    upsert_object_key,
+    upsert_at_path, upsert_object_key,
 };
-pub use path::{parse_path, try_parse_path, PathSegment};
+pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use scan::find_value;
 
 #[cfg(test)]
@@ -603,6 +603,110 @@ mod tests {
             array_len(json, &parse_path("a")),
             Err(Error::TypeMismatch { .. })
         ));
+    }
+
+    // --- Wave C --------------------------------------------------------------
+
+    #[test]
+    fn test_owned_path_reuse() {
+        let path = Path::parse("user.score");
+        let json = br#"{"user":{"score":9.5}}"#;
+        assert_eq!(path.find(json).unwrap(), b"9.5");
+        assert_eq!(
+            find_value(json, &path.borrowed()).unwrap(),
+            b"9.5"
+        );
+        let mut json = json.to_vec();
+        path.mutate(&mut json, b"10").unwrap();
+        assert_eq!(path.find(&json).unwrap(), b"10");
+    }
+
+    #[test]
+    fn test_json_pointer() {
+        let path = Path::from_json_pointer("/a~1b/0").unwrap();
+        assert_eq!(
+            path.owned_segments(),
+            &[
+                OwnedPathSegment::Key("a/b".into()),
+                OwnedPathSegment::Index(0),
+            ]
+        );
+        let path = Path::from_json_pointer("/tags/1").unwrap();
+        let json = br#"{"tags":["x","y"]}"#;
+        assert_eq!(path.find(json).unwrap(), br#""y""#);
+        assert!(Path::from_json_pointer("no-slash").is_err());
+        assert!(Path::from_json_pointer("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_option_null_and_missing() {
+        assert_eq!(
+            Option::<u32>::from_json_slice(b"null"),
+            Some(None)
+        );
+        assert_eq!(Option::<u32>::from_json_slice(b"3"), Some(Some(3)));
+        assert_eq!(Option::<u32>::from_json_slice(b"nope"), None);
+        assert_eq!((None::<u32>).to_json_bytes(), b"null");
+        assert_eq!(Some(7u32).to_json_bytes(), b"7");
+
+        #[derive(JsonMutatorSchema)]
+        struct Row {
+            #[json(path = "a")]
+            a: Option<u32>,
+            #[json(path = "b")]
+            b: Option<String>,
+        }
+
+        let json = br#"{"a":null,"b":"hi"}"#;
+        let row = Row::read_from_json(json).unwrap();
+        assert_eq!(row.a, None);
+        assert_eq!(row.b.as_deref(), Some("hi"));
+
+        let json = br#"{"b":"only"}"#;
+        let row = Row::read_from_json(json).unwrap();
+        assert_eq!(row.a, None); // missing path
+        assert_eq!(row.b.as_deref(), Some("only"));
+
+        let mut json = br#"{"a":1}"#.to_vec();
+        let mut m = Row::mutator(&mut json);
+        m.set_a(&None::<u32>).unwrap();
+        assert_eq!(find_value(&json, &parse_path("a")).unwrap(), b"null");
+    }
+
+    #[test]
+    fn test_upsert_at_path_creates_parents() {
+        let mut json = b"{}".to_vec();
+        upsert_at_path(&mut json, &parse_path("a.b.c"), b"1").unwrap();
+        assert_eq!(find_value(&json, &parse_path("a.b.c")).unwrap(), b"1");
+        serde_json::from_slice::<serde_json::Value>(&json).unwrap();
+
+        // Update existing leaf.
+        upsert_at_path(&mut json, &parse_path("a.b.c"), b"2").unwrap();
+        assert_eq!(find_value(&json, &parse_path("a.b.c")).unwrap(), b"2");
+
+        // Array terminal: append when idx == len.
+        let mut json = br#"{"list":[0]}"#.to_vec();
+        upsert_at_path(&mut json, &parse_path("list[1]"), b"9").unwrap();
+        assert_eq!(find_value(&json, &parse_path("list[1]")).unwrap(), b"9");
+    }
+
+    #[test]
+    fn test_derive_uses_static_paths() {
+        // Compile-time path constants are exercised by any derive test; this
+        // additionally covers nested paths without re-parse regressions.
+        #[derive(JsonMutatorSchema)]
+        struct Nested {
+            #[json(path = "meta.ver")]
+            ver: u32,
+            #[json(path = "tags[0]")]
+            first_tag: String,
+        }
+        let mut json = br#"{"meta":{"ver":1},"tags":["a","b"]}"#.to_vec();
+        let n = Nested::read_from_json(&json).unwrap();
+        assert_eq!(n.ver, 1);
+        assert_eq!(n.first_tag, "a");
+        Nested::mutator(&mut json).set_ver(&2).unwrap();
+        assert_eq!(find_value(&json, &parse_path("meta.ver")).unwrap(), b"2");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "jshift"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
@@ -16,7 +16,7 @@ exclude = ["/docs/", "/target/", "/fuzz/"]
 
 [dependencies]
 memchr = "2.7"
-jshift-derive = { version = "0.2.0", path = "./jshift-derive" }
+jshift-derive = { version = "0.2.1", path = "./jshift-derive" }
 
 [dev-dependencies]
 serde_json = "1.0"

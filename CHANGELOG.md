@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-19
+
+### Added
+- `Path` / `OwnedPathSegment` — owned reusable paths (`Path::parse`, `try_parse`, `find`,
+  `mutate`, `borrowed`).
+- `Path::from_json_pointer` — RFC 6901 JSON Pointer (`~0` / `~1`, numeric tokens as indexes).
+- `upsert_at_path` — upsert a leaf while creating missing object parents as `{}`.
+- `Option<T>` for `FromJsonSlice` / `ToJsonBytes` (`null` ↔ `None`); derive maps
+  missing paths to `None` for `Option` fields.
+- Derive emits `'static` path segment constants (no `parse_path` on every `set_*` / read).
+
 ## [0.2.0] - 2026-07-19
 
 Minor bump under Cargo’s `0.y` rules: several **behavior and type** changes vs `0.1.0`
@@ -57,6 +68,7 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/shan-alexander/jshift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/shan-alexander/jshift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/shan-alexander/jshift/releases/tag/v0.1.0
