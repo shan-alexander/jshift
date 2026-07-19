@@ -4,5 +4,9 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
-benches/*.json
-/benches/*_products*.json
+
+# Large real-world JSON fixtures (hundreds of MiB) — never commit to this repo.
+# See benches/README.md for optional local / external-bench-repo workflow.
+/benches/**/*.json
+/benches/datasets/
+/benches/data/

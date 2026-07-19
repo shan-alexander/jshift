@@ -12,7 +12,15 @@ documentation = "https://docs.rs/jshift"
 readme = "README.md"
 keywords = ["json", "in-place", "mutator", "parser", "zero-copy"]
 categories = ["parser-implementations", "data-structures"]
-exclude = ["/docs/", "/target/", "/fuzz/"]
+exclude = [
+    "/docs/",
+    "/target/",
+    "/fuzz/",
+    # Large real-world fixtures stay local / in a separate bench repo — never crates.io.
+    "/benches/**/*.json",
+    "/benches/datasets/",
+    "/benches/data/",
+]
 
 [dependencies]
 memchr = "2.7"

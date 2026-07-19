@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Looking up `products[0].title` on a multi-hundred-MiB array no longer scans the
   entire `products` value first (was ~500 ms; now microseconds for early keys).
 
+### Changed
+- README: real-world API ingestion story, refreshed Criterion numbers, vs-engine
+  speedup columns, concurrent key-first ×8; large fixtures documented as gitignored /
+  crates.io-excluded (`benches/README.md`).
+
 ## [0.2.1] - 2026-07-19
 
 ### Added
@@ -88,7 +93,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/shan-alexander/jshift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/shan-alexander/jshift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/shan-alexander/jshift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/shan-alexander/jshift/releases/tag/v0.1.0

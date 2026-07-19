@@ -32,6 +32,17 @@ bytes → path scan to byte offsets → splice / shift bytes in place → same V
 
 No tree. No second full document serialize. Reads return **zero-copy** slices into the original buffer.
 
+### Real-world example: API JSON ingestion (what IT teams do today)
+
+A common pattern in platform / integration teams looks like this:
+
+1. **Pull** a large JSON payload from a partner or SaaS API (catalog, events, orders, product dump—often multi‑MB or hundreds of MB).
+2. **Ingest** into an internal service: validate a couple of fields, stamp metadata (`ingested_at`, `source`, `tenant_id`), maybe drop or rewrite a status flag, then forward the body to a queue, object store, or downstream microservice.
+3. **Today’s default stack** is almost always: `HTTP body → serde_json::from_slice` (or equivalent) → walk a full in-memory tree → change one or two fields → `to_vec` / re-serialize → publish. That is simple to write and easy to reason about—but on a **300 MB catalog** you still allocate and walk the entire tree, then allocate and write another ~300 MB of output, even if you only needed `products[0].title` and a top-level `status`. Under bursty multi-worker ingestion, that becomes CPU, memory, and GC (or allocator) pressure, not “JSON is slow because HTTP is slow.”
+4. **With jshift**, the same job is: keep the body as `Vec<u8>` → path-scan only the fields you need → **splice** stamps or flags in place with safe byte rotations → hand the same buffer downstream. Peers that only need a header field never pay for the giant `products` array. Teams that must stay on **safe Rust** (no `unsafe` hot loops) get selective R/W without becoming a second full parser.
+
+Impact in practice: lower p99 on hot ingestion paths, less memory headroom for concurrent workers, and fewer “we only touch three fields but clone the whole document” incidents—while serde remains the right tool when you truly need a full typed domain model.
+
 ---
 
 ## Key Features
@@ -141,38 +152,42 @@ We **did** steal the *ideas* that transfer cleanly to safe Rust:
 
 ## Performance (illustrative — with marketing multipliers)
 
-Measured with Criterion on this repo’s `benches/json_benchmark.rs` (release build, one Linux host). Numbers are approximate; re-run before putting them on a slide deck.
+**Fresh Criterion run** on this repo’s `benches/json_benchmark.rs` (quiet machine, release, ~6 s measurement windows). Means below are the criterion mid estimate. Re-run before putting numbers on a slide deck—absolute times vary by CPU, but **ratios** are the story.
 
 **Legend**
 
-* **jshift** — path scan / in-place mutate, safe Rust  
-* **gjson** — path **read** (hot path may use unchecked loads)  
-* **sonic-rs** — high-performance JSON library (pointer get)  
+* **jshift** — path scan / in-place mutate, **`#![forbid(unsafe_code)]`**
+* **gjson** — path **read** (hot skip path may use **unchecked** loads)
+* **sonic-rs** — high-performance JSON library (pointer get)
 * **serde_json** — full `Value` parse (+ re-serialize on mutate)
 
 ### Find: path engines + full parse
 
-| Workload | jshift | gjson | sonic-rs | serde_json | **jshift vs serde** |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| **Key-last ~10MB** (target after huge array) | ~10.9 ms | ~5.2 ms | ~27.5 ms | ~220–360 ms | **~20–33× faster** |
-| **Key-first ~10MB** (target is first field) | ~37 ns | ~89 ns | ~90 ns | ~220 ms | **~6,000,000× faster** |
-| **Small ~1KB** top-level key | ~38 ns | ~88 ns | ~93 ns | ~6 µs | **~160× faster** |
-| **Small ~1KB** nested `meta.ver` | ~107 ns | ~145 ns | ~162 ns | ~6 µs | **~55× faster** |
+| Workload | jshift | gjson | sonic-rs | serde_json | **jshift vs serde** | **jshift vs gjson** | **jshift vs sonic** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Key-last ~10MB** (target after huge array) | ~11.0 ms | ~4.9 ms | ~27.4 ms | ~223 ms | **~20× faster** | ~2.3× slower | **~2.5× faster** |
+| **Key-first ~10MB** (target is first field) | ~39 ns | ~87 ns | ~97 ns | ~222 ms | **~5,700,000× faster** | **~2.2× faster** | **~2.5× faster** |
+| **Small ~1KB** top-level key | ~39 ns | ~89 ns | ~96 ns | ~6.1 µs | **~160× faster** | **~2.3× faster** | **~2.5× faster** |
+| **Small ~1KB** nested `meta.ver` | ~80 ns | ~143 ns | ~153 ns | ~6.4 µs | **~80× faster** | **~1.8× faster** | **~1.9× faster** |
+
+**One-liner:** *On selective finds, jshift is typically **~20×–millions×** faster than full `serde_json` parse, and on most shapes here **~2×** faster than gjson/sonic—while remaining 100% safe Rust; gjson can still win pure “skip a giant trailing array” finds (~2×).*
 
 Yes, the key-first row looks absurd—that is the point. Serde still parses the entire multi‑megabyte document. jshift matches the first key and stops.
 
 **Path-engine honesty**
 
-* On **key-last + giant array**, **gjson** can win pure find (~2× here). We care about that benchmark, we optimize for it in **safe** code, and we still beat sonic-rs and destroy full parse.
-* On **key-first** and **small / nested** finds in these runs, **jshift leads** gjson and sonic-rs while remaining safe.
+* On **key-last + giant array**, **gjson** can win pure find (~2× here). We optimize that path in **safe** code, still beat **sonic-rs (~2.5×)**, and still crush full parse (**~20×** vs serde).
+* On **key-first** and **small / nested** finds in this run, **jshift leads** gjson and sonic-rs while remaining safe.
 * jshift’s killer feature is not “always #1 find”; it is **find → mutate same buffer**.
 
 ### Mutate: the product story
 
-| Workload | jshift | serde_json (parse + set + `to_vec`) | **Speedup** |
+| Workload | jshift | serde_json (parse + set + `to_vec`) | **jshift vs serde** |
 | :--- | ---: | ---: | ---: |
-| **Key-last ~10MB** (same-length overwrite) | ~13 ms | ~200 ms | **~15×** |
-| **Small ~1KB** | ~74 ns | ~7.5 µs | **~100×** |
+| **Key-last ~10MB** (same-length overwrite) | ~11.3 ms | ~198 ms | **~18× faster** |
+| **Small ~1KB** | ~76 ns | ~7.3 µs | **~95× faster** |
+
+**One-liner:** *Selective in-place mutate is where jshift shines—about **~18×** (large) to **~100×** (small) versus “parse whole tree, change one field, re-serialize.”*
 
 This is the “gateway / JSONL cleaner / feature-flag rewrite” workload: change a field, keep shipping the rest of the bytes.
 
@@ -182,21 +197,23 @@ Same model for every engine: **eight workers**, each extracts `target` from a **
 
 #### Key-last ~10MB (must skip the array)
 
-| Engine | Mean (8-way wall) | **vs serde** |
-| :--- | ---: | ---: |
-| gjson ×8 | ~10 ms | **~44×** |
-| jshift ×8 | ~21 ms | **~21×** |
-| serde_json ×8 | ~443 ms | 1× |
+| Engine | Mean (8-way wall) | **vs serde** | **vs gjson** |
+| :--- | ---: | ---: | ---: |
+| gjson ×8 | ~10.3 ms | **~43× faster** | 1× |
+| jshift ×8 | ~20.1 ms | **~22× faster** | ~2.0× slower |
+| serde_json ×8 | ~442 ms | 1× | — |
+
+**One-liner:** *Under 8-way key-last load, jshift is still **~22×** faster than parallel full parses; gjson leads pure read (~2×) on this shape.*
 
 #### Key-first ~10MB (early exit)
 
-| Engine | Mean (8-way wall) | **vs serde** |
-| :--- | ---: | ---: |
-| **jshift ×8** | **~19 µs** | **~23,000×** |
-| gjson ×8 | ~19 µs | **~23,000×** |
-| serde_json ×8 | ~439 ms | 1× |
+| Engine | Mean (8-way wall) | **vs serde** | **vs gjson** |
+| :--- | ---: | ---: | ---: |
+| **jshift ×8** | **~18.7 µs** | **~22,000× faster** | **~1.02× (≈tie / slight win)** |
+| gjson ×8 | ~19.1 µs | **~21,000× faster** | 1× |
+| serde_json ×8 | ~404 ms | 1× | — |
 
-When the hot field sits near the front of the document—the common case for many APIs—path engines stay in the **microsecond** regime under parallel load while full parse stays in the **hundreds of milliseconds**.
+**One-liner:** *When the hot field is near the front—the common API case—eight workers finish in **~19 µs** with jshift vs **~400 ms** of full re-parses (**~22,000×**).*
 
 ```bash
 # Full suite
@@ -209,7 +226,9 @@ cargo bench --bench json_benchmark -- "Compete Find"
 cargo bench --bench json_benchmark -- "JSON Concurrent"
 ```
 
-These numbers are not a claim that jshift is always faster for every JSON task. For full typed deserialization and schema validation of entire documents, use serde.
+Large optional real-world fixtures (100MB+) belong **outside** crates.io and preferably outside this git history—see [benches/README.md](benches/README.md).
+
+These numbers are not a claim that jshift is always fastest for every JSON task. For full typed deserialization and schema validation of entire documents, use serde.
 
 ---
 
