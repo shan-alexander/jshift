@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `forbid(unsafe_code)`.
 - Concurrent bench: jshift / gjson / serde_json ×8 independent workers.
 - New **Compete Find** criterion groups (key-last 10MB, key-first 10MB, small+nested)
-  vs gjson and sonic-rs.
+  vs gjson, sonic-rs, and **serde_json**; README performance tables updated.
 
 ## [0.2.0] - 2026-07-19
 

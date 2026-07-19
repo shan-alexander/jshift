@@ -344,6 +344,12 @@ fn bench_compete_path_engines(c: &mut Criterion) {
                 )
             })
         });
+        group.bench_function("serde_json", |b| {
+            b.iter(|| {
+                let val: serde_json::Value = serde_json::from_slice(&last).unwrap();
+                assert_eq!(val["target"].as_u64().unwrap(), 123456);
+            })
+        });
         group.finish();
     }
 
@@ -365,6 +371,12 @@ fn bench_compete_path_engines(c: &mut Criterion) {
                         .as_raw_str(),
                     "123456"
                 )
+            })
+        });
+        group.bench_function("serde_json", |b| {
+            b.iter(|| {
+                let val: serde_json::Value = serde_json::from_slice(&first).unwrap();
+                assert_eq!(val["target"].as_u64().unwrap(), 123456);
             })
         });
         group.finish();
@@ -390,6 +402,12 @@ fn bench_compete_path_engines(c: &mut Criterion) {
                 )
             })
         });
+        group.bench_function("serde_top", |b| {
+            b.iter(|| {
+                let val: serde_json::Value = serde_json::from_slice(&small).unwrap();
+                assert_eq!(val["target"].as_u64().unwrap(), 123456);
+            })
+        });
         group.bench_function("jshift_nested", |b| {
             b.iter(|| assert_eq!(jshift::find_value(&small, &nested).unwrap(), b"1"))
         });
@@ -404,6 +422,12 @@ fn bench_compete_path_engines(c: &mut Criterion) {
                         .as_raw_str(),
                     "1"
                 )
+            })
+        });
+        group.bench_function("serde_nested", |b| {
+            b.iter(|| {
+                let val: serde_json::Value = serde_json::from_slice(&small).unwrap();
+                assert_eq!(val["meta"]["ver"].as_u64().unwrap(), 1);
             })
         });
         group.finish();

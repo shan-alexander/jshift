@@ -19,20 +19,54 @@ It is built for high-performance middleboxes, API gateways, webhook routers, and
 
 ## Performance (illustrative)
 
-Benchmarks on a ~10MB document where the target key sits after a large array, comparing jshift path scan/mutate vs full `serde_json` parse + (for writes) re-serialize:
+Measured with Criterion on this repo’s `benches/json_benchmark.rs` (release, one Linux host).
+Means are approximate; re-run on your machine before publishing claims.
 
-| Benchmark | Engine | Mean | vs `serde_json` |
-| :--- | :--- | :--- | :--- |
-| **Find Value** | `serde_json` | ~239 ms | baseline |
-| | `jshift` | ~12 ms | ~20× |
-| **Mutate Value** | `serde_json` | ~211 ms | baseline |
-| | `jshift` | ~11 ms | ~19× |
+Path engines: **jshift** (safe Rust), **gjson**, **sonic-rs**.  
+Full parse baseline: **serde_json** (`Value` parse + field access; mutate = parse + set + re-serialize).
 
-These numbers reflect that workload and machine; they are not a claim that jshift is always faster than serde for every JSON task. For full typed deserialization, use serde.
+### Compete Find — path engines + serde
+
+| Workload | jshift | gjson | sonic-rs | serde_json |
+| :--- | ---: | ---: | ---: | ---: |
+| **Key-last ~10MB** (target after huge array) | ~10.9 ms | ~5.2 ms | ~27.5 ms | ~220–360 ms |
+| **Key-first ~10MB** (target is first field) | ~37 ns | ~89 ns | ~90 ns | ~220 ms |
+| **Small ~1KB** top-level key | ~38 ns | ~88 ns | ~93 ns | ~6 µs |
+| **Small ~1KB** nested `meta.ver` | ~107 ns | ~145 ns | ~162 ns | ~6 µs |
+
+**How to read this**
+
+* **vs serde_json:** path scans avoid building an AST. On large docs the gap is often **10–1000×+** depending on key placement; on small docs still **~100×** for a single field.
+* **Key position matters:** with the key first, jshift/gjson/sonic finish in **nanoseconds** while serde still pays a full ~10MB parse (**milliseconds**).
+* **Key-last large array:** gjson can lead on pure find (~2× here). jshift stays ahead of sonic-rs and far ahead of serde; jshift’s niche is **in-place mutate**, not being a pure finder.
+* jshift is **`#![forbid(unsafe_code)]`**; gjson’s hot skip path uses unchecked loads.
+
+### Mutate (jshift’s product story)
+
+| Workload | jshift | serde_json (parse + set + `to_vec`) |
+| :--- | ---: | ---: |
+| **Key-last ~10MB** (same-length overwrite) | ~13 ms | ~200 ms |
+| **Small ~1KB** | ~74 ns | ~7.5 µs |
+
+### Concurrent find (8 workers, key-last 10MB)
+
+Each worker independently extracts `target` from the same buffer (serde re-parses per worker):
+
+| Engine | Mean (8-way wall) |
+| :--- | ---: |
+| gjson ×8 | ~9.6 ms |
+| jshift ×8 | ~21 ms |
+| serde_json ×8 | ~460 ms |
 
 ```bash
+# Full suite
 cargo bench
+
+# Head-to-head find groups (includes serde)
+cargo bench --bench json_benchmark -- "Compete Find"
 ```
+
+These are not a claim that jshift is always fastest for every JSON task. For full typed deserialization, use serde.
 
 ---
 
@@ -40,7 +74,7 @@ cargo bench
 
 ```toml
 [dependencies]
-jshift = "0.1"
+jshift = "0.2"
 ```
 
 ---
