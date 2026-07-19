@@ -31,6 +31,14 @@ pub enum Error {
         /// Encountered type name (e.g. `"primitive"`).
         found: &'static str,
     },
+    /// JMESPath evaluation error (invalid function use, incomparable types, …).
+    ///
+    /// Distinct from “no value” outcomes: under default [`crate::MissingPolicy::Skip`],
+    /// missing paths project to JSON `null` rather than this error.
+    Jmespath {
+        /// Informative message.
+        msg: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -51,6 +59,7 @@ impl std::fmt::Display for Error {
                     expected, found
                 )
             }
+            Error::Jmespath { msg } => write!(f, "JMESPath error: {}", msg),
         }
     }
 }

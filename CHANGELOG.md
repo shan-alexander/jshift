@@ -17,11 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **JMESPath surface:** filters `[?…]`, signed indices/slices, object projection
   (`*` / `foo.*` / `*.bar`), multi-select list/hash, pipe/flatten, comparisons &
   `&&`/`||`/`!`, expression refs `&expr`, functions including higher-order
-  `map` / `sort_by` / `group_by` plus `length`, `keys`, `values`, `type`,
-  `to_string`, `to_number`, `starts_with`, `ends_with`, `contains`, `not_null`,
-  `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`, `abs`/`ceil`/`floor`,
-  `to_array`, `merge`; string/JSON/raw literals; parentheses.
-- **Tests:** `tests/jmespath_features.rs` exercises the full supported surface.
+  `map` / `sort_by` / `max_by` / `min_by` / `group_by` plus `length`, `keys`,
+  `values`, `type`, `to_string`, `to_number`, `starts_with`, `ends_with`,
+  `contains`, `not_null`, `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`,
+  `abs`/`ceil`/`floor`, `to_array`, `merge`; quoted identifiers; projections omit
+  nulls; missing paths → JSON `null` under default soft policy; `Error::Jmespath`.
+- **Tests:** `tests/jmespath_features.rs`; official suite runner
+  `tests/jmespath_compliance.rs` + vendored `tests/fixtures/jmespath/` (tier A
+  strict; full suite floors). CI job runs compliance.
 - **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
   (gitignored fixtures under `benches/data/`; skips when absent).
 - **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).

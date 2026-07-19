@@ -28,6 +28,8 @@ jobs:
         run: cargo test --no-default-features --doc
       - name: cargo test (explicit derive feature)
         run: cargo test --no-default-features --features derive --lib
+      - name: JMESPath compliance (tier A + full suite gate)
+        run: cargo test --test jmespath_compliance -- --nocapture
 
   clippy:
     name: clippy

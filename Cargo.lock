@@ -330,6 +330,7 @@ dependencies = [
  "jshift-derive",
  "memchr",
  "rayon",
+ "serde",
  "serde_json",
  "sonic-rs",
 ]

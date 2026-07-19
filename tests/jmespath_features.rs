@@ -109,7 +109,8 @@ fn comparisons_and_logic() {
 #[test]
 fn literals_styles() {
     let j = br#"{"a":1}"#;
-    assert_eq!(jp(j, "{a: a, b: \"hi\"}"), br#"{"a":1,"b":"hi"}"#);
+    // Double quotes are identifiers; use raw/JSON literals for string values.
+    assert_eq!(jp(j, "{a: a, b: 'hi'}"), br#"{"a":1,"b":"hi"}"#);
     assert_eq!(jp(j, "{a: a, b: 'hi'}"), br#"{"a":1,"b":"hi"}"#);
     assert_eq!(jp(j, "{a: a, b: `null`}"), br#"{"a":1,"b":null}"#);
     assert_eq!(jp(j, "{a: a, b: `true`}"), br#"{"a":1,"b":true}"#);
@@ -224,6 +225,34 @@ fn higher_order_pipeline() {
         jp(j, "map(&name, sort_by(people, &age))"),
         br#"["a","b","c"]"#
     );
+}
+
+#[test]
+fn fn_max_by_min_by() {
+    let j = br#"{"people":[{"name":"c","age":30},{"name":"a","age":20},{"name":"b","age":25}]}"#;
+    assert_eq!(
+        jp(j, "max_by(people, &age)"),
+        br#"{"name":"c","age":30}"#
+    );
+    assert_eq!(
+        jp(j, "min_by(people, &age)"),
+        br#"{"name":"a","age":20}"#
+    );
+    assert_eq!(jp(j, "max_by(`[]`, &age)"), b"null");
+}
+
+#[test]
+fn missing_field_is_null_not_error() {
+    let j = br#"{"foo":{"bar":1}}"#;
+    assert_eq!(jp(j, "foo.missing"), b"null");
+    assert_eq!(jp(j, "nope.nested.x"), b"null");
+}
+
+#[test]
+fn quoted_identifiers() {
+    let j = br#"{"foo.bar":1,"foo bar":2}"#;
+    assert_eq!(jp(j, "\"foo.bar\""), b"1");
+    assert_eq!(jp(j, "\"foo bar\""), b"2");
 }
 
 // ─── Array projection + multi-select ─────────────────────────────────────────

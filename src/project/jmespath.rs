@@ -7,8 +7,8 @@
 //! * multi-select hash / list, pipe `|`, flatten `| []`
 //! * functions: `length`, `keys`, `values`, `type`, `to_string`, `to_number`,
 //!   `starts_with`, `ends_with`, `contains`, `not_null`, `reverse`, `sort`,
-//!   `sort_by`, `map`, `group_by`, `join`, `max`, `min`, `sum`, `avg`, `abs`,
-//!   `ceil`, `floor`, `to_array`, `merge`
+//!   `sort_by`, `max_by`, `min_by`, `map`, `group_by`, `join`, `max`, `min`,
+//!   `sum`, `avg`, `abs`, `ceil`, `floor`, `to_array`, `merge`
 //! * expression references `&expr` for higher-order functions
 //! * object projection `*` / `foo.*` / `*.bar` (multi-select wildcards on objects)
 //! * literals: numbers, `"…"` / `'…'` (raw), `` `…` `` (JSON literal), true/false/null
@@ -310,18 +310,19 @@ impl<'a> Parser<'a> {
             return Ok(SelectExpr::Expref(Box::new(inner)));
         }
         if self.peek() == Some('{') {
-            return self.parse_multi_hash();
+            let expr = self.parse_multi_hash()?;
+            return self.parse_projection_suffixes(expr);
         }
-        // leading bracket: multi-list / index / filter / slice
+        // leading bracket: multi-list / index / filter / slice (+ further suffixes)
         if self.peek() == Some('[') {
-            return self.parse_bracket_expr();
+            let expr = self.parse_bracket_expr()?;
+            return self.parse_projection_suffixes(expr);
         }
         // leading object projection
         if self.peek() == Some('*') {
             self.bump();
-            let mut expr = SelectExpr::ObjectProjection(Box::new(SelectExpr::Identity));
-            expr = self.parse_projection_suffixes(expr)?;
-            return Ok(expr);
+            let expr = SelectExpr::ObjectProjection(Box::new(SelectExpr::Identity));
+            return self.parse_projection_suffixes(expr);
         }
         let mut expr = self.parse_atom()?;
         expr = self.parse_projection_suffixes(expr)?;
@@ -349,6 +350,10 @@ impl<'a> Parser<'a> {
                     } else if self.peek() == Some('[') {
                         let right = self.parse_bracket_expr()?;
                         expr = chain_sub(expr, right);
+                    } else if self.peek() == Some('"') {
+                        // Quoted identifier: "foo.bar", "foo bar", escapes
+                        let name = self.parse_dq_string_raw()?;
+                        expr = chain_sub(expr, SelectExpr::Field(name));
                     } else {
                         let name = self.parse_ident()?;
                         if self.peek() == Some('(') {
@@ -402,7 +407,11 @@ impl<'a> Parser<'a> {
                 self.eat(')')?;
                 Ok(SelectExpr::Paren(Box::new(e)))
             }
-            Some('"') => self.parse_dq_string_literal(),
+            // Double-quoted = identifier (may contain dots/spaces). Single-quoted = string literal.
+            Some('"') => {
+                let name = self.parse_dq_string_raw()?;
+                Ok(SelectExpr::Field(name))
+            }
             Some('\'') => self.parse_raw_string_literal(),
             Some('`') => self.parse_backtick_literal(),
             Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number_literal(),
@@ -615,11 +624,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(SelectExpr::MultiSelectList(items))
-    }
-
-    fn parse_dq_string_literal(&mut self) -> Result<SelectExpr, Error> {
-        let raw = self.parse_dq_string_raw()?;
-        Ok(SelectExpr::Literal(encode_json_string(&raw)))
     }
 
     fn parse_dq_string_raw(&mut self) -> Result<String, Error> {

@@ -1,5 +1,6 @@
 //! Projection emitter: walk input spans, write output per [`SelectExpr`].
 
+use crate::convert::escape_json_key;
 use crate::error::Error;
 use crate::project::plan::{MissingPolicy, ProjectPlan, ProjectStyle};
 use crate::project::select::{
@@ -26,9 +27,20 @@ pub(crate) fn emit_value(
             Ok(())
         }
         SelectExpr::Field(key) => {
-            let (s, e) = find_object_value_span(json, start, end, key.as_bytes())?;
-            out.extend_from_slice(&json[s..e]);
-            Ok(())
+            // Logical key → on-wire escaped form for matching document bytes.
+            let wire = escape_json_key(key);
+            match find_object_value_span(json, start, end, wire.as_bytes()) {
+                Ok((s, e)) => {
+                    out.extend_from_slice(&json[s..e]);
+                    Ok(())
+                }
+                // JMESPath: missing field / non-object → null (when soft policy).
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+                    out.extend_from_slice(b"null");
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         SelectExpr::Literal(bytes) => {
             out.extend_from_slice(bytes);
@@ -56,17 +68,20 @@ pub(crate) fn emit_value(
             emit_value(json, start, end, inner, ctx, &mut mid)?;
             flatten_emit(&mid, ctx, out)
         }
-        SelectExpr::Sub(left, right) => {
-            if let Some((s, e)) = resolve_focus(json, start, end, left)? {
-                emit_value(json, s, e, right, ctx, out)
-            } else {
-                let mut mid = Vec::new();
-                emit_value(json, start, end, left, ctx, &mut mid)?;
-                let m0 = skip_whitespace(&mid, 0);
-                let m1 = skip_value(&mid, m0)?;
-                emit_value(&mid, m0, m1, right, ctx, out)
+        SelectExpr::Sub(left, right) => match resolve_focus(json, start, end, left) {
+            Ok(Some((s, e))) => emit_value(json, s, e, right, ctx, out),
+            Ok(None) if soft_null(ctx) => {
+                // Missing intermediate (JMESPath → null).
+                out.extend_from_slice(b"null");
+                Ok(())
             }
-        }
+            Ok(None) => Err(Error::PathNotFound),
+            Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+                out.extend_from_slice(b"null");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         SelectExpr::Cmp { op, left, right } => {
             let lv = eval_buf(json, start, end, left, ctx)?;
             let rv = eval_buf(json, start, end, right, ctx)?;
@@ -120,19 +135,56 @@ fn emit_object_projection(
     ctx: &mut EmitCtx<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    let (_, members, _) = collect_object_members(json, start, end)?;
+    let (_, members, _) = match collect_object_members(json, start, end) {
+        Ok(x) => x,
+        Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    // JMESPath projections omit null results.
+    emit_projection_list(
+        members
+            .iter()
+            .map(|m| (json, m.val_start, m.val_end))
+            .collect(),
+        each,
+        ctx,
+        out,
+    )
+}
+
+/// Emit `[...]` from evaluating `each` on each span; skip JSON null (projection rule).
+fn emit_projection_list(
+    spans: Vec<(&[u8], usize, usize)>,
+    each: &SelectExpr,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
     out.push(b'[');
-    for (i, m) in members.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (buf, s, e) in spans {
+        let mut piece = Vec::new();
+        emit_value(buf, s, e, each, ctx, &mut piece)?;
+        if trim_json(&piece) == b"null" {
+            continue;
+        }
+        if !first {
             out.push(b',');
         }
         maybe_pretty_newline_indent(ctx, out, true);
         ctx.depth += 1;
-        emit_value(json, m.val_start, m.val_end, each, ctx, out)?;
+        out.extend_from_slice(&piece);
         ctx.depth -= 1;
+        first = false;
     }
     emit_close_array(ctx, out);
     Ok(())
+}
+
+fn soft_null(ctx: &EmitCtx<'_>) -> bool {
+    ctx.plan.missing == MissingPolicy::Skip
 }
 
 fn eval_buf(
@@ -145,7 +197,12 @@ fn eval_buf(
     let mut v = Vec::new();
     match emit_value(json, start, end, expr, ctx, &mut v) {
         Ok(()) => Ok(v),
-        Err(Error::PathNotFound) if ctx.plan.missing == MissingPolicy::Skip => Ok(b"null".to_vec()),
+        // Soft failures → JSON null (JMESPath “no value”).
+        Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) | Err(Error::IndexOutOfBounds { .. })
+            if soft_null(ctx) =>
+        {
+            Ok(b"null".to_vec())
+        }
         Err(e) => Err(e),
     }
 }
@@ -254,9 +311,15 @@ fn resolve_focus(
     expr: &SelectExpr,
 ) -> Result<Option<(usize, usize)>, Error> {
     match expr {
+        SelectExpr::Identity | SelectExpr::Current => Ok(Some((start, end))),
+        SelectExpr::Paren(inner) => resolve_focus(json, start, end, inner),
         SelectExpr::Field(key) => {
-            let (s, e) = find_object_value_span(json, start, end, key.as_bytes())?;
-            Ok(Some((s, e)))
+            let wire = escape_json_key(key);
+            match find_object_value_span(json, start, end, wire.as_bytes()) {
+                Ok((s, e)) => Ok(Some((s, e))),
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
         }
         SelectExpr::Object(obj) if obj.len() == 1 => {
             let key = obj.keys().next().unwrap();
@@ -457,7 +520,14 @@ fn emit_object(
     ctx: &mut EmitCtx<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    let (obj_start, members, close_pos) = collect_object_members(json, start, end)?;
+    let (obj_start, members, close_pos) = match collect_object_members(json, start, end) {
+        Ok(x) => x,
+        Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut kept: Vec<(&Member<'_>, &SelectExpr)> = Vec::new();
     for m in &members {
@@ -571,7 +641,14 @@ fn emit_array(
     ctx: &mut EmitCtx<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    let elems = collect_array_elems(json, start, end)?;
+    let elems = match collect_array_elems(json, start, end) {
+        Ok(e) => e,
+        Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let mut kept: Vec<(usize, usize, SelectExpr)> = Vec::new();
     match sel {
         ArraySelect::Each(child) => {
@@ -633,15 +710,28 @@ fn emit_array(
         }
     }
 
+    // JMESPath list projections (`[*]`, slices, filters+project) omit nulls.
+    // Index-only multi selections with >1 index still use kept list as-is.
+    let omit_nulls = matches!(
+        sel,
+        ArraySelect::Each(_) | ArraySelect::Slice { .. } | ArraySelect::Filter { .. }
+    );
     out.push(b'[');
-    for (i, (s, e, child)) in kept.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (s, e, child) in &kept {
+        let mut piece = Vec::new();
+        emit_value(json, *s, *e, child, ctx, &mut piece)?;
+        if omit_nulls && trim_json(&piece) == b"null" {
+            continue;
+        }
+        if !first {
             out.push(b',');
         }
         maybe_pretty_newline_indent(ctx, out, true);
         ctx.depth += 1;
-        emit_value(json, *s, *e, child, ctx, out)?;
+        out.extend_from_slice(&piece);
         ctx.depth -= 1;
+        first = false;
     }
     emit_close_array(ctx, out);
     let _ = end;
@@ -828,7 +918,7 @@ fn emit_call(
         // map(&expr, array) — apply expr to each element
         "map" => {
             if args.len() < 2 {
-                return Err(Error::InvalidPath {
+                return Err(Error::Jmespath {
                     msg: "map requires (&expression, array)",
                 });
             }
@@ -854,20 +944,44 @@ fn emit_call(
         // sort_by(array, &expr)
         "sort_by" => {
             if args.len() < 2 {
-                return Err(Error::InvalidPath {
+                return Err(Error::Jmespath {
                     msg: "sort_by requires (array, &expression)",
                 });
             }
             let arr_v = eval_buf(json, start, end, &args[0], ctx)?;
             let key_expr = unwrap_expref(&args[1]).clone();
             let arr = trim_json(&arr_v);
+            if !arr.starts_with(b"[") {
+                if soft_null(ctx) {
+                    out.extend_from_slice(b"null");
+                    return Ok(());
+                }
+                return Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: type_name_json(arr),
+                });
+            }
             let elems = collect_array_elems(arr, 0, arr.len())?;
             let mut keyed: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(elems.len());
             for &(s, e) in &elems {
                 let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
                 keyed.push((trim_json(&key).to_vec(), s, e));
             }
-            keyed.sort_by(|a, b| cmp_sort_keys(&a.0, &b.0));
+            for i in 0..keyed.len() {
+                for j in i + 1..keyed.len() {
+                    if keyed[i].0 != b"null" && keyed[j].0 != b"null" {
+                        let _ = cmp_sort_keys_strict(&keyed[i].0, &keyed[j].0)?;
+                    }
+                }
+            }
+            keyed.sort_by(|a, b| {
+                match (a.0.as_slice() == b"null", b.0.as_slice() == b"null") {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => cmp_sort_keys(&a.0, &b.0),
+                }
+            });
             out.push(b'[');
             for (i, (_, s, e)) in keyed.iter().enumerate() {
                 if i > 0 {
@@ -881,13 +995,23 @@ fn emit_call(
         // group_by(array, &expr) → array of groups (arrays of original elements)
         "group_by" => {
             if args.len() < 2 {
-                return Err(Error::InvalidPath {
+                return Err(Error::Jmespath {
                     msg: "group_by requires (array, &expression)",
                 });
             }
             let arr_v = eval_buf(json, start, end, &args[0], ctx)?;
             let key_expr = unwrap_expref(&args[1]).clone();
             let arr = trim_json(&arr_v);
+            if !arr.starts_with(b"[") {
+                if soft_null(ctx) {
+                    out.extend_from_slice(b"null");
+                    return Ok(());
+                }
+                return Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: type_name_json(arr),
+                });
+            }
             let elems = collect_array_elems(arr, 0, arr.len())?;
             // Preserve first-seen key order
             let mut order: Vec<Vec<u8>> = Vec::new();
@@ -920,23 +1044,94 @@ fn emit_call(
             out.push(b']');
             Ok(())
         }
-        _ => Err(Error::InvalidPath {
+        // max_by(array, &expr) / min_by(array, &expr) → single element or null
+        "max_by" | "min_by" => {
+            if args.len() < 2 {
+                return Err(Error::Jmespath {
+                    msg: "max_by/min_by requires (array, &expression)",
+                });
+            }
+            let want_max = name == "max_by";
+            let arr_v = eval_buf(json, start, end, &args[0], ctx)?;
+            let key_expr = unwrap_expref(&args[1]).clone();
+            let arr = trim_json(&arr_v);
+            if !arr.starts_with(b"[") {
+                if soft_null(ctx) {
+                    out.extend_from_slice(b"null");
+                    return Ok(());
+                }
+                return Err(Error::TypeMismatch {
+                    expected: "array",
+                    found: type_name_json(arr),
+                });
+            }
+            let elems = collect_array_elems(arr, 0, arr.len())?;
+            if elems.is_empty() {
+                out.extend_from_slice(b"null");
+                return Ok(());
+            }
+            let mut best_i = 0usize;
+            let mut best_key: Option<Vec<u8>> = None;
+            for (i, &(s, e)) in elems.iter().enumerate() {
+                let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
+                let key = trim_json(&key).to_vec();
+                if key.as_slice() == b"null" {
+                    continue;
+                }
+                match &best_key {
+                    None => {
+                        best_key = Some(key);
+                        best_i = i;
+                    }
+                    Some(bk) => {
+                        let ord = cmp_sort_keys_strict(&key, bk)?;
+                        let better = if want_max {
+                            ord == std::cmp::Ordering::Greater
+                        } else {
+                            ord == std::cmp::Ordering::Less
+                        };
+                        if better {
+                            best_key = Some(key);
+                            best_i = i;
+                        }
+                    }
+                }
+            }
+            if best_key.is_none() {
+                out.extend_from_slice(b"null");
+                return Ok(());
+            }
+            let (s, e) = elems[best_i];
+            out.extend_from_slice(&arr[s..e]);
+            Ok(())
+        }
+        _ => Err(Error::Jmespath {
             msg: "Unknown JMESPath function",
         }),
     }
 }
 
 fn cmp_sort_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    cmp_sort_keys_strict(a, b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Comparable JMESPath keys: both numbers or both strings; else error.
+fn cmp_sort_keys_strict(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering, Error> {
     if let (Ok(na), Ok(nb)) = (parse_f64(a), parse_f64(b)) {
-        return na
+        return Ok(na
             .partial_cmp(&nb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(b));
+            .unwrap_or(std::cmp::Ordering::Equal));
     }
     if let (Some(sa), Some(sb)) = (json_string_content(a), json_string_content(b)) {
-        return sa.cmp(sb);
+        return Ok(sa.cmp(sb));
     }
-    a.cmp(b)
+    // nulls sort equal only to null
+    if a == b"null" && b == b"null" {
+        return Ok(std::cmp::Ordering::Equal);
+    }
+    Err(Error::Jmespath {
+        msg: "incomparable types in sort_by/max_by/min_by key",
+    })
 }
 
 fn write_json_string_out(out: &mut Vec<u8>, s: &str) {

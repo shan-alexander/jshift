@@ -9,9 +9,9 @@
 //! | Plan | [`plan`] | [`ProjectPlan`], styles, missing policy |
 //! | Emit | [`emit`] | one-pass writer with style fidelity hooks |
 //!
-//! Future: full JMESPath filters/functions, deeper transforms, richer whitespace
-//! all attach as new [`SelectExpr`] arms or style modes without replacing
-//! [`project`].
+//! JMESPath compliance: see `tests/jmespath_compliance.rs` (tier A must-pass;
+//! full suite gate). Null semantics: missing paths / failed projections emit JSON
+//! `null` under default [`MissingPolicy::Skip`]; hard failures use [`crate::Error::Jmespath`].
 
 mod emit;
 mod jmespath;
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn project_jmespath_literal_field() {
         let json = br#"{"id":1}"#;
-        let out = project_jmespath(json, "{id: id, source: \"teefury\"}").unwrap();
+        let out = project_jmespath(json, "{id: id, source: 'teefury'}").unwrap();
         assert_eq!(out, br#"{"id":1,"source":"teefury"}"#);
     }
 
