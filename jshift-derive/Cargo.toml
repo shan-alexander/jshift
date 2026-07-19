@@ -2,6 +2,7 @@
 name = "jshift-derive"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
 description = "Procedural derive macros for the jshift crate."
 license = "MIT OR Apache-2.0"

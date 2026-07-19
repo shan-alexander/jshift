@@ -2,6 +2,7 @@
 name = "jshift"
 version = "0.1.1"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
 description = "Schema-guided, safe in-place JSON path reader and mutator for raw byte buffers."
 license = "MIT OR Apache-2.0"

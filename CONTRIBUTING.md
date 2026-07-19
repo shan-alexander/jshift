@@ -43,7 +43,10 @@ breaking (and versioned accordingly).
 ## Coding guidelines
 
 - `#![forbid(unsafe_code)]` stays on. Do not introduce `unsafe`.
+- Prefer nested `if` / early returns over `let` chains so the style stays simple.
 - Prefer small modules and `pub(crate)` helpers over growing `lib.rs` again.
+- Mutation helpers must use checked spans/growth (`validate_span`, `grow_and_shift_right`)
+  rather than bare `json[start]` on untrusted offsets.
 - Mutations must keep surrounding JSON structurally intact (commas, braces).
 - Keys and string values that go on the wire must be escaped (`write_json_string`
   / `escape_json_key`). Logical key APIs (`upsert_object_key`, `delete_key`)

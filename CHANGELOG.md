@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Avoid `let` chains for broader readability / simpler MSRV story within edition 2024.
+- Document `rust-version = "1.85"` (edition 2024 floor).
+
+### Fixed
+- Mutation helpers no longer panic on empty buffers or empty replacement payloads.
+- Checked buffer growth / delete spans; container delimiter validation on array/object ops.
+- String unescape rejects raw controls and lone surrogates; accepts UTF-16 surrogate pairs.
+
 ## [0.1.1] - 2026-07-19
 
 ### Changed
