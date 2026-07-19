@@ -96,8 +96,43 @@ pub(crate) fn emit_value(
             Ok(())
         }
         SelectExpr::Call { name, args } => emit_call(json, start, end, name, args, ctx, out),
+        SelectExpr::Expref(inner) => {
+            // Bare expref is invalid at runtime; treat as identity of current for debug.
+            emit_value(json, start, end, inner, ctx, out)
+        }
+        SelectExpr::ObjectProjection(each) => emit_object_projection(json, start, end, each, ctx, out),
         SelectExpr::Paren(inner) => emit_value(json, start, end, inner, ctx, out),
     }
+}
+
+fn unwrap_expref(expr: &SelectExpr) -> &SelectExpr {
+    match expr {
+        SelectExpr::Expref(inner) | SelectExpr::Paren(inner) => unwrap_expref(inner),
+        other => other,
+    }
+}
+
+fn emit_object_projection(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    each: &SelectExpr,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let (_, members, _) = collect_object_members(json, start, end)?;
+    out.push(b'[');
+    for (i, m) in members.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        maybe_pretty_newline_indent(ctx, out, true);
+        ctx.depth += 1;
+        emit_value(json, m.val_start, m.val_end, each, ctx, out)?;
+        ctx.depth -= 1;
+    }
+    emit_close_array(ctx, out);
+    Ok(())
 }
 
 fn eval_buf(
@@ -790,10 +825,118 @@ fn emit_call(
             out.push(b'}');
             Ok(())
         }
+        // map(&expr, array) — apply expr to each element
+        "map" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidPath {
+                    msg: "map requires (&expression, array)",
+                });
+            }
+            let mapper = unwrap_expref(&args[0]).clone();
+            let arr_v = eval_buf(json, start, end, &args[1], ctx)?;
+            let arr = trim_json(&arr_v);
+            let elems = collect_array_elems(arr, 0, arr.len())?;
+            out.push(b'[');
+            for (i, &(s, e)) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                let mut piece = Vec::new();
+                match emit_value(arr, s, e, &mapper, ctx, &mut piece) {
+                    Ok(()) => out.extend_from_slice(&piece),
+                    Err(Error::PathNotFound) => out.extend_from_slice(b"null"),
+                    Err(err) => return Err(err),
+                }
+            }
+            out.push(b']');
+            Ok(())
+        }
+        // sort_by(array, &expr)
+        "sort_by" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidPath {
+                    msg: "sort_by requires (array, &expression)",
+                });
+            }
+            let arr_v = eval_buf(json, start, end, &args[0], ctx)?;
+            let key_expr = unwrap_expref(&args[1]).clone();
+            let arr = trim_json(&arr_v);
+            let elems = collect_array_elems(arr, 0, arr.len())?;
+            let mut keyed: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(elems.len());
+            for &(s, e) in &elems {
+                let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
+                keyed.push((trim_json(&key).to_vec(), s, e));
+            }
+            keyed.sort_by(|a, b| cmp_sort_keys(&a.0, &b.0));
+            out.push(b'[');
+            for (i, (_, s, e)) in keyed.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&arr[*s..*e]);
+            }
+            out.push(b']');
+            Ok(())
+        }
+        // group_by(array, &expr) → array of groups (arrays of original elements)
+        "group_by" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidPath {
+                    msg: "group_by requires (array, &expression)",
+                });
+            }
+            let arr_v = eval_buf(json, start, end, &args[0], ctx)?;
+            let key_expr = unwrap_expref(&args[1]).clone();
+            let arr = trim_json(&arr_v);
+            let elems = collect_array_elems(arr, 0, arr.len())?;
+            // Preserve first-seen key order
+            let mut order: Vec<Vec<u8>> = Vec::new();
+            let mut groups: std::collections::HashMap<Vec<u8>, Vec<(usize, usize)>> =
+                std::collections::HashMap::new();
+            for &(s, e) in &elems {
+                let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
+                let key = trim_json(&key).to_vec();
+                if !groups.contains_key(&key) {
+                    order.push(key.clone());
+                    groups.insert(key.clone(), Vec::new());
+                }
+                groups.get_mut(&key).unwrap().push((s, e));
+            }
+            out.push(b'[');
+            for (gi, k) in order.iter().enumerate() {
+                if gi > 0 {
+                    out.push(b',');
+                }
+                out.push(b'[');
+                let g = groups.get(k).unwrap();
+                for (i, &(s, e)) in g.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(&arr[s..e]);
+                }
+                out.push(b']');
+            }
+            out.push(b']');
+            Ok(())
+        }
         _ => Err(Error::InvalidPath {
             msg: "Unknown JMESPath function",
         }),
     }
+}
+
+fn cmp_sort_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    if let (Ok(na), Ok(nb)) = (parse_f64(a), parse_f64(b)) {
+        return na
+            .partial_cmp(&nb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b));
+    }
+    if let (Some(sa), Some(sb)) = (json_string_content(a), json_string_content(b)) {
+        return sa.cmp(sb);
+    }
+    a.cmp(b)
 }
 
 fn write_json_string_out(out: &mut Vec<u8>, s: &str) {

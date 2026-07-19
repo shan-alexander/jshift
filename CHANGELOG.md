@@ -14,10 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse_project_path` / `parse_jmespath_expr`, styles (`Compact`, richer
   `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
   Derive / `JsonView`: `schema_project_plan`, `project_json` / `project_bytes`.
-- **JMESPath surface:** filters `[?…]`, signed indices/slices, functions
-  (`length`, `keys`, `values`, `type`, `to_string`, `to_number`, `starts_with`,
-  `ends_with`, `contains`, `not_null`, `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`,
-  `abs`/`ceil`/`floor`, `to_array`, `merge`), raw/` backtick literals, parentheses.
+- **JMESPath surface:** filters `[?…]`, signed indices/slices, object projection
+  (`*` / `foo.*` / `*.bar`), multi-select list/hash, pipe/flatten, comparisons &
+  `&&`/`||`/`!`, expression refs `&expr`, functions including higher-order
+  `map` / `sort_by` / `group_by` plus `length`, `keys`, `values`, `type`,
+  `to_string`, `to_number`, `starts_with`, `ends_with`, `contains`, `not_null`,
+  `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`, `abs`/`ceil`/`floor`,
+  `to_array`, `merge`; string/JSON/raw literals; parentheses.
+- **Tests:** `tests/jmespath_features.rs` exercises the full supported surface.
 - **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
   (gitignored fixtures under `benches/data/`; skips when absent).
 - **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).

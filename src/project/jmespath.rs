@@ -7,12 +7,13 @@
 //! * multi-select hash / list, pipe `|`, flatten `| []`
 //! * functions: `length`, `keys`, `values`, `type`, `to_string`, `to_number`,
 //!   `starts_with`, `ends_with`, `contains`, `not_null`, `reverse`, `sort`,
-//!   `join`, `max`, `min`, `sum`, `avg`, `abs`, `ceil`, `floor`, `to_array`, `merge`
+//!   `sort_by`, `map`, `group_by`, `join`, `max`, `min`, `sum`, `avg`, `abs`,
+//!   `ceil`, `floor`, `to_array`, `merge`
+//! * expression references `&expr` for higher-order functions
+//! * object projection `*` / `foo.*` / `*.bar` (multi-select wildcards on objects)
 //! * literals: numbers, `"…"` / `'…'` (raw), `` `…` `` (JSON literal), true/false/null
 //!
-//! Not yet: `sort_by` / `map` / `group_by` higher-order functions (full arity),
-//! parent-axis (JMESPath has no `..` parent; use pipe from outer context), unicode
-//! identifier edge cases.
+//! JMESPath has no parent axis (`..`); use pipe from an outer context.
 
 use crate::error::Error;
 use crate::project::select::{
@@ -302,6 +303,12 @@ impl<'a> Parser<'a> {
 
     fn parse_project(&mut self) -> Result<SelectExpr, Error> {
         self.skip_ws();
+        // Expression reference binds tighter than pipe: &foo.bar
+        if self.peek() == Some('&') {
+            self.bump();
+            let inner = self.parse_project()?;
+            return Ok(SelectExpr::Expref(Box::new(inner)));
+        }
         if self.peek() == Some('{') {
             return self.parse_multi_hash();
         }
@@ -309,14 +316,34 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('[') {
             return self.parse_bracket_expr();
         }
+        // leading object projection
+        if self.peek() == Some('*') {
+            self.bump();
+            let mut expr = SelectExpr::ObjectProjection(Box::new(SelectExpr::Identity));
+            expr = self.parse_projection_suffixes(expr)?;
+            return Ok(expr);
+        }
         let mut expr = self.parse_atom()?;
+        expr = self.parse_projection_suffixes(expr)?;
+        Ok(expr)
+    }
+
+    /// `.field`, `.*`, `[…]`, `(args)` suffixes after a projectable expr.
+    fn parse_projection_suffixes(&mut self, mut expr: SelectExpr) -> Result<SelectExpr, Error> {
         loop {
             self.skip_ws();
             match self.peek() {
                 Some('.') => {
                     self.bump();
                     self.skip_ws();
-                    if self.peek() == Some('{') {
+                    if self.peek() == Some('*') {
+                        self.bump();
+                        // object value projection after current
+                        expr = chain_sub(
+                            expr,
+                            SelectExpr::ObjectProjection(Box::new(SelectExpr::Identity)),
+                        );
+                    } else if self.peek() == Some('{') {
                         let right = self.parse_multi_hash()?;
                         expr = chain_sub(expr, right);
                     } else if self.peek() == Some('[') {
@@ -324,17 +351,11 @@ impl<'a> Parser<'a> {
                         expr = chain_sub(expr, right);
                     } else {
                         let name = self.parse_ident()?;
-                        // function call after dot? rare. field.
                         if self.peek() == Some('(') {
-                            // .func( not standard for JMESPath after field chain on left...
-                            // treat as Field then ignore - actually illegal; parse as call on current?
                             let args = self.parse_arg_list()?;
                             expr = chain_sub(
                                 expr,
-                                SelectExpr::Call {
-                                    name,
-                                    args,
-                                },
+                                SelectExpr::Call { name, args },
                             );
                         } else {
                             expr = chain_sub(expr, SelectExpr::Field(name));
@@ -346,7 +367,6 @@ impl<'a> Parser<'a> {
                     expr = chain_sub(expr, bracket);
                 }
                 Some('(') => {
-                    // function call: name already consumed as Field
                     if let SelectExpr::Field(name) = expr {
                         let args = self.parse_arg_list()?;
                         expr = SelectExpr::Call { name, args };
@@ -366,6 +386,15 @@ impl<'a> Parser<'a> {
             Some('@') => {
                 self.bump();
                 Ok(SelectExpr::Current)
+            }
+            Some('&') => {
+                self.bump();
+                let inner = self.parse_project()?;
+                Ok(SelectExpr::Expref(Box::new(inner)))
+            }
+            Some('*') => {
+                self.bump();
+                Ok(SelectExpr::ObjectProjection(Box::new(SelectExpr::Identity)))
             }
             Some('(') => {
                 self.bump();
@@ -712,6 +741,10 @@ fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
         SelectExpr::Field(name) => {
             SelectExpr::Sub(Box::new(SelectExpr::Field(name)), Box::new(suffix))
         }
+        SelectExpr::ObjectProjection(inner) => {
+            // foo.*.bar → project each object value with .bar
+            SelectExpr::ObjectProjection(Box::new(chain_into(*inner, suffix)))
+        }
         SelectExpr::Array(ArraySelect::Each(inner)) => {
             SelectExpr::Array(ArraySelect::Each(Box::new(chain_into(*inner, suffix))))
         }
@@ -740,6 +773,7 @@ fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
         SelectExpr::Sub(left, right) => {
             SelectExpr::Sub(left, Box::new(chain_into(*right, suffix)))
         }
+        SelectExpr::Expref(inner) => SelectExpr::Expref(Box::new(chain_into(*inner, suffix))),
         SelectExpr::Paren(inner) => chain_sub(*inner, suffix),
         other => SelectExpr::Sub(Box::new(other), Box::new(suffix)),
     }

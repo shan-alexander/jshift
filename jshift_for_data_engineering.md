@@ -8,9 +8,9 @@ When these payloads are ingested with the standard Rust stack (`serde` + `serde_
 
 **Full materialization** — the entire JSON document is scanned, tokenized, and turned into owned Rust values (`String`, `Vec`, maps, nested structs, or a full `serde_json::Value` tree). Even if you only need one or two fields, a full deserialize still allocates heap memory for every key and every value that the chosen type (or `Value`) materializes.
 
-**Peak memory amplification** — when several such payloads are held in memory at once (common when batching API responses before writing to S3, a Hive-style partition, or an Iceberg table), resident set size (RSS) can climb into the multi-gigabyte range. This forces higher cloud instance sizes, triggers autoscaling, or leads teams into complex and error-prone chunking strategies.
+**Peak memory amplification** — when several such payloads are held in memory at once (common when batching API responses before writing to S3, a Hive-style partition, or an Iceberg table), resident set size (RSS) can climb into the multi-gigabyte range. This forces higher cloud instance sizes, triggers autoscaling (can be extremely expensive at scale), or leads teams into complex and error-prone chunking strategies.
 
-A concrete illustration of the *selective find* contrast (not a claim that every workload looks like this): on synthetic multi‑megabyte JSON, a full `serde_json` parse can sit in the hundreds of milliseconds while a path-only find that stops after the hot key finishes in tens of nanoseconds to low milliseconds depending on key position. The CPU and memory cost of full parse is paid even when almost all fields will be discarded. Absolute numbers always depend on CPU, document shape, and Criterion noise; re-run benches on your hardware before putting figures on a slide deck.
+A concrete illustration of the *selective find* contrast (not a claim that every workload looks like this): on synthetic multi‑megabyte JSON, a full `serde_json` parse can sit in the hundreds of milliseconds (but a `jshift` path-only find that stops after the hot key finishes in tens of nanoseconds to low milliseconds depending on key position). The CPU and memory cost of `serde_json` full parse is paid even when almost all fields will be discarded. 
 
 ## What jshift Changes
 
@@ -56,10 +56,14 @@ For listing cards, renames, filters, and function transforms, jshift compiles a 
 // JMESPath result is the projected value (often a bare array of cards):
 products[*].{id: id, title: title, handle: handle, price: variants[0].price}
 
-// filters (per-element predicate), negative indices, functions, pipes, flatten, …
+// filters, negative indices, higher-order functions, object wildcards, pipes, …
 products[?variants[0].available == `true`].{id: id, title: title}
 products[-1].title
 length(products)
+sort_by(products, &variants[0].price)
+map(&title, products)
+group_by(products, &vendor)
+meta.*
 products[*].variants[*].price | []
 ```
 
@@ -109,7 +113,7 @@ Once the JSON has been reduced to only the fields that matter, the next high-lev
 1. Receive the large, noisy vendor JSON (HTTP body, object store blob, or JSONL line).
 2. Run jshift to **project** only the required paths (or mutate a few stamps in place on the original buffer when you must forward almost everything).
 3. Deserialize the now-small cleaned JSON into a prost-generated message (or map kept fields into the protobuf struct with a thin conversion layer).
-4. Serialize the protobuf message and write the compact binary form to the data lake (S3 + Iceberg, Parquet via Arrow, etc.).
+4. Serialize the protobuf message and write the compact binary form to the data lake (Parquet via Arrow, S3 + Iceberg, etc).
 
 The advantages compound:
 
@@ -137,7 +141,7 @@ In short, jshift solves the ingestion memory and CPU tax of noisy JSON; prost so
 
 The combination does not eliminate the need for good data modeling, but it removes one of the most common and expensive accidental complexities in Rust-based data engineering: paying full deserialization cost for data you intend to throw away.
 
-## Operational notes (so the writeup stays honest)
+## Operational notes
 
 - **Indexes go stale after in-place mutate.** Rebuild or drop `IndexedDocument` after edits; prefer index → many reads / project → new buffer.
 - **Default path finds never auto-index.** Structural indexing is opt-in at the call site.
@@ -148,4 +152,4 @@ The combination does not eliminate the need for good data modeling, but it remov
 
 ## Bottom line for data engineers
 
-If your bronze layer’s job is “accept messy vendor JSON and emit only what silver needs,” jshift is the selective path-mutate and **field-projection** tool that keeps that job on the byte buffer: safe Rust, open partial schemas, optional indexes for large arrays, and a projector (including a growing JMESPath surface) that turns multi-megabyte pages into kilobyte cards before prost, Arrow, or the next hop ever sees them.
+If your bronze layer’s job is “accept messy vendor JSON and emit only what silver needs,” jshift is the selective path-mutate and **field-projection** tool that keeps that job on the byte buffer: safe Rust, open partial schemas, optional indexes for large arrays, and a projector (including a JMESPath surface) that turns multi-megabyte pages into kilobyte cards before prost, Arrow, or the next hop ever sees them.

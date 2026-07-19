@@ -60,11 +60,16 @@ pub enum SelectExpr {
     Or(Box<SelectExpr>, Box<SelectExpr>),
     /// Logical NOT (JMESPath `!`).
     Not(Box<SelectExpr>),
-    /// Function call (`length(@)`, `starts_with(title, 'Loot')`, …).
+    /// Function call (`length(@)`, `map(&foo, arr)`, …).
     Call {
         name: String,
         args: Vec<SelectExpr>,
     },
+    /// Expression reference (`&foo`) for higher-order functions (`map`, `sort_by`, `group_by`).
+    /// Not evaluated alone; the callee applies it per element.
+    Expref(Box<SelectExpr>),
+    /// Object value projection (`*` / `foo.*`): all object values as an array, then `each`.
+    ObjectProjection(Box<SelectExpr>),
     /// Parenthesized expression (preserved for AST clarity; emit = inner).
     Paren(Box<SelectExpr>),
 }
