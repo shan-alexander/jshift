@@ -120,8 +120,11 @@ pub fn write_json_string_content(out: &mut Vec<u8>, s: &str) {
 pub fn escape_json_key(s: &str) -> String {
     let mut v = Vec::with_capacity(s.len());
     write_json_string_content(&mut v, s);
-    // Escaped JSON key content is always valid UTF-8 when input is.
-    String::from_utf8(v).expect("escaped JSON key content is valid UTF-8")
+    // Escapes are ASCII; remaining bytes are copied from UTF-8 input, so this cannot fail.
+    match String::from_utf8(v) {
+        Ok(s) => s,
+        Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+    }
 }
 
 /// Append a JSON string literal (including surrounding quotes) for `s` into `out`.
@@ -153,6 +156,9 @@ pub(crate) fn unescape_json_string_literal(slice: &[u8]) -> Option<String> {
 }
 
 /// Unescape JSON string content (bytes between the quotes).
+///
+/// Rejects raw control characters (U+0000..=U+001F) outside escapes, invalid
+/// escape sequences, and lone UTF-16 surrogates. Accepts standard surrogate pairs.
 pub(crate) fn unescape_json_string_content(content: &[u8]) -> Option<String> {
     let mut out = Vec::with_capacity(content.len());
     let mut i = 0;
@@ -173,21 +179,20 @@ pub(crate) fn unescape_json_string_content(content: &[u8]) -> Option<String> {
                     b'r' => out.push(b'\r'),
                     b't' => out.push(b'\t'),
                     b'u' => {
-                        if i + 4 >= content.len() {
-                            return None;
-                        }
-                        let hex = std::str::from_utf8(&content[i + 1..i + 5]).ok()?;
-                        let code = u16::from_str_radix(hex, 16).ok()?;
-                        // BMP only; surrogate pairs not required for key/value round-trips we emit.
-                        let ch = char::from_u32(u32::from(code))?;
+                        let (ch, consumed) = decode_json_unicode_escape(content, i)?;
                         let mut buf = [0u8; 4];
                         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                        i += 4;
+                        // `i` points at `u`; consumed is total bytes of the \u sequence(s)
+                        // after the backslash (including `u` and hex digits).
+                        i += consumed;
+                        continue;
                     }
                     _ => return None,
                 }
                 i += 1;
             }
+            // JSON strings may not contain unescaped control characters.
+            c if c < 0x20 => return None,
             c => {
                 out.push(c);
                 i += 1;
@@ -195,6 +200,41 @@ pub(crate) fn unescape_json_string_content(content: &[u8]) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Decode a `\uXXXX` (or surrogate pair) starting at the `u` of the first escape.
+/// Returns `(char, bytes_consumed_from_u_inclusive)`.
+fn decode_json_unicode_escape(content: &[u8], u_pos: usize) -> Option<(char, usize)> {
+    let code = parse_u4_hex(content, u_pos + 1)?;
+    if (0xD800..=0xDBFF).contains(&code) {
+        // High surrogate — require a low surrogate escape immediately after.
+        let next = u_pos + 5;
+        if next + 5 >= content.len() || content[next] != b'\\' || content[next + 1] != b'u' {
+            return None;
+        }
+        let low = parse_u4_hex(content, next + 2)?;
+        if !(0xDC00..=0xDFFF).contains(&low) {
+            return None;
+        }
+        let cp = 0x10000 + (((u32::from(code) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+        let ch = char::from_u32(cp)?;
+        // `u` + 4 hex + `\` + `u` + 4 hex = 11 bytes from first `u`.
+        Some((ch, 11))
+    } else if (0xDC00..=0xDFFF).contains(&code) {
+        // Lone low surrogate.
+        None
+    } else {
+        let ch = char::from_u32(u32::from(code))?;
+        Some((ch, 5)) // `u` + 4 hex digits
+    }
+}
+
+fn parse_u4_hex(content: &[u8], start: usize) -> Option<u16> {
+    if start + 4 > content.len() {
+        return None;
+    }
+    let hex = std::str::from_utf8(&content[start..start + 4]).ok()?;
+    u16::from_str_radix(hex, 16).ok()
 }
 
 impl ToJsonBytes for String {
