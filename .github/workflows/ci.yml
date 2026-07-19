@@ -18,10 +18,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test
+      - name: cargo test (default features)
         run: cargo test --workspace --all-targets
-      - name: cargo test (doctests)
+      - name: cargo test (doctests, default)
         run: cargo test --workspace --doc
+      - name: cargo test (core only, no default features)
+        run: cargo test --no-default-features --lib
+      - name: cargo test (doctests, no default features)
+        run: cargo test --no-default-features --doc
+      - name: cargo test (explicit derive feature)
+        run: cargo test --no-default-features --features derive --lib
 
   clippy:
     name: clippy
@@ -32,8 +38,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
+      - name: cargo clippy (default)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
 
   docs:
     name: docs
@@ -46,3 +54,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --document-private-items
+      - name: cargo doc (no default features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-default-features --no-deps --document-private-items

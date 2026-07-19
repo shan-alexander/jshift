@@ -1,25 +1,20 @@
 //! Buffer-centric shared documents (cheap clone, many readers).
 //!
-//! Inspired by prost’s buffer traits and `bytes::Bytes`: keep the **data**
+//! Inspired by prost buffer traits and `bytes::Bytes`: keep the **data**
 //! shareable, keep **mutation** on owned `Vec<u8>`.
 //!
 //! ```
-//! use jshift::{JsonMutatorSchema, JsonView, SharedDocument};
+//! use jshift::SharedDocument;
 //! use std::sync::Arc;
-//!
-//! #[derive(JsonMutatorSchema)]
-//! struct Card {
-//!     #[json(path = "id")]
-//!     id: u64,
-//! }
 //!
 //! let doc = SharedDocument::from_slice(br#"{"id":1,"extra":true}"#);
 //! let a = doc.clone();
 //! let b = doc.clone();
-//! assert_eq!(Card::read_from(a.as_bytes()).unwrap().id, 1);
-//! assert_eq!(Card::read_from(b.as_bytes()).unwrap().id, 1);
+//! assert_eq!(a.as_bytes(), b.as_bytes());
 //! let _shared: Arc<[u8]> = doc.into_arc();
 //! ```
+//!
+//! With the `derive` feature, `read` / `read_indexed` pair with `JsonView` schemas.
 
 use std::sync::Arc;
 

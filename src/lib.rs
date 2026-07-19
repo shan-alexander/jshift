@@ -17,23 +17,24 @@
 //! | Preserve unmentioned fields | Full RFC validator (unless you add one) |
 //!
 //! **Open documents:** paths you don't name are left unread (and byte-preserved on
-//! write). That is a feature for API evolution—same spirit as prost's unknown fields.
+//! write). That is a feature for API evolution (same spirit as prost unknown fields).
 //!
 //! # Cargo features
 //!
 //! | Feature | Default | Purpose |
 //! | --- | --- | --- |
 //! | `derive` | yes | `JsonMutatorSchema` / `JsonView` proc-macros |
-//! | `index-simd` | no | Reserved for optional SIMD Stage-1 (no-op today) |
 //!
 //! Core path engine and structural indexing always compile. Indexing is **opt-in at
-//! the call site** (`IndexedDocument`, `read_from_indexed`)—never taxed on default finds.
+//! the call site** (`IndexedDocument`, `read_from_indexed`); never taxed on default finds.
 //!
 //! ```toml
 //! jshift = { version = "0.4", features = ["derive"] }
-//! # core only:
+//! # core only (no proc-macros):
 //! jshift = { version = "0.4", default-features = false }
 //! ```
+//!
+//! CI verifies both default and `--no-default-features` builds.
 //!
 //! # Features
 //! * **Zero-copy reads:** Find values as slices into the raw buffer.
@@ -63,6 +64,8 @@
 //!
 //! # JsonView: typed projections (open partial structs)
 //! ```
+//! # #[cfg(feature = "derive")]
+//! # {
 //! use jshift::{JsonView, JsonMutatorSchema};
 //!
 //! #[derive(JsonMutatorSchema)]
@@ -71,7 +74,7 @@
 //!     id: u64,
 //!     #[json(path = "title")]
 //!     title: String,
-//!     // intentionally no variants / images — partial view
+//!     // intentionally no variants / images: partial view
 //! }
 //!
 //! fn ingest<T: JsonView>(buf: &[u8]) -> Result<T, jshift::Error> {
@@ -87,6 +90,7 @@
 //! let mut buf = json.to_vec();
 //! card.write_into(&mut buf).unwrap();
 //! assert!(buf.windows(8).any(|w| w == b"\"images\""));
+//! # }
 //! ```
 //!
 //! # High-Impact Real-World Use Case: LLM Dataset Processing (JSONL)
@@ -94,6 +98,8 @@
 //! You can inspect token lengths and mark records as skipped or cleaned in-place:
 //!
 //! ```
+//! # #[cfg(feature = "derive")]
+//! # {
 //! use jshift::JsonMutatorSchema;
 //!
 //! #[derive(JsonMutatorSchema)]
@@ -119,6 +125,7 @@
 //!     line,
 //!     b"{\"instruction\": \"Translate...\", \"tokens\": 1024, \"status\": \"skipped\"}".to_vec()
 //! );
+//! # }
 //! ```
 
 mod convert;
@@ -315,6 +322,7 @@ mod tests {
         assert_eq!(json, b"{\"b\": 2\n}");
     }
 
+    #[cfg(feature = "derive")]
     #[derive(JsonMutatorSchema)]
     struct Config {
         #[json(path = "metadata.version")]
@@ -327,6 +335,7 @@ mod tests {
         tags: Vec<String>,
     }
 
+    #[cfg(feature = "derive")]
     #[test]
     fn test_procedural_macro() {
         let mut json = b"{\"metadata\": {\"version\": 1}, \"user\": {\"score\": 9.5, \"name\": \"farmer\", \"tags\": [\"rust\", \"fast\"]}}".to_vec();
@@ -753,7 +762,11 @@ mod tests {
         assert_eq!(Option::<u32>::from_json_slice(b"nope"), None);
         assert_eq!((None::<u32>).to_json_bytes(), b"null");
         assert_eq!(Some(7u32).to_json_bytes(), b"7");
+    }
 
+    #[cfg(feature = "derive")]
+    #[test]
+    fn test_option_null_and_missing_derive() {
         #[derive(JsonMutatorSchema)]
         struct Row {
             #[json(path = "a")]
@@ -795,6 +808,7 @@ mod tests {
         assert_eq!(find_value(&json, &parse_path("list[1]")).unwrap(), b"9");
     }
 
+    #[cfg(feature = "derive")]
     #[test]
     fn test_derive_uses_static_paths() {
         // Compile-time path constants are exercised by any derive test; this
@@ -819,6 +833,7 @@ mod tests {
         assert_eq!(Nested::FIELD_PATHS, &["meta.ver", "tags[0]"]);
     }
 
+    #[cfg(feature = "derive")]
     #[test]
     fn test_json_view_trait_generic_pipeline() {
         #[derive(JsonMutatorSchema)]
@@ -872,6 +887,57 @@ mod tests {
         let est = estimate_projected_len(json, Card::FIELD_PATHS).unwrap();
         assert!(est < json.len());
         assert_eq!(Card::estimate_projected_len(json).unwrap(), est);
+    }
+
+
+    #[test]
+    fn test_json_view_manual_impl_core_only() {
+        // Verifies the trait surface without the derive feature / proc-macro.
+        struct IdOnly {
+            id: u64,
+        }
+
+        impl JsonView for IdOnly {
+            fn read_from(json: &[u8]) -> Result<Self, Error> {
+                let slice = find_value(json, &parse_path("id"))?;
+                let id = u64::from_json_slice(slice).ok_or(Error::TypeMismatch {
+                    expected: "u64",
+                    found: "invalid format",
+                })?;
+                Ok(Self { id })
+            }
+
+            fn write_into(&self, json: &mut Vec<u8>) -> Result<(), Error> {
+                let bytes = self.id.to_json_bytes();
+                upsert_at_path(json, &parse_path("id"), &bytes)
+            }
+        }
+
+        fn ingest<T: JsonView>(buf: &[u8]) -> Result<T, Error> {
+            T::read_from(buf)
+        }
+
+        let json = br#"{"id":42,"extra":true}"#;
+        let v: IdOnly = ingest(json).unwrap();
+        assert_eq!(v.id, 42);
+        assert_eq!(read_view::<IdOnly>(json).unwrap().id, 42);
+
+        let mut buf = json.to_vec();
+        IdOnly { id: 99 }.write_into(&mut buf).unwrap();
+        assert_eq!(find_value(&buf, &parse_path("id")).unwrap(), b"99");
+        // open document: unmentioned field preserved
+        assert_eq!(find_value(&buf, &parse_path("extra")).unwrap(), b"true");
+
+        let shared = SharedDocument::from_slice(json);
+        assert_eq!(shared.read::<IdOnly>().unwrap().id, 42);
+
+        let lines = br#"{"id":1}
+{"id":2}
+"#;
+        let ids: Vec<u64> = read_jsonl::<IdOnly>(lines)
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

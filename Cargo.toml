@@ -26,8 +26,6 @@ exclude = [
 default = ["derive"]
 # Proc-macro schemas: JsonMutatorSchema / JsonView derive.
 derive = ["dep:jshift-derive"]
-# Reserved for optional SIMD Stage-1 structural scan (no effect yet; safe scalar path remains default).
-index-simd = []
 
 [dependencies]
 memchr = "2.7"

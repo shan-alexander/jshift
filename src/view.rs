@@ -2,17 +2,47 @@
 //!
 //! A [`JsonView`] is a **partial** Rust type: only the paths you name are read or
 //! written. Everything else in the buffer is ignored on read and preserved on write
-//! (open-document / “unknown fields” semantics).
+//! (open-document / "unknown fields" semantics).
 //!
 //! This is **not** a full JSON DOM and **not** a serde replacement. It is the single
-//! protocol surface for “this Rust type talks to JSON bytes,” enabling generic
+//! protocol surface for "this Rust type talks to JSON bytes," enabling generic
 //! pipelines:
 //!
-//! ```ignore
+//! ```
+//! use jshift::{
+//!     find_value, parse_path, upsert_at_path, FromJsonSlice, JsonView, ToJsonBytes, Error,
+//! };
+//!
+//! struct IdOnly {
+//!     id: u64,
+//! }
+//!
+//! impl JsonView for IdOnly {
+//!     fn read_from(json: &[u8]) -> Result<Self, Error> {
+//!         let slice = find_value(json, &parse_path("id"))?;
+//!         let id = u64::from_json_slice(slice).ok_or(Error::TypeMismatch {
+//!             expected: "u64",
+//!             found: "invalid format",
+//!         })?;
+//!         Ok(Self { id })
+//!     }
+//!
+//!     fn write_into(&self, json: &mut Vec<u8>) -> Result<(), Error> {
+//!         upsert_at_path(json, &parse_path("id"), &self.id.to_json_bytes())
+//!     }
+//! }
+//!
 //! fn ingest<T: JsonView>(buf: &[u8]) -> Result<T, Error> {
 //!     T::read_from(buf)
 //! }
+//!
+//! let json = br#"{"id":1,"extra":true}"#;
+//! let v: IdOnly = ingest(json).unwrap();
+//! assert_eq!(v.id, 1);
 //! ```
+//!
+//! With the `derive` feature (default), prefer `#[derive(JsonView)]` /
+//! `JsonMutatorSchema` instead of hand-written impls.
 
 use crate::error::Error;
 use crate::index::IndexedDocument;
@@ -23,11 +53,11 @@ use crate::index::IndexedDocument;
 ///
 /// Fields (and whole subtrees) you do not name are:
 ///
-/// * **unread** on [`read_from`](Self::read_from) — never validated or allocated;
-/// * **preserved byte-for-byte** on [`write_into`](Self::write_into) — only named
+/// * **unread** on [`read_from`](Self::read_from): never validated or allocated;
+/// * **preserved byte-for-byte** on [`write_into`](Self::write_into): only named
 ///   paths are upserted.
 ///
-/// That is intentional and first-class: use partial “view structs” the way prost
+/// That is intentional and first-class: use partial "view structs" the way prost
 /// users use messages, not 1:1 mirrors of every JSON key.
 ///
 /// # Indexing
@@ -35,6 +65,9 @@ use crate::index::IndexedDocument;
 /// Prefer [`read_from_indexed`](Self::read_from_indexed) or
 /// [`read_from_doc`](Self::read_from_doc) when paths cross large arrays and you have
 /// already built (or can build) schema-guided side-tables.
+///
+/// Indexes bind to a fixed byte snapshot. After in-place mutate/delete, rebuild or
+/// drop the index (see [`IndexedDocument`]).
 pub trait JsonView: Sized {
     /// Read this projection from raw JSON bytes (linear path scans).
     fn read_from(json: &[u8]) -> Result<Self, Error>;
@@ -54,7 +87,7 @@ pub trait JsonView: Sized {
         Self::read_from(doc.as_bytes())
     }
 
-    /// Upsert this projection’s fields into `json`.
+    /// Upsert this projection's fields into `json`.
     ///
     /// Unmentioned paths in the buffer are left alone. Missing parents for named
     /// paths may be created (see [`crate::upsert_at_path`]).

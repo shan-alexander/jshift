@@ -15,10 +15,15 @@
 //! 3. **Stage-1 structural list** — offsets of `{ } [ ] : ,` outside strings; used to
 //!    skip large containers by walking structurals instead of every byte.
 //!
-//! # Mutation
+//! # Mutation (indexes go stale)
 //!
-//! Indexes bind to a fixed `&[u8]` snapshot. After in-place mutate/delete, rebuild
-//! (or drop). Preferred ETL: index → many reads → stream new bytes → reindex.
+//! Indexes bind to a fixed `&[u8]` snapshot. After **any** in-place mutate/delete/
+//! upsert that changes offsets, the index is **invalid**: using it is a logic error
+//! (wrong spans / panics in debug if out of range). There is no dirty flag in 0.4;
+//! rebuild or drop after writes.
+//!
+//! Preferred ETL: **index → many reads → write a new buffer (or rebuild) → optional
+//! reindex**.
 //!
 //! # Safety
 //!

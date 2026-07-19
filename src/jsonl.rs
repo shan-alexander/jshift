@@ -1,25 +1,20 @@
-//! JSON Lines (JSONL) framing helpers — message-at-a-time, not one giant index.
+//! JSON Lines (JSONL) framing helpers: message-at-a-time, not one giant index.
 //!
 //! Large multi-document workloads (Shopify pages, training dumps) are usually
 //! better as **one index per line / page** than a single index over a merged blob.
 //!
 //! ```
-//! use jshift::{json_lines, JsonMutatorSchema, JsonView};
-//!
-//! #[derive(JsonMutatorSchema)]
-//! struct Row {
-//!     #[json(path = "id")]
-//!     id: u64,
-//! }
+//! use jshift::json_lines;
 //!
 //! let buf = br#"{"id":1}
 //! {"id":2}
 //! "#;
-//! let ids: Vec<u64> = json_lines(buf)
-//!     .map(|line| Row::read_from(line).unwrap().id)
-//!     .collect();
-//! assert_eq!(ids, vec![1, 2]);
+//! let lines: Vec<&[u8]> = json_lines(buf).collect();
+//! assert_eq!(lines.len(), 2);
+//! assert_eq!(lines[0], br#"{"id":1}"#);
 //! ```
+//!
+//! With a [`crate::JsonView`] (manual or derive), use [`read_jsonl`] for typed rows.
 
 use crate::error::Error;
 use crate::index::IndexedDocument;

@@ -1,28 +1,42 @@
-//! Projection size estimates (prost `encoded_len` analogue).
+//! Projection size **estimates** (planning only; not a stream projector).
 //!
-//! Useful before large stream jobs: pre-size output buffers, or decide whether a
-//! field projection is worth it vs a full serde round-trip by size ratio.
+//! These helpers answer "about how big would a field subset be?" for capacity
+//! and triage. They are **not** a substitute for a full `project_paths` / stream
+//! projector (deferred; see changelog). Do not treat the return value as an
+//! exact output length for production writers.
+//!
+//! Useful before large jobs: pre-size buffers with headroom, or compare "keep
+//! these fields" size ratio vs full serde re-serialize.
 
 use crate::error::Error;
 use crate::path::{parse_path, PathSegment};
 use crate::scan::find_value;
 
-/// Estimate the byte length of a minimal object that keeps only `paths`.
+/// **Ballpark** byte length of a minimal flat object keeping only `paths`.
 ///
-/// This is a **planning** estimate (keys + values + structural punctuation), not a
-/// guarantee of exact `project` output. Missing paths return [`Error::PathNotFound`].
+/// # What this is
 ///
-/// Overhead model (flat object of named leaves):
-/// `{` + for each path: optional comma, `"key":`, value bytes + `}`.
-/// Nested path keys use only the **last** object key segment for the estimate
-/// (suitable for top-level projections and ballpark capacity).
+/// A **planning estimate**: sum of on-wire value lengths plus a simple model for
+/// keys and object punctuation (`{`, `"key":`, `,`, `}`). Good for capacity
+/// hints and "is projection worth it?" ratios.
+///
+/// # What this is not
+///
+/// * **Not** exact output of a real projector (whitespace, key order, nested
+///   reshaping, and pretty-print differ).
+/// * **Not** a stream `project()` API; that is intentionally out of scope for
+///   this helper.
+/// * Nested path keys contribute only the **last** object key segment to the
+///   key-length model (flat-leaf bias).
+///
+/// Missing paths return [`Error::PathNotFound`].
 ///
 /// ```
 /// use jshift::estimate_projected_len;
 ///
 /// let json = br#"{"id":1,"title":"hi","blob":{"x":1,"y":2}}"#;
 /// let n = estimate_projected_len(json, &["id", "title"]).unwrap();
-/// // {"id":1,"title":"hi"} → small
+/// // Smaller than the full document; roughly {"id":1,"title":"hi"}.
 /// assert!(n < json.len());
 /// assert!(n >= br#"{"id":1,"title":"hi"}"#.len());
 /// ```
@@ -48,7 +62,8 @@ pub fn estimate_projected_len(json: &[u8], paths: &[&str]) -> Result<usize, Erro
 
 /// Sum of on-wire value lengths for `paths` (no object framing).
 ///
-/// Cheaper signal for “how much payload do these fields represent?”
+/// Cheaper signal for "how much payload do these fields represent?" Still a
+/// planning metric, not a projector.
 pub fn estimate_values_len(json: &[u8], paths: &[&str]) -> Result<usize, Error> {
     let mut total = 0usize;
     for p in paths {
@@ -59,7 +74,7 @@ pub fn estimate_values_len(json: &[u8], paths: &[&str]) -> Result<usize, Error> 
 }
 
 fn key_wire_len(segs: &[PathSegment<'_>]) -> usize {
-    // "key" including quotes — use last Key segment if any.
+    // "key" including quotes: use last Key segment if any.
     for seg in segs.iter().rev() {
         if let PathSegment::Key(k) = seg {
             return 2 + k.len();

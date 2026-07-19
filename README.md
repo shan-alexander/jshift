@@ -56,7 +56,7 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 * **Open projections:** fields you don’t name are **unread** and **byte-preserved** on write (API evolution as a feature).
 * **Shared documents:** `SharedDocument` (`Arc<[u8]>`) for cheap clone + many concurrent readers.
 * **JSONL helpers:** `json_lines` / `read_jsonl` -- index **per line**, not one giant merge.
-* **Projection estimates:** `estimate_projected_len` (size planning before big jobs).
+* **Projection estimates:** `estimate_projected_len` (ballpark size planning only; not a stream projector).
 * **Object & array CRUD:** Update, upsert, delete keys; append, index, delete elements; nested `upsert_at_path`.
 * **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
 * **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
@@ -69,9 +69,10 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 
 ```toml
 jshift = "0.4"                              # default: derive on
-jshift = { version = "0.4", default-features = false }  # core only
-# index-simd is reserved (no-op); indexing APIs are always available, opt-in at call site
+jshift = { version = "0.4", default-features = false }  # core only (no proc-macros)
 ```
+
+Structural indexing APIs always compile; they are opt-in at the call site (never forced on default finds). CI runs both default and `--no-default-features` test matrices.
 
 ### Non-goals (deliberate)
 
@@ -309,7 +310,7 @@ Prebuilt jshift index vs peers on the **same** buffer (index build timed separat
 
 **One-liner:** *Object key maps are also opt-in: pay ~0.3 ms once on a 2k-key object, then last-key lookup at **~47 ns** instead of tens of microseconds of linear scan.*
 
-Indexes bind to a fixed byte snapshot. After in-place mutate/delete, **rebuild** (or drop) the index. Best ETL pattern: **index → many reads / project → write a new buffer → optional reindex**.
+**Indexes go stale after mutation.** They bind to a fixed byte snapshot. After any in-place mutate/delete/upsert that shifts bytes, the index is invalid (no dirty flag in 0.4). **Rebuild or drop** it. Best ETL pattern: **index → many reads → write a new buffer (or rebuild) → optional reindex**.
 
 This stays `forbid(unsafe_code)`: `Vec<u32>` offsets, `HashMap` key tables, Stage-1 structural lists, and existing safe cursors.
 
