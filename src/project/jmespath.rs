@@ -57,7 +57,10 @@ pub fn parse_project_path(s: &str) -> Result<Vec<ProjectPathSegment>, Error> {
                 msg: "Unclosed '[' in project path",
             })?;
             let inner = rest[1..end_idx].trim();
-            if inner.is_empty() || inner == "*" {
+            if inner.is_empty() {
+                // Keep-list `[]` means every element (wildcard), not flatten.
+                segments.push(ProjectPathSegment::ArrayWildcard);
+            } else if inner == "*" {
                 segments.push(ProjectPathSegment::ArrayWildcard);
             } else if inner.contains(':') {
                 segments.push(parse_slice_inner(inner)?);
@@ -353,7 +356,7 @@ impl<'a> Parser<'a> {
                     } else if self.peek() == Some('"') {
                         // Quoted identifier: "foo.bar", "foo bar", escapes
                         let name = self.parse_dq_string_raw()?;
-                        expr = chain_sub(expr, SelectExpr::Field(name));
+                        expr = chain_sub(expr, SelectExpr::FieldQuoted(name));
                     } else {
                         let name = self.parse_ident()?;
                         if self.peek() == Some('(') {
@@ -372,9 +375,14 @@ impl<'a> Parser<'a> {
                     expr = chain_sub(expr, bracket);
                 }
                 Some('(') => {
+                    // Only bare identifiers are function names (not quoted identifiers).
                     if let SelectExpr::Field(name) = expr {
                         let args = self.parse_arg_list()?;
                         expr = SelectExpr::Call { name, args };
+                    } else if matches!(expr, SelectExpr::FieldQuoted(_)) {
+                        return Err(Error::InvalidPath {
+                            msg: "Quoted identifier is not a function name",
+                        });
                     } else {
                         break;
                     }
@@ -409,8 +417,9 @@ impl<'a> Parser<'a> {
             }
             // Double-quoted = identifier (may contain dots/spaces). Single-quoted = string literal.
             Some('"') => {
+                // Quoted identifier (not a callable function name).
                 let name = self.parse_dq_string_raw()?;
-                Ok(SelectExpr::Field(name))
+                Ok(SelectExpr::FieldQuoted(name))
             }
             Some('\'') => self.parse_raw_string_literal(),
             Some('`') => self.parse_backtick_literal(),
@@ -552,7 +561,9 @@ impl<'a> Parser<'a> {
                 each: Box::new(SelectExpr::Identity),
             }));
         }
-        // empty / wildcard
+        // empty [] — list/flatten projection (acts like [*] on object arrays; flattens
+        // nested arrays when the projection result is nested). Represented as Each;
+        // trailing flatten is applied via Flatten when chained after filters/etc.
         if self.peek() == Some(']') {
             self.bump();
             return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
@@ -741,13 +752,31 @@ fn is_ident_continue(c: char) -> bool {
 }
 
 fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
+    // Flatten projection `[]` applied after a value: flatten(prefix) or flatten(prefix|inner).
+    if let SelectExpr::Flatten(inner) = &suffix {
+        if matches!(inner.as_ref(), SelectExpr::Identity | SelectExpr::Current) {
+            return SelectExpr::Flatten(Box::new(prefix));
+        }
+        // rare: [] then more — flatten after applying inner to each of prefix
+        return SelectExpr::Flatten(Box::new(chain_sub(prefix, *inner.clone())));
+    }
     match prefix {
         SelectExpr::Field(name) => {
             SelectExpr::Sub(Box::new(SelectExpr::Field(name)), Box::new(suffix))
         }
+        SelectExpr::FieldQuoted(name) => {
+            SelectExpr::Sub(Box::new(SelectExpr::FieldQuoted(name)), Box::new(suffix))
+        }
         SelectExpr::ObjectProjection(inner) => {
             // foo.*.bar → project each object value with .bar
             SelectExpr::ObjectProjection(Box::new(chain_into(*inner, suffix)))
+        }
+        SelectExpr::Flatten(inner) => {
+            // people[].name → flatten(people) then project name per element:
+            // re-express as each-name then flatten
+            SelectExpr::Flatten(Box::new(SelectExpr::Array(ArraySelect::Each(Box::new(
+                chain_into(*inner, suffix),
+            )))))
         }
         SelectExpr::Array(ArraySelect::Each(inner)) => {
             SelectExpr::Array(ArraySelect::Each(Box::new(chain_into(*inner, suffix))))

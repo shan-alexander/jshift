@@ -42,3 +42,17 @@ path = "fuzz_targets/valid_json_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "project_jmespath"
+path = "fuzz_targets/project_jmespath.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "project_paths"
+path = "fuzz_targets/project_paths.rs"
+test = false
+doc = false
+bench = false

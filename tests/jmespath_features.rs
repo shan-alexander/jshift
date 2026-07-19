@@ -6,6 +6,8 @@
 
 use jshift::{parse_jmespath_expr, project_jmespath, project_paths, ProjectPlan};
 
+// project_jmespath used for error-path assertions in function tests.
+
 fn jp(json: &[u8], expr: &str) -> Vec<u8> {
     project_jmespath(json, expr).unwrap_or_else(|e| {
         panic!("project_jmespath({expr:?}) failed: {e:?}");
@@ -93,7 +95,7 @@ fn filter_projection() {
 
 #[test]
 fn comparisons_and_logic() {
-    let j = br#"{"x":1,"y":0,"s":"ab"}"#;
+    let j = br#"{"x":1,"y":0,"s":"ab","EmptyList":[],"True":true,"False":false,"Number":5}"#;
     assert_eq!(jp(j, "x == `1`"), b"true");
     assert_eq!(jp(j, "x != `1`"), b"false");
     assert_eq!(jp(j, "x > `0`"), b"true");
@@ -104,6 +106,14 @@ fn comparisons_and_logic() {
     assert_eq!(jp(j, "x == `2` || y == `0`"), b"true");
     assert_eq!(jp(j, "!(x == `2`)"), b"true");
     assert_eq!(jp(j, "s == 'ab'"), b"true");
+    // JMESPath && returns the falsey *value*, not boolean false.
+    assert_eq!(jp(j, "EmptyList && True"), b"[]");
+    assert_eq!(jp(j, "Number && EmptyList"), b"[]");
+    assert_eq!(jp(j, "True && Number"), b"5");
+    // incomparable order → null
+    assert_eq!(jp(j, "EmptyList < Number"), b"null");
+    // structural equality in comparisons
+    assert_eq!(jp(j, "`{\"a\":1}` == `{\"a\":1}`"), b"true");
 }
 
 #[test]
@@ -144,20 +154,27 @@ fn fn_string_and_number_coercion() {
 
 #[test]
 fn fn_array_numeric_and_misc() {
-    let j = br#"{"a":[3,1,2], "b":[1,[2],null]}"#;
+    let j = br#"{"a":[3,1,2], "s":["c","a","b"], "b":[1,[2],null]}"#;
     assert_eq!(jp(j, "sort(a)"), br#"[1,2,3]"#);
     assert_eq!(jp(j, "reverse(a)"), br#"[2,1,3]"#);
     assert_eq!(jp(j, "max(a)"), b"3");
     assert_eq!(jp(j, "min(a)"), b"1");
     assert_eq!(jp(j, "sum(a)"), b"6");
     assert_eq!(jp(j, "avg(a)"), b"2");
+    assert_eq!(jp(j, "max(s)"), br#""c""#);
+    assert_eq!(jp(j, "min(s)"), br#""a""#);
     assert_eq!(jp(j, "abs(`-3`)"), b"3");
     assert_eq!(jp(j, "ceil(`1.2`)"), b"2");
     assert_eq!(jp(j, "floor(`1.8`)"), b"1");
     assert_eq!(jp(j, "to_array(`1`)"), br#"[1]"#);
     assert_eq!(jp(j, "not_null(b[2], b[0])"), b"1");
-    assert_eq!(jp(j, "join(',', a)"), br#""3,1,2""#);
+    // join requires an array of strings
+    assert_eq!(jp(j, "join(',', s)"), br#""c,a,b""#);
     assert_eq!(jp(j, "contains(a, `1`)"), b"true");
+    // arity / type errors
+    assert!(project_jmespath(j, "abs(`1`, `2`)").is_err());
+    assert!(project_jmespath(j, "length(`false`)").is_err());
+    assert!(project_jmespath(j, "join(',', a)").is_err());
 }
 
 #[test]

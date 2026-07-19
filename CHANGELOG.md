@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nulls; missing paths → JSON `null` under default soft policy; `Error::Jmespath`.
 - **Tests:** `tests/jmespath_features.rs`; official suite runner
   `tests/jmespath_compliance.rs` + vendored `tests/fixtures/jmespath/` (tier A
-  strict; full suite floors). CI job runs compliance.
+  strict; full suite floors ≥650 pass). CI job runs compliance.
+- **Fuzz:** `fuzz/fuzz_targets/project_jmespath.rs`, `project_paths.rs`.
 - **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
   (gitignored fixtures under `benches/data/`; skips when absent).
 - **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).

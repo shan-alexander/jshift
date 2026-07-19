@@ -26,7 +26,7 @@ pub(crate) fn emit_value(
             out.extend_from_slice(&json[start..end]);
             Ok(())
         }
-        SelectExpr::Field(key) => {
+        SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
             // Logical key → on-wire escaped form for matching document bytes.
             let wire = escape_json_key(key);
             match find_object_value_span(json, start, end, wire.as_bytes()) {
@@ -85,22 +85,32 @@ pub(crate) fn emit_value(
         SelectExpr::Cmp { op, left, right } => {
             let lv = eval_buf(json, start, end, left, ctx)?;
             let rv = eval_buf(json, start, end, right, ctx)?;
-            let t = cmp_values(&lv, &rv, *op);
-            out.extend_from_slice(if t { b"true" } else { b"false" });
-            Ok(())
+            // JMESPath: incomparable types → null (not false).
+            match cmp_values(&lv, &rv, *op) {
+                Some(t) => {
+                    out.extend_from_slice(if t { b"true" } else { b"false" });
+                    Ok(())
+                }
+                None => {
+                    out.extend_from_slice(b"null");
+                    Ok(())
+                }
+            }
         }
         SelectExpr::And(a, b) => {
+            // JMESPath && : if left is falsey return **left value**; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if !is_truthy(&av) {
-                out.extend_from_slice(b"false");
+                out.extend_from_slice(trim_json(&av));
                 return Ok(());
             }
             emit_value(json, start, end, b, ctx, out)
         }
         SelectExpr::Or(a, b) => {
+            // JMESPath || : if left is truthy return left; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if is_truthy(&av) {
-                out.extend_from_slice(&av);
+                out.extend_from_slice(trim_json(&av));
                 return Ok(());
             }
             emit_value(json, start, end, b, ctx, out)
@@ -229,54 +239,123 @@ pub(crate) fn is_truthy(v: &[u8]) -> bool {
     }
 }
 
-fn cmp_values(left: &[u8], right: &[u8], op: CmpOp) -> bool {
+/// Compare two JSON values. `None` means incomparable → JMESPath `null`.
+fn cmp_values(left: &[u8], right: &[u8], op: CmpOp) -> Option<bool> {
     let l = trim_json(left);
     let r = trim_json(right);
-    // null equality
+
+    // Structural equality for objects/arrays (filters like `key == \`{"a":1}\``).
+    if matches!(op, CmpOp::Eq | CmpOp::Ne)
+        && (l.starts_with(b"{") || l.starts_with(b"[") || r.starts_with(b"{") || r.starts_with(b"["))
+    {
+        let eq = json_struct_equal(l, r);
+        return Some(match op {
+            CmpOp::Eq => eq,
+            CmpOp::Ne => !eq,
+            _ => unreachable!(),
+        });
+    }
+
+    // null equality / inequality only; order with null → null
     if l == b"null" || r == b"null" {
         return match op {
-            CmpOp::Eq => l == r,
-            CmpOp::Ne => l != r,
-            _ => false,
+            CmpOp::Eq => Some(l == r),
+            CmpOp::Ne => Some(l != r),
+            _ => None,
         };
     }
-    // boolean
+    // boolean — only eq/ne with booleans
     if (l == b"true" || l == b"false") && (r == b"true" || r == b"false") {
         let lb = l == b"true";
         let rb = r == b"true";
         return match op {
-            CmpOp::Eq => lb == rb,
-            CmpOp::Ne => lb != rb,
-            _ => false,
+            CmpOp::Eq => Some(lb == rb),
+            CmpOp::Ne => Some(lb != rb),
+            _ => None,
         };
     }
     // numbers
     if let (Ok(ln), Ok(rn)) = (parse_f64(l), parse_f64(r)) {
-        return match op {
+        return Some(match op {
             CmpOp::Eq => ln == rn,
             CmpOp::Ne => ln != rn,
             CmpOp::Lt => ln < rn,
             CmpOp::Le => ln <= rn,
             CmpOp::Gt => ln > rn,
             CmpOp::Ge => ln >= rn,
-        };
+        });
     }
     // strings (JSON quoted)
     if let (Some(ls), Some(rs)) = (json_string_content(l), json_string_content(r)) {
-        return match op {
+        return Some(match op {
             CmpOp::Eq => ls == rs,
             CmpOp::Ne => ls != rs,
             CmpOp::Lt => ls < rs,
             CmpOp::Le => ls <= rs,
             CmpOp::Gt => ls > rs,
             CmpOp::Ge => ls >= rs,
-        };
+        });
     }
-    // raw byte equality fallback
-    match op {
-        CmpOp::Eq => l == r,
-        CmpOp::Ne => l != r,
-        _ => false,
+    // incomparable types
+    None
+}
+
+/// Deep structural equality for JSON objects/arrays (order-sensitive for arrays;
+/// objects compared by key multiset of wire form).
+fn json_struct_equal(a: &[u8], b: &[u8]) -> bool {
+    let a = trim_json(a);
+    let b = trim_json(b);
+    if a == b {
+        return true;
+    }
+    if a.first() != b.first() {
+        return false;
+    }
+    match a.first() {
+        Some(b'[') => {
+            let ea = match collect_array_elems(a, 0, a.len()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let eb = match collect_array_elems(b, 0, b.len()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if ea.len() != eb.len() {
+                return false;
+            }
+            ea.iter().zip(eb.iter()).all(|(&(sa, ea_), &(sb, eb_))| {
+                json_struct_equal(&a[sa..ea_], &b[sb..eb_])
+            })
+        }
+        Some(b'{') => {
+            let (_, ma, _) = match collect_object_members(a, 0, a.len()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let (_, mb, _) = match collect_object_members(b, 0, b.len()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if ma.len() != mb.len() {
+                return false;
+            }
+            // Compare as sets of (key, value)
+            for ma_ in &ma {
+                let found = mb.iter().any(|mb_| {
+                    ma_.key_on_wire == mb_.key_on_wire
+                        && json_struct_equal(
+                            &a[ma_.val_start..ma_.val_end],
+                            &b[mb_.val_start..mb_.val_end],
+                        )
+                });
+                if !found {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => a == b,
     }
 }
 
@@ -313,7 +392,7 @@ fn resolve_focus(
     match expr {
         SelectExpr::Identity | SelectExpr::Current => Ok(Some((start, end))),
         SelectExpr::Paren(inner) => resolve_focus(json, start, end, inner),
-        SelectExpr::Field(key) => {
+        SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
             let wire = escape_json_key(key);
             match find_object_value_span(json, start, end, wire.as_bytes()) {
                 Ok((s, e)) => Ok(Some((s, e))),
@@ -750,49 +829,53 @@ fn emit_call(
     let name = name.to_ascii_lowercase();
     match name.as_str() {
         "length" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             let n = length_of(&v)?;
             out.extend_from_slice(n.to_string().as_bytes());
             Ok(())
         }
         "keys" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             keys_of(&v, out)
         }
         "values" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             values_of(&v, out)
         }
         "type" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             let t = type_name_json(&v);
             write_json_string_out(out, t);
             Ok(())
         }
         "to_string" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             let t = trim_json(&v);
             if t.starts_with(b"\"") {
+                // Already a JSON string.
                 out.extend_from_slice(t);
             } else {
+                // Numbers, bools, null, objects, arrays → JSON text as a string value.
                 write_json_string_out(out, std::str::from_utf8(t).unwrap_or(""));
             }
             Ok(())
         }
         "to_number" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
             let t = trim_json(&v);
             if let Some(s) = json_string_content(t) {
-                let s = std::str::from_utf8(s).unwrap_or("");
-                if s.parse::<f64>().is_ok() {
-                    out.extend_from_slice(s.as_bytes());
-                    return Ok(());
+                // Unescape for parse (simple path: raw content without escapes common in suite).
+                if let Ok(s) = std::str::from_utf8(s) {
+                    if s.parse::<f64>().is_ok() {
+                        out.extend_from_slice(s.as_bytes());
+                        return Ok(());
+                    }
                 }
             } else if parse_f64(t).is_ok() {
                 out.extend_from_slice(t);
@@ -801,32 +884,58 @@ fn emit_call(
             out.extend_from_slice(b"null");
             Ok(())
         }
-        "starts_with" | "ends_with" | "contains" => {
-            if args.len() < 2 {
-                return Err(Error::InvalidPath {
-                    msg: "starts_with/ends_with/contains need 2 args",
-                });
-            }
+        "starts_with" | "ends_with" => {
+            require_arity(&name, args, 2)?;
             let a = eval_buf(json, start, end, &args[0], ctx)?;
             let b = eval_buf(json, start, end, &args[1], ctx)?;
-            let as_ = json_string_content(trim_json(&a)).unwrap_or(trim_json(&a));
-            let bs = json_string_content(trim_json(&b)).unwrap_or(trim_json(&b));
-            let ok = match name.as_str() {
-                "starts_with" => as_.starts_with(bs),
-                "ends_with" => as_.ends_with(bs),
-                _ => {
-                    // contains: string substring or array membership (byte equality)
-                    if trim_json(&a).starts_with(b"[") {
-                        array_contains(trim_json(&a), trim_json(&b))?
-                    } else {
-                        as_.windows(bs.len()).any(|w| w == bs)
-                    }
-                }
+            let at = trim_json(&a);
+            let bt = trim_json(&b);
+            let as_ = json_string_content(at).ok_or(Error::Jmespath {
+                msg: "starts_with/ends_with require string subject",
+            })?;
+            let bs = json_string_content(bt).ok_or(Error::Jmespath {
+                msg: "starts_with/ends_with require string prefix/suffix",
+            })?;
+            // Compare unescaped logical content when possible
+            let as_u = unescape_string_content(as_).unwrap_or_else(|| as_.to_vec());
+            let bs_u = unescape_string_content(bs).unwrap_or_else(|| bs.to_vec());
+            let ok = if name == "starts_with" {
+                as_u.starts_with(&bs_u)
+            } else {
+                as_u.ends_with(&bs_u)
+            };
+            out.extend_from_slice(if ok { b"true" } else { b"false" });
+            Ok(())
+        }
+        "contains" => {
+            require_arity(&name, args, 2)?;
+            let a = eval_buf(json, start, end, &args[0], ctx)?;
+            let b = eval_buf(json, start, end, &args[1], ctx)?;
+            let at = trim_json(&a);
+            let bt = trim_json(&b);
+            let ok = if at.starts_with(b"[") {
+                array_contains(at, bt)?
+            } else if let Some(as_) = json_string_content(at) {
+                let bs = json_string_content(bt).ok_or(Error::Jmespath {
+                    msg: "contains on string requires string search",
+                })?;
+                let as_u = unescape_string_content(as_).unwrap_or_else(|| as_.to_vec());
+                let bs_u = unescape_string_content(bs).unwrap_or_else(|| bs.to_vec());
+                as_u.windows(bs_u.len()).any(|w| w == bs_u.as_slice())
+            } else {
+                return Err(Error::Jmespath {
+                    msg: "contains requires string or array subject",
+                });
             };
             out.extend_from_slice(if ok { b"true" } else { b"false" });
             Ok(())
         }
         "not_null" => {
+            if args.is_empty() {
+                return Err(Error::Jmespath {
+                    msg: "not_null requires at least one argument",
+                });
+            }
             for a in args {
                 let v = eval_buf(json, start, end, a, ctx)?;
                 if trim_json(&v) != b"null" {
@@ -848,27 +957,24 @@ fn emit_call(
             sort_array(&v, out)
         }
         "join" => {
-            if args.len() < 2 {
-                return Err(Error::InvalidPath {
-                    msg: "join needs separator and array",
-                });
-            }
+            require_arity(&name, args, 2)?;
             let sep_v = eval_buf(json, start, end, &args[0], ctx)?;
             let arr_v = eval_buf(json, start, end, &args[1], ctx)?;
-            let sep = json_string_content(trim_json(&sep_v)).unwrap_or(b"");
+            let sep = json_string_content(trim_json(&sep_v)).ok_or(Error::Jmespath {
+                msg: "join separator must be a string",
+            })?;
             join_array(trim_json(&arr_v), sep, out)
         }
         "max" | "min" | "sum" | "avg" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
-            numeric_reduce(trim_json(&v), name.as_str(), out)
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
+            array_reduce(trim_json(&v), name.as_str(), out)
         }
         "abs" | "ceil" | "floor" => {
-            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
-            let v = eval_buf(json, start, end, &arg, ctx)?;
-            let n = parse_f64(trim_json(&v)).map_err(|_| Error::TypeMismatch {
-                expected: "number",
-                found: "other",
+            require_arity(&name, args, 1)?;
+            let v = eval_buf(json, start, end, &args[0], ctx)?;
+            let n = parse_f64(trim_json(&v)).map_err(|_| Error::Jmespath {
+                msg: "abs/ceil/floor require a number",
             })?;
             let r = match name.as_str() {
                 "abs" => n.abs(),
@@ -1149,10 +1255,28 @@ fn write_json_string_out(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 }
 
+fn require_arity(name: &str, args: &[SelectExpr], n: usize) -> Result<(), Error> {
+    if args.len() != n {
+        return Err(Error::Jmespath {
+            msg: "wrong number of arguments to function",
+        });
+    }
+    let _ = name;
+    Ok(())
+}
+
 fn length_of(v: &[u8]) -> Result<usize, Error> {
     let t = trim_json(v);
     if t.starts_with(b"\"") {
-        return Ok(json_string_content(t).map(|s| s.len()).unwrap_or(0));
+        let raw = json_string_content(t).ok_or(Error::Jmespath {
+            msg: "length: invalid string",
+        })?;
+        let unesc = unescape_string_content(raw).unwrap_or_else(|| raw.to_vec());
+        let s = std::str::from_utf8(&unesc).map_err(|_| Error::Jmespath {
+            msg: "length: invalid utf-8 string",
+        })?;
+        // JMESPath counts Unicode code points (chars), not UTF-8 bytes.
+        return Ok(s.chars().count());
     }
     if t.starts_with(b"[") {
         return Ok(collect_array_elems(t, 0, t.len())?.len());
@@ -1160,11 +1284,54 @@ fn length_of(v: &[u8]) -> Result<usize, Error> {
     if t.starts_with(b"{") {
         return Ok(collect_object_members(t, 0, t.len())?.1.len());
     }
-    Ok(0)
+    Err(Error::Jmespath {
+        msg: "length requires string, array, or object",
+    })
+}
+
+/// Best-effort unescape of JSON string content (handles common escapes).
+fn unescape_string_content(content: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(content.len());
+    let mut i = 0;
+    while i < content.len() {
+        if content[i] != b'\\' {
+            out.push(content[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= content.len() {
+            return None;
+        }
+        match content[i] {
+            b'"' | b'\\' | b'/' => out.push(content[i]),
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'u' if i + 4 < content.len() => {
+                let hex = std::str::from_utf8(&content[i + 1..i + 5]).ok()?;
+                let cp = u32::from_str_radix(hex, 16).ok()?;
+                let ch = char::from_u32(cp)?;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                i += 4;
+            }
+            _ => out.push(content[i]),
+        }
+        i += 1;
+    }
+    Some(out)
 }
 
 fn keys_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     let t = trim_json(v);
+    if !t.starts_with(b"{") {
+        return Err(Error::Jmespath {
+            msg: "keys requires an object",
+        });
+    }
     let (_, members, _) = collect_object_members(t, 0, t.len())?;
     out.push(b'[');
     for (i, m) in members.iter().enumerate() {
@@ -1179,6 +1346,11 @@ fn keys_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
 
 fn values_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     let t = trim_json(v);
+    if !t.starts_with(b"{") {
+        return Err(Error::Jmespath {
+            msg: "values requires an object",
+        });
+    }
     let (_, members, _) = collect_object_members(t, 0, t.len())?;
     out.push(b'[');
     for (i, m) in members.iter().enumerate() {
@@ -1234,13 +1406,42 @@ fn reverse_array_or_string(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
 
 fn sort_array(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     let t = trim_json(v);
+    if !t.starts_with(b"[") {
+        return Err(Error::Jmespath {
+            msg: "sort requires an array",
+        });
+    }
     let elems = collect_array_elems(t, 0, t.len())?;
     let mut pieces: Vec<&[u8]> = elems.iter().map(|&(s, e)| &t[s..e]).collect();
+    // Strict: all numbers or all strings.
+    let mut kind: Option<bool> = None; // true=num, false=str
+    for p in &pieces {
+        let ta = trim_json(p);
+        let is_num = parse_f64(ta).is_ok();
+        let is_str = json_string_content(ta).is_some();
+        if is_num == is_str {
+            return Err(Error::Jmespath {
+                msg: "sort: invalid element type",
+            });
+        }
+        match kind {
+            None => kind = Some(is_num),
+            Some(k) if k != is_num => {
+                return Err(Error::Jmespath {
+                    msg: "sort: mixed number/string array",
+                });
+            }
+            _ => {}
+        }
+    }
     pieces.sort_by(|a, b| {
         let ta = trim_json(a);
         let tb = trim_json(b);
         if let (Ok(na), Ok(nb)) = (parse_f64(ta), parse_f64(tb)) {
-            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+            na.partial_cmp(&nb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        } else if let (Some(sa), Some(sb)) = (json_string_content(ta), json_string_content(tb)) {
+            sa.cmp(sb)
         } else {
             ta.cmp(tb)
         }
@@ -1257,43 +1458,113 @@ fn sort_array(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
 }
 
 fn join_array(arr: &[u8], sep: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    if !arr.starts_with(b"[") {
+        return Err(Error::Jmespath {
+            msg: "join requires an array",
+        });
+    }
     let elems = collect_array_elems(arr, 0, arr.len())?;
     let mut s = Vec::new();
     for (i, &(a, b)) in elems.iter().enumerate() {
-        if i > 0 {
-            s.extend_from_slice(sep);
-        }
         let el = trim_json(&arr[a..b]);
-        if let Some(c) = json_string_content(el) {
-            s.extend_from_slice(c);
-        } else {
-            s.extend_from_slice(el);
+        let c = json_string_content(el).ok_or(Error::Jmespath {
+            msg: "join array elements must be strings",
+        })?;
+        if i > 0 {
+            // sep is wire content; unescape for output body
+            let sep_u = unescape_string_content(sep).unwrap_or_else(|| sep.to_vec());
+            s.extend_from_slice(&sep_u);
         }
+        let cu = unescape_string_content(c).unwrap_or_else(|| c.to_vec());
+        s.extend_from_slice(&cu);
     }
     write_json_string_out(out, std::str::from_utf8(&s).unwrap_or(""));
     Ok(())
 }
 
-fn numeric_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+fn array_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+    if !arr.starts_with(b"[") {
+        return Err(Error::Jmespath {
+            msg: "max/min/sum/avg require an array",
+        });
+    }
     let elems = collect_array_elems(arr, 0, arr.len())?;
-    let mut nums = Vec::new();
-    for &(s, e) in &elems {
-        if let Ok(n) = parse_f64(trim_json(&arr[s..e])) {
-            nums.push(n);
+    if elems.is_empty() {
+        // JMESPath: max/min of empty → null; sum of empty → 0; avg of empty → null
+        match which {
+            "sum" => {
+                out.extend_from_slice(b"0");
+                return Ok(());
+            }
+            _ => {
+                out.extend_from_slice(b"null");
+                return Ok(());
+            }
         }
     }
-    if nums.is_empty() {
-        out.extend_from_slice(b"null");
-        return Ok(());
+
+    // Classify: all numbers or all strings (for max/min); sum/avg numbers only.
+    let mut nums: Vec<f64> = Vec::new();
+    let mut strs: Vec<Vec<u8>> = Vec::new();
+    let mut saw_num = false;
+    let mut saw_str = false;
+    for &(s, e) in &elems {
+        let t = trim_json(&arr[s..e]);
+        if let Ok(n) = parse_f64(t) {
+            saw_num = true;
+            nums.push(n);
+        } else if let Some(c) = json_string_content(t) {
+            saw_str = true;
+            strs.push(unescape_string_content(c).unwrap_or_else(|| c.to_vec()));
+        } else {
+            return Err(Error::Jmespath {
+                msg: "max/min/sum/avg: invalid array element type",
+            });
+        }
     }
-    let r = match which {
-        "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        "min" => nums.iter().cloned().fold(f64::INFINITY, f64::min),
-        "sum" => nums.iter().sum(),
-        "avg" => nums.iter().sum::<f64>() / nums.len() as f64,
-        _ => 0.0,
-    };
-    out.extend_from_slice(format_number(r).as_bytes());
+    if saw_num && saw_str {
+        return Err(Error::Jmespath {
+            msg: "max/min/sum/avg: mixed number/string array",
+        });
+    }
+
+    match which {
+        "sum" | "avg" => {
+            if saw_str {
+                return Err(Error::Jmespath {
+                    msg: "sum/avg require number array",
+                });
+            }
+            let sum: f64 = nums.iter().sum();
+            let r = if which == "avg" {
+                sum / nums.len() as f64
+            } else {
+                sum
+            };
+            out.extend_from_slice(format_number(r).as_bytes());
+        }
+        "max" | "min" => {
+            if saw_num {
+                let r = if which == "max" {
+                    nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                } else {
+                    nums.iter().cloned().fold(f64::INFINITY, f64::min)
+                };
+                out.extend_from_slice(format_number(r).as_bytes());
+            } else {
+                let best = if which == "max" {
+                    strs.iter().max().cloned()
+                } else {
+                    strs.iter().min().cloned()
+                };
+                match best {
+                    Some(s) => write_json_string_out(out, std::str::from_utf8(&s).unwrap_or("")),
+                    None => out.extend_from_slice(b"null"),
+                }
+            }
+        }
+        _ => out.extend_from_slice(b"null"),
+    }
     Ok(())
 }
 

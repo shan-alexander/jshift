@@ -62,16 +62,12 @@ fn values_equal(actual: &Value, expected: &Value) -> bool {
 
 /// Known gaps (substring). Shrink over time.
 fn is_unsupported(expr: &str) -> bool {
+    // Keep this list short and honest — shrink as coverage grows.
     const NEEDLES: &[&str] = &[
         "pad_",
         "from_items",
         "to_items",
         "zip(",
-        "[*].*.*",
-        // flatten-after-filter multi-projection still incomplete
-        "][]",
-        // multi-select list as projection target edge cases in suite
-        "?.*.",
     ];
     NEEDLES.iter().any(|n| expr.contains(n))
 }
@@ -226,14 +222,19 @@ fn jmespath_compliance_full_suite_gate() {
 
     // Floors — raise as coverage improves.
     assert!(
-        stats.pass >= 100,
-        "expected >= 100 value passes, got {}",
+        stats.pass >= 650,
+        "expected >= 650 value passes, got {}",
         stats.pass
     );
     assert!(
-        stats.pass + stats.error_ok >= 150,
-        "expected >= 150 pass+error_ok, got {}",
+        stats.pass + stats.error_ok >= 800,
+        "expected >= 800 pass+error_ok, got {}",
         stats.pass + stats.error_ok
+    );
+    assert!(
+        stats.unexpected.len() <= 100,
+        "too many residual mismatches ({})",
+        stats.unexpected.len()
     );
 
     // Full suite still fails CI on unexpected mismatches (strict).

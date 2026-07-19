@@ -32,6 +32,8 @@ pub enum SelectExpr {
     Current,
     /// Get a single object field by on-wire key and yield **its value**.
     Field(String),
+    /// Quoted identifier (`"foo.bar"`) — same as Field at runtime, but not a function name.
+    FieldQuoted(String),
     /// Raw JSON literal bytes.
     Literal(Vec<u8>),
     /// Subset projection of an object (document-order emission of kept keys).
