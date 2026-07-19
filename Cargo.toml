@@ -1,0 +1,30 @@
+[package]
+name = "jshift"
+version = "0.1.0"
+edition = "2024"
+authors = ["Shan Alexander Newton"]
+description = "Schema-guided, safe in-place JSON path reader and mutator for raw byte buffers."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shan-alexander/jshift"
+homepage = "https://github.com/shan-alexander/jshift"
+documentation = "https://docs.rs/jshift"
+readme = "README.md"
+keywords = ["json", "in-place", "mutator", "parser", "zero-copy"]
+categories = ["parser-implementations", "data-structures"]
+exclude = ["/docs/", "/target/"]
+
+[dependencies]
+memchr = "2.7"
+jshift-derive = { version = "0.1.0", path = "./jshift-derive" }
+
+[dev-dependencies]
+serde_json = "1.0"
+criterion = "0.5"
+rayon = "1.8"
+
+[[bench]]
+name = "json_benchmark"
+harness = false
+
+[workspace]
+members = ["jshift-derive"]

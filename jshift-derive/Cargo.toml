@@ -1,0 +1,20 @@
+[package]
+name = "jshift-derive"
+version = "0.1.0"
+edition = "2024"
+authors = ["Shan Alexander Newton"]
+description = "Procedural derive macros for the jshift crate."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shan-alexander/jshift"
+homepage = "https://github.com/shan-alexander/jshift"
+documentation = "https://docs.rs/jshift-derive"
+readme = "README.md"
+keywords = ["json", "derive", "proc-macro", "jshift"]
+categories = ["development-tools::procedural-macro-helpers", "parser-implementations"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
