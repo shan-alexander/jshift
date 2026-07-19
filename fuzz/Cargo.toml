@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 jshift = { path = ".." }
+serde_json = "1.0"
 
 [workspace]
 members = ["."]
@@ -31,6 +32,13 @@ bench = false
 [[bin]]
 name = "find_value"
 path = "fuzz_targets/find_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "valid_json_ops"
+path = "fuzz_targets/valid_json_ops.rs"
 test = false
 doc = false
 bench = false

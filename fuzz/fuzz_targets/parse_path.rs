@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
     // Bound work so pathological multi-megabyte inputs stay practical.
     let s = if s.len() > 4096 { &s[..4096] } else { s };
     let path = jshift::parse_path(s);
+    let _ = jshift::try_parse_path(s);
     // Touch results so LLVM keeps the work.
     let _ = path.len();
     for seg in &path {
