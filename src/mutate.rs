@@ -2,7 +2,7 @@ use crate::convert::{escape_json_key, write_json_string};
 use crate::error::Error;
 use crate::path::PathSegment;
 use crate::scan::{
-    find_object_member_offsets, find_value_offsets, scan_backwards_whitespace, skip_value,
+    byte_at, find_object_member_offsets, find_value_offsets, scan_backwards_whitespace, skip_value,
     skip_whitespace,
 };
 
@@ -23,41 +23,15 @@ use crate::scan::{
 /// assert_eq!(json, b"{\"status\": \"running\"}".to_vec());
 /// ```
 pub fn mutate_value(json: &mut Vec<u8>, path: &[PathSegment], new_value: &[u8]) -> Result<(), Error> {
-    // 1. Locate the value offsets
-    let (start, end) = find_value_offsets(json, path)?;
-
-    let old_len = end - start;
-    let new_len = new_value.len();
-
-    if old_len == new_len {
-        // Simple case: same length, just overwrite the slice
-        json[start..end].copy_from_slice(new_value);
-    } else {
-        let old_total_len = json.len();
-
-        if new_len > old_len {
-            let delta = new_len - old_len;
-            json.resize(old_total_len + delta, 0);
-
-            // Shift the tail to the right using safe slice rotation
-            let tail_slice = &mut json[end..];
-            tail_slice.rotate_right(delta);
-        } else {
-            let delta = old_len - new_len;
-
-            // Shift the tail to the left using safe slice rotation
-            let tail_slice = &mut json[start + new_len..];
-            tail_slice.rotate_left(delta);
-
-            // Shrink the vector to remove trailing garbage
-            json.truncate(old_total_len - delta);
-        }
-
-        // Write the new value into the gap
-        json[start..start + new_len].copy_from_slice(new_value);
+    if new_value.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "Replacement value must not be empty",
+        });
     }
-
-    Ok(())
+    let (start, end) = find_value_offsets(json, path)?;
+    validate_span(json, start, end)?;
+    splice_range(json, start, end, new_value)
 }
 
 /// Appends a new value to the end of a JSON array located at the specified path.
@@ -78,32 +52,33 @@ pub fn append_to_array(
     path: &[PathSegment],
     new_element: &[u8],
 ) -> Result<(), Error> {
-    let (start, end) = find_value_offsets(json, path)?;
-
-    if json[start] != b'[' {
-        return Err(Error::TypeMismatch {
-            expected: "array",
-            found: "primitive/object",
+    if new_element.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "Appended value must not be empty",
         });
     }
 
+    let (start, end) = find_value_offsets(json, path)?;
+    require_container(json, start, end, b'[', b']', "array", "primitive/object")?;
+
     let insertion_point = end - 1;
     let is_empty = is_array_empty(json, start, end)?;
-    let old_total_len = json.len();
 
     let delta = if is_empty {
         new_element.len()
     } else {
-        1 + new_element.len()
+        new_element
+            .len()
+            .checked_add(1)
+            .ok_or(Error::InvalidJsonSyntax {
+                pos: insertion_point,
+                msg: "Buffer size overflow",
+            })?
     };
 
-    json.resize(old_total_len + delta, 0);
+    grow_and_shift_right(json, insertion_point, delta)?;
 
-    // Shift the closing bracket and everything after it to the right
-    let tail_slice = &mut json[insertion_point..];
-    tail_slice.rotate_right(delta);
-
-    // Write the new element (and comma if not empty)
     if is_empty {
         json[insertion_point..insertion_point + new_element.len()].copy_from_slice(new_element);
     } else {
@@ -142,13 +117,8 @@ fn is_array_empty(json: &[u8], start: usize, end: usize) -> Result<bool, Error> 
 /// assert_eq!(array_len(json, &parse_path("list")).unwrap(), 3);
 /// ```
 pub fn array_len(json: &[u8], path: &[PathSegment]) -> Result<usize, Error> {
-    let (start, _end) = find_value_offsets(json, path)?;
-    if json[start] != b'[' {
-        return Err(Error::TypeMismatch {
-            expected: "array",
-            found: "primitive/object",
-        });
-    }
+    let (start, end) = find_value_offsets(json, path)?;
+    require_container(json, start, end, b'[', b']', "array", "primitive/object")?;
 
     let mut pos = skip_whitespace(json, start + 1);
     if pos >= json.len() {
@@ -161,7 +131,7 @@ pub fn array_len(json: &[u8], path: &[PathSegment]) -> Result<usize, Error> {
         return Ok(0);
     }
 
-    let mut count = 1;
+    let mut count = 1usize;
     loop {
         pos = skip_value(json, pos)?;
         pos = skip_whitespace(json, pos);
@@ -172,7 +142,10 @@ pub fn array_len(json: &[u8], path: &[PathSegment]) -> Result<usize, Error> {
             });
         }
         if json[pos] == b',' {
-            count += 1;
+            count = count.checked_add(1).ok_or(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Array length overflow",
+            })?;
             pos += 1;
         } else if json[pos] == b']' {
             break;
@@ -205,31 +178,21 @@ pub fn upsert_object_key(
     key: &str,
     new_value: &[u8],
 ) -> Result<(), Error> {
+    if new_value.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "Upsert value must not be empty",
+        });
+    }
+
     // Match the escaped on-wire key form so logical keys with `"`, `\`, etc. update
     // correctly instead of inserting duplicates.
     let escaped_key = escape_json_key(key);
 
     match find_object_member_offsets(json, path, escaped_key.as_bytes()) {
         Ok((_key_start, val_start, val_end)) => {
-            // Key exists: splice the new value over the old value span.
-            let old_len = val_end - val_start;
-            let new_len = new_value.len();
-            if old_len == new_len {
-                json[val_start..val_end].copy_from_slice(new_value);
-            } else {
-                let old_total_len = json.len();
-                if new_len > old_len {
-                    let delta = new_len - old_len;
-                    json.resize(old_total_len + delta, 0);
-                    json[val_end..].rotate_right(delta);
-                } else {
-                    let delta = old_len - new_len;
-                    json[val_start + new_len..].rotate_left(delta);
-                    json.truncate(old_total_len - delta);
-                }
-                json[val_start..val_start + new_len].copy_from_slice(new_value);
-            }
-            return Ok(());
+            validate_span(json, val_start, val_end)?;
+            return splice_range(json, val_start, val_end, new_value);
         }
         Err(Error::PathNotFound) => {
             // Insert below.
@@ -238,16 +201,10 @@ pub fn upsert_object_key(
     }
 
     let (start, end) = find_value_offsets(json, path)?;
-    if json[start] != b'{' {
-        return Err(Error::TypeMismatch {
-            expected: "object",
-            found: "primitive/array",
-        });
-    }
+    require_container(json, start, end, b'{', b'}', "object", "primitive/array")?;
 
     let insertion_point = end - 1;
     let is_empty = is_object_empty(json, start, end)?;
-    let old_total_len = json.len();
 
     let mut insertion_content = Vec::new();
     if !is_empty {
@@ -258,11 +215,7 @@ pub fn upsert_object_key(
     insertion_content.extend_from_slice(new_value);
 
     let delta = insertion_content.len();
-    json.resize(old_total_len + delta, 0);
-
-    let tail_slice = &mut json[insertion_point..];
-    tail_slice.rotate_right(delta);
-
+    grow_and_shift_right(json, insertion_point, delta)?;
     json[insertion_point..insertion_point + delta].copy_from_slice(&insertion_content);
 
     Ok(())
@@ -311,7 +264,7 @@ pub fn delete_key(json: &mut Vec<u8>, path: &[PathSegment], key: &str) -> Result
     let delete_start;
     let delete_end;
 
-    if prev_comma_pos > 0 && json[prev_comma_pos - 1] == b',' {
+    if prev_comma_pos > 0 && byte_at(json, prev_comma_pos - 1)? == b',' {
         delete_start = prev_comma_pos - 1;
         delete_end = val_end;
     } else {
@@ -327,14 +280,7 @@ pub fn delete_key(json: &mut Vec<u8>, path: &[PathSegment], key: &str) -> Result
         }
     }
 
-    let delta = delete_end - delete_start;
-    let old_total_len = json.len();
-
-    let tail_slice = &mut json[delete_start..];
-    tail_slice.rotate_left(delta);
-    json.truncate(old_total_len - delta);
-
-    Ok(())
+    delete_range(json, delete_start, delete_end)
 }
 
 /// Deletes an element from a JSON array located at the specified path by its index.
@@ -354,6 +300,7 @@ pub fn delete_index(json: &mut Vec<u8>, path: &[PathSegment], index: usize) -> R
     target_path.push(PathSegment::Index(index));
 
     let (val_start, val_end) = find_value_offsets(json, &target_path)?;
+    validate_span(json, val_start, val_end)?;
 
     let mut prev_comma_pos = val_start;
     prev_comma_pos = scan_backwards_whitespace(json, prev_comma_pos);
@@ -361,7 +308,7 @@ pub fn delete_index(json: &mut Vec<u8>, path: &[PathSegment], index: usize) -> R
     let delete_start;
     let delete_end;
 
-    if prev_comma_pos > 0 && json[prev_comma_pos - 1] == b',' {
+    if prev_comma_pos > 0 && byte_at(json, prev_comma_pos - 1)? == b',' {
         delete_start = prev_comma_pos - 1;
         delete_end = val_end;
     } else {
@@ -376,12 +323,109 @@ pub fn delete_index(json: &mut Vec<u8>, path: &[PathSegment], index: usize) -> R
         }
     }
 
-    let delta = delete_end - delete_start;
+    delete_range(json, delete_start, delete_end)
+}
+
+// --- buffer helpers ---------------------------------------------------------
+
+fn validate_span(json: &[u8], start: usize, end: usize) -> Result<(), Error> {
+    if start > end || end > json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: start,
+            msg: "Invalid value span",
+        });
+    }
+    if start == end {
+        return Err(Error::InvalidJsonSyntax {
+            pos: start,
+            msg: "Empty value span",
+        });
+    }
+    Ok(())
+}
+
+fn require_container(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    open: u8,
+    close: u8,
+    expected: &'static str,
+    found: &'static str,
+) -> Result<(), Error> {
+    validate_span(json, start, end)?;
+    if byte_at(json, start)? != open {
+        return Err(Error::TypeMismatch { expected, found });
+    }
+    if json[end - 1] != close {
+        return Err(Error::InvalidJsonSyntax {
+            pos: end.saturating_sub(1),
+            msg: "Mismatched container delimiters",
+        });
+    }
+    Ok(())
+}
+
+/// Replace `json[start..end]` with `new_value`, growing or shrinking as needed.
+fn splice_range(
+    json: &mut Vec<u8>,
+    start: usize,
+    end: usize,
+    new_value: &[u8],
+) -> Result<(), Error> {
+    let old_len = end - start;
+    let new_len = new_value.len();
+
+    if old_len == new_len {
+        json[start..end].copy_from_slice(new_value);
+        return Ok(());
+    }
+
     let old_total_len = json.len();
+    if new_len > old_len {
+        let delta = new_len - old_len;
+        grow_and_shift_right(json, end, delta)?;
+    } else {
+        let delta = old_len - new_len;
+        json[start + new_len..].rotate_left(delta);
+        json.truncate(old_total_len - delta);
+    }
+    json[start..start + new_len].copy_from_slice(new_value);
+    Ok(())
+}
 
-    let tail_slice = &mut json[delete_start..];
-    tail_slice.rotate_left(delta);
+fn grow_and_shift_right(json: &mut Vec<u8>, at: usize, delta: usize) -> Result<(), Error> {
+    if delta == 0 {
+        return Ok(());
+    }
+    if at > json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: at,
+            msg: "Insert position out of bounds",
+        });
+    }
+    let new_len = json.len().checked_add(delta).ok_or(Error::InvalidJsonSyntax {
+        pos: at,
+        msg: "Buffer size overflow",
+    })?;
+    json.resize(new_len, 0);
+    json[at..].rotate_right(delta);
+    Ok(())
+}
+
+fn delete_range(json: &mut Vec<u8>, delete_start: usize, delete_end: usize) -> Result<(), Error> {
+    if delete_start > delete_end || delete_end > json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: delete_start,
+            msg: "Invalid delete span",
+        });
+    }
+    let delta = delete_end - delete_start;
+    if delta == 0 {
+        return Ok(());
+    }
+    let old_total_len = json.len();
+    json[delete_start..].rotate_left(delta);
     json.truncate(old_total_len - delta);
-
     Ok(())
 }

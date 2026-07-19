@@ -114,7 +114,7 @@ pub(crate) fn find_value_offsets(json: &[u8], path: &[PathSegment]) -> Result<(u
 
     match &path[0] {
         PathSegment::Key(_) => {
-            if json[pos] != b'{' {
+            if byte_at(json, pos)? != b'{' {
                 return Err(Error::InvalidJsonSyntax {
                     pos,
                     msg: "Expected opening brace '{' for object",
@@ -123,7 +123,7 @@ pub(crate) fn find_value_offsets(json: &[u8], path: &[PathSegment]) -> Result<(u
             find_in_object_offsets(json, pos + 1, path)
         }
         PathSegment::Index(_) => {
-            if json[pos] != b'[' {
+            if byte_at(json, pos)? != b'[' {
                 return Err(Error::InvalidJsonSyntax {
                     pos,
                     msg: "Expected opening bracket '[' for array",
@@ -407,12 +407,20 @@ pub(crate) fn skip_value(json: &[u8], mut pos: usize) -> Result<usize, Error> {
         }
         _ => {
             // Primitive (number, true, false, null)
-            // Stop at structural JSON characters or whitespace
+            // Stop at structural JSON characters or whitespace.
+            let start = pos;
             while pos < json.len() {
                 match json[pos] {
                     b' ' | b'\t' | b'\n' | b'\r' | b',' | b'}' | b']' => break,
                     _ => pos += 1,
                 }
+            }
+            // Empty primitive (e.g. value starts with `,` or `}`) is invalid.
+            if pos == start {
+                return Err(Error::InvalidJsonSyntax {
+                    pos: start,
+                    msg: "Expected JSON value",
+                });
             }
             Ok(pos)
         }
@@ -423,21 +431,20 @@ pub(crate) fn skip_value(json: &[u8], mut pos: usize) -> Result<usize, Error> {
 /// Returns the index of the closing double-quote.
 pub(crate) fn find_string_end(json: &[u8], mut pos: usize) -> Result<usize, Error> {
     while pos < json.len() {
-        // Fast scan for next quote or backslash
+        // Fast scan for next quote
         if let Some(next_pos) = memchr(b'"', &json[pos..]) {
             let found_idx = pos + next_pos;
-            // Check if quote is escaped by counting backslashes before it
-            let mut backslashes = 0;
-            let mut check_idx = found_idx as isize - 1;
-            while check_idx >= 0 && json[check_idx as usize] == b'\\' {
+            // Quote is escaped iff an odd number of consecutive backslashes precede it.
+            let mut backslashes = 0usize;
+            let mut check = found_idx;
+            while check > 0 && json[check - 1] == b'\\' {
                 backslashes += 1;
-                check_idx -= 1;
+                check -= 1;
             }
             if backslashes % 2 == 0 {
                 return Ok(found_idx); // unescaped quote
-            } else {
-                pos = found_idx + 1; // escaped quote, keep scanning
             }
+            pos = found_idx + 1; // escaped quote, keep scanning
         } else {
             return Err(Error::InvalidJsonSyntax {
                 pos,
@@ -448,6 +455,15 @@ pub(crate) fn find_string_end(json: &[u8], mut pos: usize) -> Result<usize, Erro
     Err(Error::InvalidJsonSyntax {
         pos,
         msg: "Unclosed string literal",
+    })
+}
+
+/// Read `json[pos]` or return a syntax error (no panic on empty / short buffers).
+#[inline]
+pub(crate) fn byte_at(json: &[u8], pos: usize) -> Result<u8, Error> {
+    json.get(pos).copied().ok_or(Error::InvalidJsonSyntax {
+        pos,
+        msg: "Unexpected EOF",
     })
 }
 
