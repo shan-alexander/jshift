@@ -1,6 +1,6 @@
 [package]
 name = "jshift"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
@@ -22,9 +22,16 @@ exclude = [
     "/benches/data/",
 ]
 
+[features]
+default = ["derive"]
+# Proc-macro schemas: JsonMutatorSchema / JsonView derive.
+derive = ["dep:jshift-derive"]
+# Reserved for optional SIMD Stage-1 structural scan (no effect yet; safe scalar path remains default).
+index-simd = []
+
 [dependencies]
 memchr = "2.7"
-jshift-derive = { version = "0.3.1", path = "./jshift-derive" }
+jshift-derive = { version = "0.4.0", path = "./jshift-derive", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

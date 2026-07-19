@@ -51,15 +51,38 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 * **In-place mutations:** Upsize and downsize with safe slice rotations (compiles to `memmove`-class moves).
 * **100% Safe Rust:** `#![forbid(unsafe_code)]`—no `get_unchecked` in the hot path.
 * **Zero-copy reads:** `find_value` returns a subslice of the input buffer.
-* **Schema derive:** `#[derive(JsonMutatorSchema)]` generates typed readers and mutators with compile-time path constants.
+* **`JsonView` trait:** one protocol surface for “this Rust type is a projection of JSON bytes” (`read_from` / `read_from_indexed` / `write_into`)—generic pipelines without ad-hoc methods.
+* **Schema derive:** `#[derive(JsonView)]` or `JsonMutatorSchema` — typed readers/mutators, `FIELD_PATHS`, schema-guided `INDEXED_ARRAY_PATHS` / `prepare()`.
+* **Open projections:** fields you don’t name are **unread** and **byte-preserved** on write (API evolution as a feature).
+* **Shared documents:** `SharedDocument` (`Arc<[u8]>`) for cheap clone + many concurrent readers.
+* **JSONL helpers:** `json_lines` / `read_jsonl` — index **per line**, not one giant merge.
+* **Projection estimates:** `estimate_projected_len` (size planning before big jobs).
 * **Object & array CRUD:** Update, upsert, delete keys; append, index, delete elements; nested `upsert_at_path`.
 * **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
 * **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
 * **Option / null:** first-class for training JSONL and partial records.
-* **Structural array indexes (0.3):** [`IndexedDocument`] builds safe element side-tables so
-  mid/last `products[i].field` jumps instead of scanning every sibling (see below).
+* **Structural indexes (opt-in):** [`IndexedDocument`] side-tables so mid/last `products[i].field` jumps instead of scanning every sibling.
 
 > **Contract:** jshift is a **non-validating** path engine. It assumes mostly well-formed JSON along the path you traverse. Callers must supply complete JSON value bytes for raw mutations (or use `ToJsonBytes` / `mutate_value_checked`).
+
+### Cargo features
+
+```toml
+jshift = "0.4"                              # default: derive on
+jshift = { version = "0.4", default-features = false }  # core only
+# index-simd is reserved (no-op); indexing APIs are always available, opt-in at call site
+```
+
+### Non-goals (deliberate)
+
+| Do | Don’t |
+| :--- | :--- |
+| Path index + mutate | Full JSON DOM |
+| Schema-guided projection | Replace serde for fully typed apps |
+| Safe structural tables | Promise simdjson Stage-1 crowns |
+| Preserve unmentioned fields | Full RFC validator (unless optional later) |
+
+Clear non-goals keep jshift the **safe path-mutate / field-projection** crate—not a second full parser.
 
 ---
 
@@ -76,6 +99,7 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 * “Filter / tag / rewrite `status` on every JSONL line” → **jshift**.
 * “Deserialize into `struct Request { … }` with dozens of fields and nested enums” → **serde**.
 * “Gateway: inspect `headers.x-request-id`, maybe set `status`, forward body” → **jshift**.
+* “Partial view struct (`ListingCard { id, title }`) over a fat catalog object” → **`JsonView`**.
 
 ---
 

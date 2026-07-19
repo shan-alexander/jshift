@@ -7,11 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-19
+
+API maturity pass (prost product architecture, not Protobuf wire format).
+
+### Added
+- **`JsonView` trait** — single protocol surface: `read_from`, `read_from_indexed`,
+  `read_from_doc`, `write_into` for typed projections of JSON bytes; free helpers
+  `read_view` / `write_view`.
+- **Derive implements `JsonView`:** `#[derive(JsonView)]` alias of `JsonMutatorSchema`;
+  `FIELD_PATHS`, `prepare()`, `from_indexed_document()`, `write_into_json()`,
+  `estimate_projected_len()` on schema types.
+- **`SharedDocument`** — cheaply cloneable `Arc<[u8]>` buffer for read-heavy fan-out
+  (`read` / `read_indexed` / `indexed`).
+- **JSONL helpers:** `json_lines`, `JsonLines`, `read_jsonl`, `read_jsonl_indexed`,
+  `read_line_indexed` (message-at-a-time indexing).
+- **Projection estimates:** `estimate_projected_len`, `estimate_values_len`.
+- **Cargo features:** `derive` (default), reserved `index-simd` (no-op). Core path +
+  index APIs always compile; indexing remains **opt-in at call site**.
+- Docs: open-document semantics, explicit non-goals table (not a DOM / not serde).
+
+### Notes
+- Unmentioned JSON paths stay unread / byte-preserved on `write_into` (productized).
+- Schema-complete index plan: derive still emits only path-needed array prefixes.
+
+## [0.3.1] - 2026-07-19
+
 ### Added
 - Indexed benches vs **gjson / sonic-rs / serde_json** (array mid/last + wide object);
   README documents **opt-in** indexing (no tax on default paths).
-
-## [0.3.1] - 2026-07-19
 
 ### Added
 - **Stage-1 structural index** ([`StructuralIndex`] / `build_structural_index`): safe list of

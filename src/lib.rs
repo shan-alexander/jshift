@@ -7,14 +7,43 @@
 //! building a full AST. Path scans return zero-copy slices; mutations resize the
 //! buffer and shift the tail with safe slice rotations.
 //!
+//! # What jshift is (and is not)
+//!
+//! | Do | Don't |
+//! | --- | --- |
+//! | Path index + mutate | Full JSON DOM |
+//! | Schema-guided projection ([`JsonView`]) | Replace serde for fully typed apps |
+//! | Safe structural side-tables | Promise simdjson Stage-1 crowns |
+//! | Preserve unmentioned fields | Full RFC validator (unless you add one) |
+//!
+//! **Open documents:** paths you don't name are left unread (and byte-preserved on
+//! write). That is a feature for API evolution—same spirit as prost's unknown fields.
+//!
+//! # Cargo features
+//!
+//! | Feature | Default | Purpose |
+//! | --- | --- | --- |
+//! | `derive` | yes | `JsonMutatorSchema` / `JsonView` proc-macros |
+//! | `index-simd` | no | Reserved for optional SIMD Stage-1 (no-op today) |
+//!
+//! Core path engine and structural indexing always compile. Indexing is **opt-in at
+//! the call site** (`IndexedDocument`, `read_from_indexed`)—never taxed on default finds.
+//!
+//! ```toml
+//! jshift = { version = "0.4", features = ["derive"] }
+//! # core only:
+//! jshift = { version = "0.4", default-features = false }
+//! ```
+//!
 //! # Features
 //! * **Zero-copy reads:** Find values as slices into the raw buffer.
 //! * **In-place mutations:** Safe byte-shifting (including resize) via slice rotations.
-//! * **Macro-generated schemas:** `#[derive(JsonMutatorSchema)]` for typed readers and mutators.
-//! * **Array and object CRUD:** Insert, update, append, and delete dynamically.
-//! * **JSON string escaping:** `ToJsonBytes` and key upserts escape special characters.
-//! * **Structural array indexes:** [`IndexedDocument`] builds safe side-tables so
-//!   `products[i].field` jumps in O(1) instead of skipping `i` siblings.
+//! * **[`JsonView`] trait:** one protocol surface for typed projections of bytes.
+//! * **Macro-generated schemas:** `#[derive(JsonView)]` / `JsonMutatorSchema`.
+//! * **Shared buffers:** [`SharedDocument`] (`Arc<[u8]>`) for read-heavy fan-out.
+//! * **JSONL helpers:** [`json_lines`], message-at-a-time indexing.
+//! * **Projection estimates:** [`estimate_projected_len`] (prost `encoded_len` analogue).
+//! * **Structural array indexes:** [`IndexedDocument`] side-tables for large arrays.
 //!
 //! # Quick Start
 //! ```
@@ -30,6 +59,34 @@
 //! // Mutate in-place
 //! mutate_value(&mut json, &path, b"10.0").unwrap();
 //! assert_eq!(json, b"{\"user\": \"farmer\", \"score\": 10.0}".to_vec());
+//! ```
+//!
+//! # JsonView: typed projections (open partial structs)
+//! ```
+//! use jshift::{JsonView, JsonMutatorSchema};
+//!
+//! #[derive(JsonMutatorSchema)]
+//! struct ListingCard {
+//!     #[json(path = "id")]
+//!     id: u64,
+//!     #[json(path = "title")]
+//!     title: String,
+//!     // intentionally no variants / images — partial view
+//! }
+//!
+//! fn ingest<T: JsonView>(buf: &[u8]) -> Result<T, jshift::Error> {
+//!     T::read_from(buf)
+//! }
+//!
+//! let json = br#"{"id":7,"title":"Hat","images":[1,2,3],"variants":[]}"#;
+//! let card: ListingCard = ingest(json).unwrap();
+//! assert_eq!(card.id, 7);
+//! assert_eq!(card.title, "Hat");
+//!
+//! // write_into only touches named paths; other keys stay put
+//! let mut buf = json.to_vec();
+//! card.write_into(&mut buf).unwrap();
+//! assert!(buf.windows(8).any(|w| w == b"\"images\""));
 //! ```
 //!
 //! # High-Impact Real-World Use Case: LLM Dataset Processing (JSONL)
@@ -65,28 +122,44 @@
 //! ```
 
 mod convert;
+mod document;
 mod error;
 mod index;
+mod jsonl;
 mod mutate;
 mod path;
+mod project;
 mod scan;
+mod view;
 
 pub use convert::{
     escape_json_key, escape_json_string, from_json_string, write_json_string,
     write_json_string_content, FromJsonSlice, ToJsonBytes,
 };
+pub use document::SharedDocument;
 pub use error::Error;
 pub use index::{
     build_array_index, build_object_key_index, build_structural_index, static_array_prefixes_from_path,
     ArrayIndex, IndexedDocument, ObjectKeyIndex, StructuralIndex,
 };
-pub use jshift_derive::JsonMutatorSchema;
+pub use jsonl::{json_lines, read_jsonl, read_jsonl_indexed, read_line_indexed, JsonLines};
 pub use mutate::{
     append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,
     upsert_at_path, upsert_object_key,
 };
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
+pub use project::{estimate_projected_len, estimate_values_len};
 pub use scan::find_value;
+pub use view::{read_view, write_view, JsonView};
+
+#[cfg(feature = "derive")]
+pub use jshift_derive::JsonMutatorSchema;
+
+// Derive macro shares the `JsonView` name (macro namespace) with the trait.
+// `#[derive(JsonView)]` and `T: JsonView` both work with `use jshift::JsonView`.
+#[cfg(feature = "derive")]
+#[doc(inline)]
+pub use jshift_derive::JsonView;
 
 #[cfg(test)]
 mod tests {
@@ -743,6 +816,78 @@ mod tests {
         assert!(Nested::INDEXED_ARRAY_PATHS.contains(&"tags"));
         let n2 = Nested::read_from_json_indexed(&json).unwrap();
         assert_eq!(n2.first_tag, "a");
+        assert_eq!(Nested::FIELD_PATHS, &["meta.ver", "tags[0]"]);
+    }
+
+    #[test]
+    fn test_json_view_trait_generic_pipeline() {
+        #[derive(JsonMutatorSchema)]
+        struct Card {
+            #[json(path = "id")]
+            id: u64,
+            #[json(path = "title")]
+            title: String,
+        }
+
+        fn ingest<T: JsonView>(buf: &[u8]) -> Result<T, Error> {
+            T::read_from(buf)
+        }
+
+        let json = br#"{"id":7,"title":"Hat","images":[1,2,3]}"#;
+        let card: Card = ingest(json).unwrap();
+        assert_eq!(card.id, 7);
+        assert_eq!(card.title, "Hat");
+
+        // write_into preserves unmentioned fields
+        let mut buf = json.to_vec();
+        let updated = Card {
+            id: 8,
+            title: "Cap".into(),
+        };
+        updated.write_into(&mut buf).unwrap();
+        assert_eq!(find_value(&buf, &parse_path("id")).unwrap(), b"8");
+        assert_eq!(
+            find_value(&buf, &parse_path("title")).unwrap(),
+            br#""Cap""#
+        );
+        assert!(
+            find_value(&buf, &parse_path("images")).unwrap().starts_with(b"[")
+        );
+
+        // SharedDocument + trait
+        let shared = SharedDocument::from_slice(json);
+        let c2: Card = shared.read().unwrap();
+        assert_eq!(c2.id, 7);
+
+        // JSONL
+        let lines = br#"{"id":1,"title":"a"}
+{"id":2,"title":"b"}
+"#;
+        let ids: Vec<u64> = read_jsonl::<Card>(lines)
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+
+        // estimate
+        let est = estimate_projected_len(json, Card::FIELD_PATHS).unwrap();
+        assert!(est < json.len());
+        assert_eq!(Card::estimate_projected_len(json).unwrap(), est);
+    }
+
+    #[test]
+    fn test_json_lines_and_shared_doc() {
+        let buf = b"\n{\"a\":1}\r\n\n{\"a\":2}\n";
+        let lines: Vec<&[u8]> = json_lines(buf).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], br#"{"a":1}"#);
+        assert_eq!(lines[1], br#"{"a":2}"#);
+
+        let doc = SharedDocument::from_vec(br#"{"products":[{"id":1},{"id":2}]}"#.to_vec());
+        let idx = doc.indexed(&["products"]).unwrap();
+        assert_eq!(
+            idx.find(&parse_path("products[1].id")).unwrap(),
+            b"2"
+        );
     }
 
     #[test]

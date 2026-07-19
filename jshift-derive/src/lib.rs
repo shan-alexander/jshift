@@ -3,8 +3,23 @@ use quote::quote;
 use std::collections::BTreeSet;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Ident, Type};
 
+/// Derive typed JSON path readers/mutators and implement [`jshift::JsonView`].
+///
+/// Same as [`JsonView`] — kept for backward compatibility.
 #[proc_macro_derive(JsonMutatorSchema, attributes(json))]
 pub fn derive_json_mutator_schema(input: TokenStream) -> TokenStream {
+    derive_inner(input)
+}
+
+/// Alias for [`JsonMutatorSchema`]: a Rust type is a projection of JSON bytes.
+///
+/// Prefer this name when thinking in views / partial records (prost-like messages).
+#[proc_macro_derive(JsonView, attributes(json))]
+pub fn derive_json_view(input: TokenStream) -> TokenStream {
+    derive_inner(input)
+}
+
+fn derive_inner(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match expand_derive(&input) {
         Ok(tokens) => tokens.into(),
@@ -21,7 +36,7 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         _ => {
             return Err(syn::Error::new_spanned(
                 input,
-                "JsonMutatorSchema can only be derived on structs",
+                "JsonMutatorSchema / JsonView can only be derived on structs",
             ));
         }
     };
@@ -31,15 +46,18 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         _ => {
             return Err(syn::Error::new_spanned(
                 input,
-                "JsonMutatorSchema can only be derived on structs with named fields",
+                "JsonMutatorSchema / JsonView can only be derived on structs with named fields",
             ));
         }
     };
 
     let mut field_reads = Vec::new();
     let mut field_reads_indexed = Vec::new();
+    let mut field_reads_doc = Vec::new();
     let mut mutator_setters = Vec::new();
     let mut path_statics = Vec::new();
+    let mut write_fields = Vec::new();
+    let mut field_path_lits = Vec::new();
     let mut array_prefixes: BTreeSet<String> = BTreeSet::new();
 
     for field in fields {
@@ -48,6 +66,7 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         })?;
         let field_type = &field.ty;
         let raw_path = get_json_path(field)?;
+        field_path_lits.push(raw_path.clone());
 
         let path_segments = parse_path_segments(&raw_path).map_err(|msg| {
             syn::Error::new_spanned(
@@ -113,6 +132,21 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                     }
                 }
             });
+            field_reads_doc.push(quote! {
+                #field_name: {
+                    match doc.find(Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => None,
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
         } else {
             field_reads.push(quote! {
                 #field_name: {
@@ -134,7 +168,24 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                         })?
                 }
             });
+            field_reads_doc.push(quote! {
+                #field_name: {
+                    let slice = doc.find(Self::#path_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(slice)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
+                }
+            });
         }
+
+        write_fields.push(quote! {
+            {
+                let bytes = jshift::ToJsonBytes::to_json_bytes(&self.#field_name);
+                jshift::upsert_at_path(json, Self::#path_const_name, &bytes)?;
+            }
+        });
 
         mutator_setters.push(quote! {
             pub fn #setter_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
@@ -155,14 +206,21 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     }
 
     let array_path_lits: Vec<_> = array_prefixes.iter().map(|s| quote! { #s }).collect();
+    let field_path_tokens: Vec<_> = field_path_lits.iter().map(|s| quote! { #s }).collect();
 
     Ok(quote! {
         impl #struct_name {
             #(#path_statics)*
 
+            /// All `#[json(path = ...)]` paths for this view (schema surface).
+            pub const FIELD_PATHS: &'static [&'static str] = &[
+                #(#field_path_tokens),*
+            ];
+
             /// Static array path prefixes inferred from field paths (for auto-index).
             ///
             /// e.g. `products[0].title` contributes `"products"`.
+            /// Schema-complete index plan: runtime only builds what paths need.
             pub const INDEXED_ARRAY_PATHS: &'static [&'static str] = &[
                 #(#array_path_lits),*
             ];
@@ -184,6 +242,12 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 Ok(doc)
             }
 
+            /// Schema-guided prepare: same as [`Self::indexed_document`].
+            #[inline]
+            pub fn prepare(json: &[u8]) -> Result<jshift::IndexedDocument<'_>, jshift::Error> {
+                Self::indexed_document(json)
+            }
+
             /// Like [`Self::read_from_json`] but uses [`Self::indexed_document`] so
             /// paths through large arrays jump via side-tables.
             pub fn read_from_json_indexed(json: &[u8]) -> Result<Self, jshift::Error> {
@@ -193,8 +257,52 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 })
             }
 
+            /// Read using a pre-built index (reuses side-tables across views).
+            ///
+            /// Prefer [`jshift::JsonView::read_from_doc`] in generic code.
+            pub fn from_indexed_document(
+                doc: &jshift::IndexedDocument<'_>,
+            ) -> Result<Self, jshift::Error> {
+                Ok(Self {
+                    #(#field_reads_doc),*
+                })
+            }
+
+            /// Upsert all schema fields into `json` (unmentioned paths preserved).
+            pub fn write_into_json(&self, json: &mut Vec<u8>) -> Result<(), jshift::Error> {
+                #(#write_fields)*
+                Ok(())
+            }
+
+            /// Rough projected size if only this schema's fields were kept.
+            pub fn estimate_projected_len(json: &[u8]) -> Result<usize, jshift::Error> {
+                jshift::estimate_projected_len(json, Self::FIELD_PATHS)
+            }
+
             pub fn mutator(json: &mut Vec<u8>) -> #mutator_name {
                 #mutator_name { json }
+            }
+        }
+
+        impl jshift::JsonView for #struct_name {
+            #[inline]
+            fn read_from(json: &[u8]) -> Result<Self, jshift::Error> {
+                Self::read_from_json(json)
+            }
+
+            #[inline]
+            fn read_from_indexed(json: &[u8]) -> Result<Self, jshift::Error> {
+                Self::read_from_json_indexed(json)
+            }
+
+            #[inline]
+            fn read_from_doc(doc: &jshift::IndexedDocument<'_>) -> Result<Self, jshift::Error> {
+                Self::from_indexed_document(doc)
+            }
+
+            #[inline]
+            fn write_into(&self, json: &mut Vec<u8>) -> Result<(), jshift::Error> {
+                self.write_into_json(json)
             }
         }
 
