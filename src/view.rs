@@ -46,6 +46,7 @@
 
 use crate::error::Error;
 use crate::index::IndexedDocument;
+use crate::project::{project, ProjectPlan};
 
 /// A Rust type that is a **projection** of JSON bytes along named paths.
 ///
@@ -92,6 +93,19 @@ pub trait JsonView: Sized {
     /// Unmentioned paths in the buffer are left alone. Missing parents for named
     /// paths may be created (see [`crate::upsert_at_path`]).
     fn write_into(&self, json: &mut Vec<u8>) -> Result<(), Error>;
+
+    /// Schema keep-list as a [`ProjectPlan`] (default: empty object selection).
+    ///
+    /// Derive implementations build this from `FIELD_PATHS` (including `[]` wildcards
+    /// when present in path attributes).
+    fn project_plan() -> ProjectPlan {
+        ProjectPlan::from_paths(&[]).unwrap_or_else(|_| ProjectPlan::identity())
+    }
+
+    /// Project `json` down to this view's keep-list (new buffer).
+    fn project_bytes(json: &[u8]) -> Result<Vec<u8>, Error> {
+        project(json, &Self::project_plan())
+    }
 }
 
 /// Shared helper: read any [`JsonView`] from bytes.

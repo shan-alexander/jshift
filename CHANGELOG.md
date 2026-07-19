@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Field projection:** `project`, `project_paths`, `project_into`, `project_write`,
+  `ProjectPlan`, `SelectExpr` AST, `parse_project_path` (`[]` / `[*]` wildcards),
+  styles (`Compact`, `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
+  Derive / `JsonView`: `schema_project_plan`, `project_json` / `project_bytes`.
+  Architecture reserved for future JMESPath, transforms, richer whitespace fidelity.
+
 ## [0.4.0] - 2026-07-19
 
 API maturity pass (prost product architecture, not Protobuf wire format).

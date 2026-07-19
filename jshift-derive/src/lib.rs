@@ -279,6 +279,17 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 jshift::estimate_projected_len(json, Self::FIELD_PATHS)
             }
 
+            /// Keep-list plan for [`jshift::project`] (merged [`Self::FIELD_PATHS`]).
+            pub fn schema_project_plan() -> jshift::ProjectPlan {
+                jshift::ProjectPlan::from_paths(Self::FIELD_PATHS)
+                    .expect("FIELD_PATHS must be valid project paths")
+            }
+
+            /// Project a document down to this schema's paths (new buffer).
+            pub fn project_json(json: &[u8]) -> Result<Vec<u8>, jshift::Error> {
+                jshift::project(json, &Self::schema_project_plan())
+            }
+
             pub fn mutator(json: &mut Vec<u8>) -> #mutator_name {
                 #mutator_name { json }
             }
@@ -303,6 +314,16 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             #[inline]
             fn write_into(&self, json: &mut Vec<u8>) -> Result<(), jshift::Error> {
                 self.write_into_json(json)
+            }
+
+            #[inline]
+            fn project_plan() -> jshift::ProjectPlan {
+                Self::schema_project_plan()
+            }
+
+            #[inline]
+            fn project_bytes(json: &[u8]) -> Result<Vec<u8>, jshift::Error> {
+                Self::project_json(json)
             }
         }
 

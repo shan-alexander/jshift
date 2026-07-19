@@ -56,7 +56,8 @@ Impact in practice: lower p99 on hot ingestion paths, less memory headroom for c
 * **Open projections:** fields you don’t name are **unread** and **byte-preserved** on write (API evolution as a feature).
 * **Shared documents:** `SharedDocument` (`Arc<[u8]>`) for cheap clone + many concurrent readers.
 * **JSONL helpers:** `json_lines` / `read_jsonl` -- index **per line**, not one giant merge.
-* **Projection estimates:** `estimate_projected_len` (ballpark size planning only; not a stream projector).
+* **Field projection:** `project` / `project_paths` / `ProjectPlan` (keep-list → new JSON; `[]` wildcards; Compact / PreserveSource / Pretty styles).
+* **Projection estimates:** `estimate_projected_len` / `projected_len` (planning vs exact).
 * **Object & array CRUD:** Update, upsert, delete keys; append, index, delete elements; nested `upsert_at_path`.
 * **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
 * **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
