@@ -48,6 +48,22 @@ impl FromJsonSlice for bool {
     }
 }
 
+impl<T: FromJsonSlice> FromJsonSlice for Option<T> {
+    /// `null` → `Some(None)` (parse success); a valid `T` → `Some(Some(t))`;
+    /// invalid payload → `None` (parse failure).
+    fn from_json_slice(slice: &[u8]) -> Option<Self> {
+        let start = skip_whitespace(slice, 0);
+        let mut end = slice.len();
+        while end > start && matches!(slice[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+            end -= 1;
+        }
+        if &slice[start..end] == b"null" {
+            return Some(None);
+        }
+        T::from_json_slice(slice).map(Some)
+    }
+}
+
 impl<T: FromJsonSlice> FromJsonSlice for Vec<T> {
     fn from_json_slice(slice: &[u8]) -> Option<Self> {
         let mut pos = skip_whitespace(slice, 0);
@@ -277,6 +293,16 @@ impl ToJsonBytes for bool {
             b"true".to_vec()
         } else {
             b"false".to_vec()
+        }
+    }
+}
+
+impl<T: ToJsonBytes> ToJsonBytes for Option<T> {
+    /// `None` serializes as JSON `null`; `Some(v)` uses `v`'s encoding.
+    fn to_json_bytes(&self) -> Vec<u8> {
+        match self {
+            Some(v) => v.to_json_bytes(),
+            None => b"null".to_vec(),
         }
     }
 }
