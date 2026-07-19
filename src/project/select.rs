@@ -7,59 +7,83 @@ use std::collections::HashMap;
 pub enum ProjectPathSegment {
     /// Object key (on-wire form).
     Key(String),
-    /// Fixed array index.
-    Index(usize),
+    /// Array index (may be negative: `-1` is last element).
+    Index(i64),
     /// Every array element (`[]` or `[*]`).
     ArrayWildcard,
-    /// Half-open slice `[start:end]` (`end = None` means to end).
+    /// Slice `[start:end:step]` with optional signed bounds (JMESPath rules).
     ArraySlice {
-        start: usize,
-        end: Option<usize>,
+        start: Option<i64>,
+        end: Option<i64>,
+        step: Option<i64>,
     },
 }
 
-/// Selection expression over a JSON value span.
+/// Selection / expression node over a JSON value span.
 ///
-/// Extension point for JMESPath and transforms. New shapes become new arms;
-/// [`crate::project`] remains the executor.
+/// Extension point for JMESPath. New shapes become new arms; [`crate::project`]
+/// remains the executor.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectExpr {
     /// Keep the entire current value (raw byte copy).
     Identity,
-    /// Current node (`@` in JMESPath); same emit as Identity today.
+    /// Current node (`@` in JMESPath).
     Current,
-    /// Get a single object field by on-wire key and yield **its value** (not a wrapper object).
-    ///
-    /// JMESPath identifier `id` compiles to `Field("id")`, whereas keep-list path
-    /// merge still uses [`SelectExpr::Object`] subset projection.
+    /// Get a single object field by on-wire key and yield **its value**.
     Field(String),
-    /// Raw JSON literal bytes (number, string, bool, null, or prebuilt structure).
+    /// Raw JSON literal bytes.
     Literal(Vec<u8>),
     /// Subset projection of an object (document-order emission of kept keys).
     Object(ObjectSelect),
-    /// Array projection (each / indices / slice).
+    /// Array projection (each / indices / slice / filter).
     Array(ArraySelect),
-    /// JMESPath multi-select hash: build a **new** object in listed field order.
-    ///
-    /// Example: `{id: id, title: title, price: variants[0].price}`
+    /// Multi-select hash: build a **new** object in listed field order.
     MultiSelectHash(Vec<HashField>),
-    /// JMESPath multi-select list: build a **new** array of projected values.
+    /// Multi-select list: build a **new** array of projected values.
     MultiSelectList(Vec<SelectExpr>),
     /// Pipe: evaluate `left`, then apply `right` to that intermediate JSON.
     Pipe(Box<SelectExpr>, Box<SelectExpr>),
-    /// Flatten one level of nested arrays (JMESPath `[]` flatten projection).
+    /// Flatten one level of nested arrays.
     Flatten(Box<SelectExpr>),
-    /// Descend a relative path from the current value, then apply `then`.
+    /// Descend via `left` focus, then apply `right`.
     Sub(Box<SelectExpr>, Box<SelectExpr>),
+    /// Comparison → JSON `true` / `false`.
+    Cmp {
+        op: CmpOp,
+        left: Box<SelectExpr>,
+        right: Box<SelectExpr>,
+    },
+    /// Logical AND (JMESPath `&&`) → truthy left or false.
+    And(Box<SelectExpr>, Box<SelectExpr>),
+    /// Logical OR (JMESPath `||`).
+    Or(Box<SelectExpr>, Box<SelectExpr>),
+    /// Logical NOT (JMESPath `!`).
+    Not(Box<SelectExpr>),
+    /// Function call (`length(@)`, `starts_with(title, 'Loot')`, …).
+    Call {
+        name: String,
+        args: Vec<SelectExpr>,
+    },
+    /// Parenthesized expression (preserved for AST clarity; emit = inner).
+    Paren(Box<SelectExpr>),
+}
+
+/// Comparison operators (JMESPath).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// One field in a multi-select hash (`output_key: expr`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashField {
-    /// Key written in the output object.
     pub output_key: String,
-    /// Expression evaluated against the current node.
     pub expr: SelectExpr,
 }
 
@@ -72,7 +96,7 @@ impl HashField {
     }
 }
 
-/// Object field selection for subset projection (keeps keys from the input object).
+/// Object field selection for subset projection.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObjectSelect {
     pub(crate) fields: HashMap<String, SelectExpr>,
@@ -101,7 +125,6 @@ impl ObjectSelect {
         self.fields.get(key)
     }
 
-    /// Insert or replace a field selection.
     pub fn insert(&mut self, key: impl Into<String>, expr: SelectExpr) {
         self.fields.insert(key.into(), expr);
     }
@@ -113,30 +136,99 @@ impl ObjectSelect {
 pub enum ArraySelect {
     /// Apply the same expression to every element.
     Each(Box<SelectExpr>),
-    /// Project listed indices only (ascending emission order).
-    Indices(HashMap<usize, SelectExpr>),
-    /// Project a half-open index range, applying `each` to every kept element.
+    /// Project listed indices only (keys may be negative before resolve).
+    Indices(HashMap<i64, SelectExpr>),
+    /// Slice with optional signed bounds and step.
     Slice {
-        start: usize,
-        end: Option<usize>,
+        start: Option<i64>,
+        end: Option<i64>,
+        step: Option<i64>,
+        each: Box<SelectExpr>,
+    },
+    /// Filter projection: keep elements where `pred` is truthy, then apply `each`.
+    Filter {
+        pred: Box<SelectExpr>,
         each: Box<SelectExpr>,
     },
 }
 
-/// Helpers for building selection trees programmatically (transforms).
 impl SelectExpr {
-    /// Identity / keep-all.
     pub fn identity() -> Self {
         Self::Identity
     }
 
-    /// `left | right` pipe.
     pub fn pipe(left: SelectExpr, right: SelectExpr) -> Self {
         SelectExpr::Pipe(Box::new(left), Box::new(right))
     }
 
-    /// Flatten after projecting `inner`.
     pub fn flatten(inner: SelectExpr) -> Self {
         SelectExpr::Flatten(Box::new(inner))
+    }
+}
+
+/// Resolve a JMESPath-style signed index against `len`.
+pub fn resolve_index(index: i64, len: usize) -> Option<usize> {
+    if index >= 0 {
+        let i = index as usize;
+        if i < len {
+            Some(i)
+        } else {
+            None
+        }
+    } else {
+        let n = (-index) as usize;
+        if n == 0 || n > len {
+            None
+        } else {
+            Some(len - n)
+        }
+    }
+}
+
+/// Expand a JMESPath slice to concrete ascending/stepped indices.
+pub fn resolve_slice(
+    len: usize,
+    start: Option<i64>,
+    end: Option<i64>,
+    step: Option<i64>,
+) -> Vec<usize> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Vec::new();
+    }
+    let len_i = len as i64;
+
+    // JMESPath / Python-like normalization.
+    let mut s = start.unwrap_or(if step > 0 { 0 } else { len_i - 1 });
+    let mut e = end.unwrap_or(if step > 0 { len_i } else { -len_i - 1 });
+
+    if s < 0 {
+        s += len_i;
+    }
+    if e < 0 {
+        e += len_i;
+    }
+    if step > 0 {
+        s = s.clamp(0, len_i);
+        e = e.clamp(0, len_i);
+        let mut out = Vec::new();
+        let mut i = s;
+        while i < e {
+            out.push(i as usize);
+            i += step;
+        }
+        out
+    } else {
+        s = s.clamp(-1, len_i - 1);
+        e = e.clamp(-1, len_i - 1);
+        let mut out = Vec::new();
+        let mut i = s;
+        while i > e {
+            if i >= 0 && i < len_i {
+                out.push(i as usize);
+            }
+            i += step;
+        }
+        out
     }
 }

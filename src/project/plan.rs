@@ -172,7 +172,9 @@ pub(crate) fn merge_segments(
                 unreachable!();
             };
             match arr {
-                ArraySelect::Each(each) | ArraySelect::Slice { each, .. } => {
+                ArraySelect::Each(each)
+                | ArraySelect::Slice { each, .. }
+                | ArraySelect::Filter { each, .. } => {
                     if segs.len() == 1 {
                         **each = SelectExpr::Identity;
                     } else {
@@ -196,7 +198,8 @@ pub(crate) fn merge_segments(
             ensure_array_each(node)?;
             match node {
                 SelectExpr::Array(ArraySelect::Each(each))
-                | SelectExpr::Array(ArraySelect::Slice { each, .. }) => {
+                | SelectExpr::Array(ArraySelect::Slice { each, .. })
+                | SelectExpr::Array(ArraySelect::Filter { each, .. }) => {
                     if segs.len() == 1 {
                         **each = SelectExpr::Identity;
                     } else {
@@ -207,14 +210,14 @@ pub(crate) fn merge_segments(
                 _ => unreachable!(),
             }
         }
-        ProjectPathSegment::ArraySlice { start, end } => {
-            // Convert to slice each
+        ProjectPathSegment::ArraySlice { start, end, step } => {
             match node {
                 SelectExpr::Array(ArraySelect::Slice {
                     start: s,
                     end: e,
+                    step: st,
                     each,
-                }) if *s == *start && *e == *end => {
+                }) if s == start && e == end && st == step => {
                     if segs.len() == 1 {
                         **each = SelectExpr::Identity;
                     } else {
@@ -232,6 +235,7 @@ pub(crate) fn merge_segments(
                     *node = SelectExpr::Array(ArraySelect::Slice {
                         start: *start,
                         end: *end,
+                        step: *step,
                         each: Box::new(each),
                     });
                     Ok(())
@@ -245,7 +249,8 @@ fn ensure_array_indices(node: &mut SelectExpr) -> Result<(), Error> {
     match node {
         SelectExpr::Array(ArraySelect::Indices(_))
         | SelectExpr::Array(ArraySelect::Each(_))
-        | SelectExpr::Array(ArraySelect::Slice { .. }) => Ok(()),
+        | SelectExpr::Array(ArraySelect::Slice { .. })
+        | SelectExpr::Array(ArraySelect::Filter { .. }) => Ok(()),
         SelectExpr::Identity | SelectExpr::Current => {
             *node = SelectExpr::Array(ArraySelect::Indices(Default::default()));
             Ok(())
@@ -267,8 +272,12 @@ fn ensure_array_indices(node: &mut SelectExpr) -> Result<(), Error> {
 fn ensure_array_each(node: &mut SelectExpr) -> Result<(), Error> {
     match node {
         SelectExpr::Array(ArraySelect::Each(_)) => Ok(()),
+        SelectExpr::Array(ArraySelect::Filter { each, .. }) => {
+            let e = each.clone();
+            *node = SelectExpr::Array(ArraySelect::Each(e));
+            Ok(())
+        }
         SelectExpr::Array(ArraySelect::Slice { each, .. }) => {
-            // promote slice to each (lose slice bounds) when mixing wildcards
             let e = each.clone();
             *node = SelectExpr::Array(ArraySelect::Each(e));
             Ok(())

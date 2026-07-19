@@ -2,7 +2,9 @@
 
 use crate::error::Error;
 use crate::project::plan::{MissingPolicy, ProjectPlan, ProjectStyle};
-use crate::project::select::{ArraySelect, HashField, ObjectSelect, SelectExpr};
+use crate::project::select::{
+    resolve_index, resolve_slice, ArraySelect, CmpOp, HashField, ObjectSelect, SelectExpr,
+};
 use crate::scan::{find_string_end, skip_value, skip_whitespace};
 
 pub(crate) struct EmitCtx<'a> {
@@ -55,10 +57,6 @@ pub(crate) fn emit_value(
             flatten_emit(&mid, ctx, out)
         }
         SelectExpr::Sub(left, right) => {
-            // Evaluate left as a descent that produces a sub-value, then right.
-            // For Object/Array left, emit left into mid then apply right... but left
-            // might be a subset object wrapping the target. Prefer: if left is a
-            // single-key object keep or index array, resolve child span and apply right.
             if let Some((s, e)) = resolve_focus(json, start, end, left)? {
                 emit_value(json, s, e, right, ctx, out)
             } else {
@@ -69,6 +67,147 @@ pub(crate) fn emit_value(
                 emit_value(&mid, m0, m1, right, ctx, out)
             }
         }
+        SelectExpr::Cmp { op, left, right } => {
+            let lv = eval_buf(json, start, end, left, ctx)?;
+            let rv = eval_buf(json, start, end, right, ctx)?;
+            let t = cmp_values(&lv, &rv, *op);
+            out.extend_from_slice(if t { b"true" } else { b"false" });
+            Ok(())
+        }
+        SelectExpr::And(a, b) => {
+            let av = eval_buf(json, start, end, a, ctx)?;
+            if !is_truthy(&av) {
+                out.extend_from_slice(b"false");
+                return Ok(());
+            }
+            emit_value(json, start, end, b, ctx, out)
+        }
+        SelectExpr::Or(a, b) => {
+            let av = eval_buf(json, start, end, a, ctx)?;
+            if is_truthy(&av) {
+                out.extend_from_slice(&av);
+                return Ok(());
+            }
+            emit_value(json, start, end, b, ctx, out)
+        }
+        SelectExpr::Not(inner) => {
+            let v = eval_buf(json, start, end, inner, ctx)?;
+            out.extend_from_slice(if is_truthy(&v) { b"false" } else { b"true" });
+            Ok(())
+        }
+        SelectExpr::Call { name, args } => emit_call(json, start, end, name, args, ctx, out),
+        SelectExpr::Paren(inner) => emit_value(json, start, end, inner, ctx, out),
+    }
+}
+
+fn eval_buf(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    expr: &SelectExpr,
+    ctx: &mut EmitCtx<'_>,
+) -> Result<Vec<u8>, Error> {
+    let mut v = Vec::new();
+    match emit_value(json, start, end, expr, ctx, &mut v) {
+        Ok(()) => Ok(v),
+        Err(Error::PathNotFound) if ctx.plan.missing == MissingPolicy::Skip => Ok(b"null".to_vec()),
+        Err(e) => Err(e),
+    }
+}
+
+/// JMESPath truthiness: false, null, empty string/array/object are falsey.
+pub(crate) fn is_truthy(v: &[u8]) -> bool {
+    let s = skip_whitespace(v, 0);
+    let e = match skip_value(v, s) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    let slice = &v[s..e];
+    match slice {
+        b"null" | b"false" => false,
+        b"true" => true,
+        b"\"\"" => false,
+        b"[]" | b"{}" => false,
+        x if x.starts_with(b"[") || x.starts_with(b"{") || x.starts_with(b"\"") => true,
+        x if x.first().is_some_and(|c| c.is_ascii_digit() || *c == b'-') => {
+            // numbers: 0 is truthy in JMESPath
+            true
+        }
+        _ => !slice.is_empty(),
+    }
+}
+
+fn cmp_values(left: &[u8], right: &[u8], op: CmpOp) -> bool {
+    let l = trim_json(left);
+    let r = trim_json(right);
+    // null equality
+    if l == b"null" || r == b"null" {
+        return match op {
+            CmpOp::Eq => l == r,
+            CmpOp::Ne => l != r,
+            _ => false,
+        };
+    }
+    // boolean
+    if (l == b"true" || l == b"false") && (r == b"true" || r == b"false") {
+        let lb = l == b"true";
+        let rb = r == b"true";
+        return match op {
+            CmpOp::Eq => lb == rb,
+            CmpOp::Ne => lb != rb,
+            _ => false,
+        };
+    }
+    // numbers
+    if let (Ok(ln), Ok(rn)) = (parse_f64(l), parse_f64(r)) {
+        return match op {
+            CmpOp::Eq => ln == rn,
+            CmpOp::Ne => ln != rn,
+            CmpOp::Lt => ln < rn,
+            CmpOp::Le => ln <= rn,
+            CmpOp::Gt => ln > rn,
+            CmpOp::Ge => ln >= rn,
+        };
+    }
+    // strings (JSON quoted)
+    if let (Some(ls), Some(rs)) = (json_string_content(l), json_string_content(r)) {
+        return match op {
+            CmpOp::Eq => ls == rs,
+            CmpOp::Ne => ls != rs,
+            CmpOp::Lt => ls < rs,
+            CmpOp::Le => ls <= rs,
+            CmpOp::Gt => ls > rs,
+            CmpOp::Ge => ls >= rs,
+        };
+    }
+    // raw byte equality fallback
+    match op {
+        CmpOp::Eq => l == r,
+        CmpOp::Ne => l != r,
+        _ => false,
+    }
+}
+
+fn trim_json(v: &[u8]) -> &[u8] {
+    let s = skip_whitespace(v, 0);
+    let e = skip_value(v, s).unwrap_or(v.len());
+    let mut end = e;
+    while end > s && matches!(v[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
+    }
+    &v[s..end]
+}
+
+fn parse_f64(v: &[u8]) -> Result<f64, ()> {
+    let s = std::str::from_utf8(v).map_err(|_| ())?;
+    s.parse().map_err(|_| ())
+}
+
+fn json_string_content(v: &[u8]) -> Option<&[u8]> {
+    if v.len() >= 2 && v[0] == b'"' && v[v.len() - 1] == b'"' {
+        Some(&v[1..v.len() - 1])
+    } else {
+        None
     }
 }
 
@@ -97,16 +236,17 @@ fn resolve_focus(
         SelectExpr::Array(ArraySelect::Indices(map)) if map.len() == 1 => {
             let (idx, child) = map.iter().next().unwrap();
             let elems = collect_array_elems(json, start, end)?;
-            let (s, e) = elems.get(*idx).copied().ok_or(Error::PathNotFound)?;
+            let i = resolve_index(*idx, elems.len()).ok_or(Error::PathNotFound)?;
+            let (s, e) = elems[i];
             if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
                 Ok(Some((s, e)))
             } else {
                 resolve_focus(json, s, e, child)
             }
         }
-        SelectExpr::Array(ArraySelect::Each(_)) | SelectExpr::Array(ArraySelect::Slice { .. }) => {
-            Ok(None)
-        }
+        SelectExpr::Array(ArraySelect::Each(_))
+        | SelectExpr::Array(ArraySelect::Slice { .. })
+        | SelectExpr::Array(ArraySelect::Filter { .. }) => Ok(None),
         SelectExpr::Sub(left, right) => {
             if let Some((s, e)) = resolve_focus(json, start, end, left)? {
                 resolve_focus(json, s, e, right)
@@ -397,19 +537,39 @@ fn emit_array(
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
     let elems = collect_array_elems(json, start, end)?;
-    let mut kept: Vec<(usize, usize, &SelectExpr)> = Vec::new();
+    let mut kept: Vec<(usize, usize, SelectExpr)> = Vec::new();
     match sel {
         ArraySelect::Each(child) => {
             for &(s, e) in &elems {
-                kept.push((s, e, child));
+                kept.push((s, e, (*child.as_ref()).clone()));
             }
         }
         ArraySelect::Indices(map) => {
-            let mut idxs: Vec<usize> = map.keys().copied().collect();
-            idxs.sort_unstable();
-            for i in idxs {
-                match elems.get(i) {
-                    Some(&(s, e)) => kept.push((s, e, map.get(&i).unwrap())),
+            let mut keys: Vec<i64> = map.keys().copied().collect();
+            keys.sort_unstable();
+            // JMESPath: a single index expression yields the element, not a 1-array.
+            if map.len() == 1 {
+                let k = keys[0];
+                match resolve_index(k, elems.len()) {
+                    Some(i) => {
+                        let (s, e) = elems[i];
+                        return emit_value(json, s, e, map.get(&k).unwrap(), ctx, out);
+                    }
+                    None if ctx.plan.missing == MissingPolicy::Error => {
+                        return Err(Error::PathNotFound);
+                    }
+                    None => {
+                        out.extend_from_slice(b"null");
+                        return Ok(());
+                    }
+                }
+            }
+            for k in keys {
+                match resolve_index(k, elems.len()) {
+                    Some(i) => {
+                        let (s, e) = elems[i];
+                        kept.push((s, e, map.get(&k).unwrap().clone()));
+                    }
                     None if ctx.plan.missing == MissingPolicy::Error => {
                         return Err(Error::PathNotFound);
                     }
@@ -420,12 +580,20 @@ fn emit_array(
         ArraySelect::Slice {
             start: st,
             end: en,
+            step,
             each,
         } => {
-            let hi = en.unwrap_or(elems.len()).min(elems.len());
-            let lo = (*st).min(hi);
-            for &(s, e) in &elems[lo..hi] {
-                kept.push((s, e, each));
+            for i in resolve_slice(elems.len(), *st, *en, *step) {
+                let (s, e) = elems[i];
+                kept.push((s, e, (*each.as_ref()).clone()));
+            }
+        }
+        ArraySelect::Filter { pred, each } => {
+            for &(s, e) in &elems {
+                let pv = eval_buf(json, s, e, pred, ctx)?;
+                if is_truthy(&pv) {
+                    kept.push((s, e, (*each.as_ref()).clone()));
+                }
             }
         }
     }
@@ -443,6 +611,360 @@ fn emit_array(
     emit_close_array(ctx, out);
     let _ = end;
     Ok(())
+}
+
+fn emit_call(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    name: &str,
+    args: &[SelectExpr],
+    ctx: &mut EmitCtx<'_>,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "length" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let n = length_of(&v)?;
+            out.extend_from_slice(n.to_string().as_bytes());
+            Ok(())
+        }
+        "keys" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            keys_of(&v, out)
+        }
+        "values" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            values_of(&v, out)
+        }
+        "type" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let t = type_name_json(&v);
+            write_json_string_out(out, t);
+            Ok(())
+        }
+        "to_string" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let t = trim_json(&v);
+            if t.starts_with(b"\"") {
+                out.extend_from_slice(t);
+            } else {
+                write_json_string_out(out, std::str::from_utf8(t).unwrap_or(""));
+            }
+            Ok(())
+        }
+        "to_number" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let t = trim_json(&v);
+            if let Some(s) = json_string_content(t) {
+                let s = std::str::from_utf8(s).unwrap_or("");
+                if s.parse::<f64>().is_ok() {
+                    out.extend_from_slice(s.as_bytes());
+                    return Ok(());
+                }
+            } else if parse_f64(t).is_ok() {
+                out.extend_from_slice(t);
+                return Ok(());
+            }
+            out.extend_from_slice(b"null");
+            Ok(())
+        }
+        "starts_with" | "ends_with" | "contains" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidPath {
+                    msg: "starts_with/ends_with/contains need 2 args",
+                });
+            }
+            let a = eval_buf(json, start, end, &args[0], ctx)?;
+            let b = eval_buf(json, start, end, &args[1], ctx)?;
+            let as_ = json_string_content(trim_json(&a)).unwrap_or(trim_json(&a));
+            let bs = json_string_content(trim_json(&b)).unwrap_or(trim_json(&b));
+            let ok = match name.as_str() {
+                "starts_with" => as_.starts_with(bs),
+                "ends_with" => as_.ends_with(bs),
+                _ => {
+                    // contains: string substring or array membership (byte equality)
+                    if trim_json(&a).starts_with(b"[") {
+                        array_contains(trim_json(&a), trim_json(&b))?
+                    } else {
+                        as_.windows(bs.len()).any(|w| w == bs)
+                    }
+                }
+            };
+            out.extend_from_slice(if ok { b"true" } else { b"false" });
+            Ok(())
+        }
+        "not_null" => {
+            for a in args {
+                let v = eval_buf(json, start, end, a, ctx)?;
+                if trim_json(&v) != b"null" {
+                    out.extend_from_slice(trim_json(&v));
+                    return Ok(());
+                }
+            }
+            out.extend_from_slice(b"null");
+            Ok(())
+        }
+        "reverse" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            reverse_array_or_string(&v, out)
+        }
+        "sort" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            sort_array(&v, out)
+        }
+        "join" => {
+            if args.len() < 2 {
+                return Err(Error::InvalidPath {
+                    msg: "join needs separator and array",
+                });
+            }
+            let sep_v = eval_buf(json, start, end, &args[0], ctx)?;
+            let arr_v = eval_buf(json, start, end, &args[1], ctx)?;
+            let sep = json_string_content(trim_json(&sep_v)).unwrap_or(b"");
+            join_array(trim_json(&arr_v), sep, out)
+        }
+        "max" | "min" | "sum" | "avg" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            numeric_reduce(trim_json(&v), name.as_str(), out)
+        }
+        "abs" | "ceil" | "floor" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let n = parse_f64(trim_json(&v)).map_err(|_| Error::TypeMismatch {
+                expected: "number",
+                found: "other",
+            })?;
+            let r = match name.as_str() {
+                "abs" => n.abs(),
+                "ceil" => n.ceil(),
+                _ => n.floor(),
+            };
+            out.extend_from_slice(format_number(r).as_bytes());
+            Ok(())
+        }
+        "to_array" => {
+            let arg = args.first().cloned().unwrap_or(SelectExpr::Current);
+            let v = eval_buf(json, start, end, &arg, ctx)?;
+            let t = trim_json(&v);
+            if t.starts_with(b"[") {
+                out.extend_from_slice(t);
+            } else {
+                out.push(b'[');
+                out.extend_from_slice(t);
+                out.push(b']');
+            }
+            Ok(())
+        }
+        "merge" => {
+            // shallow merge of objects
+            out.push(b'{');
+            let mut first = true;
+            for a in args {
+                let v = eval_buf(json, start, end, a, ctx)?;
+                let t = trim_json(&v);
+                if !t.starts_with(b"{") {
+                    continue;
+                }
+                let (_, members, _) = collect_object_members(t, 0, t.len())?;
+                for m in members {
+                    if !first {
+                        out.push(b',');
+                    }
+                    out.extend_from_slice(&t[m.key_span.0..m.key_span.1]);
+                    out.push(b':');
+                    out.extend_from_slice(&t[m.val_start..m.val_end]);
+                    first = false;
+                }
+            }
+            out.push(b'}');
+            Ok(())
+        }
+        _ => Err(Error::InvalidPath {
+            msg: "Unknown JMESPath function",
+        }),
+    }
+}
+
+fn write_json_string_out(out: &mut Vec<u8>, s: &str) {
+    out.push(b'"');
+    for b in s.bytes() {
+        match b {
+            b'"' | b'\\' => {
+                out.push(b'\\');
+                out.push(b);
+            }
+            c if c < 0x20 => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+            c => out.push(c),
+        }
+    }
+    out.push(b'"');
+}
+
+fn length_of(v: &[u8]) -> Result<usize, Error> {
+    let t = trim_json(v);
+    if t.starts_with(b"\"") {
+        return Ok(json_string_content(t).map(|s| s.len()).unwrap_or(0));
+    }
+    if t.starts_with(b"[") {
+        return Ok(collect_array_elems(t, 0, t.len())?.len());
+    }
+    if t.starts_with(b"{") {
+        return Ok(collect_object_members(t, 0, t.len())?.1.len());
+    }
+    Ok(0)
+}
+
+fn keys_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let t = trim_json(v);
+    let (_, members, _) = collect_object_members(t, 0, t.len())?;
+    out.push(b'[');
+    for (i, m) in members.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&t[m.key_span.0..m.key_span.1]);
+    }
+    out.push(b']');
+    Ok(())
+}
+
+fn values_of(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let t = trim_json(v);
+    let (_, members, _) = collect_object_members(t, 0, t.len())?;
+    out.push(b'[');
+    for (i, m) in members.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&t[m.val_start..m.val_end]);
+    }
+    out.push(b']');
+    Ok(())
+}
+
+fn type_name_json(v: &[u8]) -> &'static str {
+    let t = trim_json(v);
+    match t.first() {
+        Some(b'{') => "object",
+        Some(b'[') => "array",
+        Some(b'"') => "string",
+        Some(b't') | Some(b'f') => "boolean",
+        Some(b'n') => "null",
+        Some(b'-') | Some(b'0'..=b'9') => "number",
+        _ => "null",
+    }
+}
+
+fn array_contains(arr: &[u8], item: &[u8]) -> Result<bool, Error> {
+    let elems = collect_array_elems(arr, 0, arr.len())?;
+    Ok(elems
+        .iter()
+        .any(|&(s, e)| trim_json(&arr[s..e]) == item))
+}
+
+fn reverse_array_or_string(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let t = trim_json(v);
+    if t.starts_with(b"\"") {
+        let s = json_string_content(t).unwrap_or(b"");
+        let rev: Vec<u8> = s.iter().rev().copied().collect();
+        write_json_string_out(out, std::str::from_utf8(&rev).unwrap_or(""));
+        return Ok(());
+    }
+    let elems = collect_array_elems(t, 0, t.len())?;
+    out.push(b'[');
+    for (i, &(s, e)) in elems.iter().rev().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&t[s..e]);
+    }
+    out.push(b']');
+    Ok(())
+}
+
+
+fn sort_array(v: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let t = trim_json(v);
+    let elems = collect_array_elems(t, 0, t.len())?;
+    let mut pieces: Vec<&[u8]> = elems.iter().map(|&(s, e)| &t[s..e]).collect();
+    pieces.sort_by(|a, b| {
+        let ta = trim_json(a);
+        let tb = trim_json(b);
+        if let (Ok(na), Ok(nb)) = (parse_f64(ta), parse_f64(tb)) {
+            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+        } else {
+            ta.cmp(tb)
+        }
+    });
+    out.push(b'[');
+    for (i, p) in pieces.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(p);
+    }
+    out.push(b']');
+    Ok(())
+}
+
+fn join_array(arr: &[u8], sep: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let elems = collect_array_elems(arr, 0, arr.len())?;
+    let mut s = Vec::new();
+    for (i, &(a, b)) in elems.iter().enumerate() {
+        if i > 0 {
+            s.extend_from_slice(sep);
+        }
+        let el = trim_json(&arr[a..b]);
+        if let Some(c) = json_string_content(el) {
+            s.extend_from_slice(c);
+        } else {
+            s.extend_from_slice(el);
+        }
+    }
+    write_json_string_out(out, std::str::from_utf8(&s).unwrap_or(""));
+    Ok(())
+}
+
+fn numeric_reduce(arr: &[u8], which: &str, out: &mut Vec<u8>) -> Result<(), Error> {
+    let elems = collect_array_elems(arr, 0, arr.len())?;
+    let mut nums = Vec::new();
+    for &(s, e) in &elems {
+        if let Ok(n) = parse_f64(trim_json(&arr[s..e])) {
+            nums.push(n);
+        }
+    }
+    if nums.is_empty() {
+        out.extend_from_slice(b"null");
+        return Ok(());
+    }
+    let r = match which {
+        "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        "min" => nums.iter().cloned().fold(f64::INFINITY, f64::min),
+        "sum" => nums.iter().sum(),
+        "avg" => nums.iter().sum::<f64>() / nums.len() as f64,
+        _ => 0.0,
+    };
+    out.extend_from_slice(format_number(r).as_bytes());
+    Ok(())
+}
+
+fn format_number(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
 }
 
 fn emit_multi_hash(

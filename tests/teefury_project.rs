@@ -155,6 +155,29 @@ fn teefury_multipage_project_totals() {
 }
 
 #[test]
+fn teefury_jmespath_filter_available_variants() {
+    let Some(json) = load_page(1) else {
+        eprintln!("skip teefury filter: no fixture");
+        return;
+    };
+    // Products that have at least one available variant (Shopify shape).
+    let expr = "products[?variants[0].available == `true`].{id: id, title: title, price: variants[0].price}";
+    let out = project_jmespath(&json, expr).expect("filter project");
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let cards = v.as_array().expect("array");
+    eprintln!(
+        "teefury filter available: {} cards from page1 ({} bytes out)",
+        cards.len(),
+        out.len()
+    );
+    assert!(!cards.is_empty() || out == b"[]");
+    for c in cards {
+        assert!(c.get("id").is_some());
+        assert!(c.get("title").is_some());
+    }
+}
+
+#[test]
 fn teefury_pretty_style_still_parses() {
     let Some(json) = load_page(1) else {
         eprintln!("skip teefury_pretty: no fixture");

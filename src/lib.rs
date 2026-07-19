@@ -184,9 +184,9 @@ pub use mutate::{
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
     estimate_projected_len, estimate_values_len, parse_jmespath_expr, parse_project_path, project,
-    project_into, project_jmespath, project_paths, project_write, projected_len, ArraySelect,
-    HashField, MissingPolicy, ObjectSelect, ProjectPathSegment, ProjectPlan, ProjectStyle,
-    SelectExpr,
+    project_into, project_jmespath, project_paths, project_write, projected_len,
+    select_from_project_path, ArraySelect, CmpOp, HashField, MissingPolicy, ObjectSelect,
+    ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr,
 };
 pub use scan::find_value;
 pub use view::{read_view, write_view, JsonView};

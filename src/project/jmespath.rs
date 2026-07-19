@@ -1,20 +1,25 @@
-//! JMESPath **subset** parser → [`SelectExpr`].
+//! JMESPath parser → [`SelectExpr`].
 //!
-//! Supported (intentionally growing):
-//! * identifiers, `.` descent, `@` current
-//! * `[N]`, `[*]` / `[]` (wildcard list projection), `[start:end]` slices
-//! * multi-select hash `{k: expr, ...}` and list `[expr, ...]`
-//! * pipe `|`
-//! * flatten projection trailing `[]` after a pipe: `a[*].b | []`
-//! * literals: numbers, `"strings"`, `true` / `false` / `null`
+//! Supported surface (growing):
+//! * identifiers, `.` descent, `@` current, parentheses
+//! * `[N]` / `[-N]`, `[*]` / `[]`, slices `[start:end:step]` (signed)
+//! * filters `[?expr]` with `== != < <= > >=`, `&&`, `||`, `!`
+//! * multi-select hash / list, pipe `|`, flatten `| []`
+//! * functions: `length`, `keys`, `values`, `type`, `to_string`, `to_number`,
+//!   `starts_with`, `ends_with`, `contains`, `not_null`, `reverse`, `sort`,
+//!   `join`, `max`, `min`, `sum`, `avg`, `abs`, `ceil`, `floor`, `to_array`, `merge`
+//! * literals: numbers, `"…"` / `'…'` (raw), `` `…` `` (JSON literal), true/false/null
 //!
-//! Not yet: filters `[?...]`, functions, `||` / `&&`, raw string literals, slices
-//! with steps / negatives (partial), parent / root refs beyond `@`.
+//! Not yet: `sort_by` / `map` / `group_by` higher-order functions (full arity),
+//! parent-axis (JMESPath has no `..` parent; use pipe from outer context), unicode
+//! identifier edge cases.
 
 use crate::error::Error;
-use crate::project::select::{ArraySelect, HashField, ProjectPathSegment, SelectExpr};
+use crate::project::select::{
+    ArraySelect, CmpOp, HashField, ProjectPathSegment, SelectExpr,
+};
 
-/// Parse a JMESPath subset expression into a [`SelectExpr`].
+/// Parse a JMESPath expression into a [`SelectExpr`].
 pub fn parse_jmespath_expr(input: &str) -> Result<SelectExpr, Error> {
     let mut p = Parser::new(input);
     let expr = p.parse_pipe()?;
@@ -27,14 +32,12 @@ pub fn parse_jmespath_expr(input: &str) -> Result<SelectExpr, Error> {
     Ok(expr)
 }
 
-/// Build [`SelectExpr`] from a keep-list path (`products[].title`) via project path parse.
-#[allow(dead_code)] // public helper for tooling / future transforms
+/// Build [`SelectExpr`] from a keep-list path.
 pub fn select_from_project_path(path: &str) -> Result<SelectExpr, Error> {
-    let segs = parse_project_path(path)?;
-    segs_to_select(&segs)
+    segs_to_select(&parse_project_path(path)?)
 }
 
-/// Parse projection path segments including slices and wildcards.
+/// Parse projection path segments including signed slices and wildcards.
 pub fn parse_project_path(s: &str) -> Result<Vec<ProjectPathSegment>, Error> {
     let mut rest = s.trim();
     let mut segments = Vec::new();
@@ -55,31 +58,13 @@ pub fn parse_project_path(s: &str) -> Result<Vec<ProjectPathSegment>, Error> {
             let inner = rest[1..end_idx].trim();
             if inner.is_empty() || inner == "*" {
                 segments.push(ProjectPathSegment::ArrayWildcard);
-            } else if let Some((a, b)) = inner.split_once(':') {
-                let start = if a.trim().is_empty() {
-                    0usize
-                } else {
-                    a.trim().parse().map_err(|_| Error::InvalidPath {
-                        msg: "Invalid slice start",
-                    })?
-                };
-                let end = if b.trim().is_empty() {
-                    None
-                } else {
-                    Some(b.trim().parse().map_err(|_| Error::InvalidPath {
-                        msg: "Invalid slice end",
-                    })?)
-                };
-                segments.push(ProjectPathSegment::ArraySlice { start, end });
-            } else if inner.bytes().all(|b| b.is_ascii_digit()) {
-                let idx = inner.parse::<usize>().map_err(|_| Error::InvalidPath {
-                    msg: "Array index out of range",
+            } else if inner.contains(':') {
+                segments.push(parse_slice_inner(inner)?);
+            } else {
+                let idx = parse_signed(inner).map_err(|_| Error::InvalidPath {
+                    msg: "Invalid array index",
                 })?;
                 segments.push(ProjectPathSegment::Index(idx));
-            } else {
-                return Err(Error::InvalidPath {
-                    msg: "Invalid array selector (use [N], [], [*], or [start:end])",
-                });
             }
             rest = &rest[end_idx + 1..];
         } else {
@@ -95,6 +80,37 @@ pub fn parse_project_path(s: &str) -> Result<Vec<ProjectPathSegment>, Error> {
         }
     }
     Ok(segments)
+}
+
+fn parse_slice_inner(inner: &str) -> Result<ProjectPathSegment, Error> {
+    let parts: Vec<&str> = inner.split(':').collect();
+    if parts.len() > 3 {
+        return Err(Error::InvalidPath {
+            msg: "Slice has too many components",
+        });
+    }
+    let parse_opt = |s: &str| -> Result<Option<i64>, Error> {
+        let s = s.trim();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(parse_signed(s).map_err(|_| Error::InvalidPath {
+                msg: "Invalid slice bound",
+            })?))
+        }
+    };
+    let start = parse_opt(parts.first().copied().unwrap_or(""))?;
+    let end = parse_opt(parts.get(1).copied().unwrap_or(""))?;
+    let step = if parts.len() == 3 {
+        parse_opt(parts[2])?
+    } else {
+        None
+    };
+    Ok(ProjectPathSegment::ArraySlice { start, end, step })
+}
+
+fn parse_signed(s: &str) -> Result<i64, ()> {
+    s.trim().parse().map_err(|_| ())
 }
 
 fn segs_to_select(segs: &[ProjectPathSegment]) -> Result<SelectExpr, Error> {
@@ -119,11 +135,14 @@ fn segs_to_select(segs: &[ProjectPathSegment]) -> Result<SelectExpr, Error> {
             ProjectPathSegment::ArrayWildcard => {
                 SelectExpr::Array(ArraySelect::Each(Box::new(expr)))
             }
-            ProjectPathSegment::ArraySlice { start, end } => SelectExpr::Array(ArraySelect::Slice {
-                start: *start,
-                end: *end,
-                each: Box::new(expr),
-            }),
+            ProjectPathSegment::ArraySlice { start, end, step } => {
+                SelectExpr::Array(ArraySelect::Slice {
+                    start: *start,
+                    end: *end,
+                    step: *step,
+                    each: Box::new(expr),
+                })
+            }
         };
     }
     Ok(expr)
@@ -147,6 +166,10 @@ impl<'a> Parser<'a> {
         self.s[self.i..].chars().next()
     }
 
+    fn peek_str(&self) -> &str {
+        &self.s[self.i..]
+    }
+
     fn bump(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.i += c.len_utf8();
@@ -154,12 +177,8 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.bump();
-            } else {
-                break;
-            }
+        while self.peek().is_some_and(|c| c.is_whitespace()) {
+            self.bump();
         }
     }
 
@@ -173,14 +192,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn starts_with(&self, lit: &str) -> bool {
+        self.peek_str().starts_with(lit)
+    }
+
+    // pipe → or → and → not → cmp → project
     fn parse_pipe(&mut self) -> Result<SelectExpr, Error> {
-        let mut left = self.parse_project()?;
+        let mut left = self.parse_or()?;
         loop {
             self.skip_ws();
-            if self.peek() == Some('|') {
+            if self.peek() == Some('|') && !self.starts_with("||") {
                 self.bump();
                 self.skip_ws();
-                // flatten idiom: `| []`
                 if self.peek() == Some('[') {
                     let save = self.i;
                     self.bump();
@@ -192,7 +215,7 @@ impl<'a> Parser<'a> {
                     }
                     self.i = save;
                 }
-                let right = self.parse_project()?;
+                let right = self.parse_or()?;
                 left = SelectExpr::Pipe(Box::new(left), Box::new(right));
             } else {
                 break;
@@ -201,15 +224,90 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    fn parse_or(&mut self) -> Result<SelectExpr, Error> {
+        let mut left = self.parse_and()?;
+        loop {
+            self.skip_ws();
+            if self.starts_with("||") {
+                self.i += 2;
+                let right = self.parse_and()?;
+                left = SelectExpr::Or(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<SelectExpr, Error> {
+        let mut left = self.parse_not()?;
+        loop {
+            self.skip_ws();
+            if self.starts_with("&&") {
+                self.i += 2;
+                let right = self.parse_not()?;
+                left = SelectExpr::And(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<SelectExpr, Error> {
+        self.skip_ws();
+        if self.peek() == Some('!') && !self.starts_with("!=") {
+            self.bump();
+            let inner = self.parse_not()?;
+            return Ok(SelectExpr::Not(Box::new(inner)));
+        }
+        self.parse_compare()
+    }
+
+    fn parse_compare(&mut self) -> Result<SelectExpr, Error> {
+        let left = self.parse_project()?;
+        self.skip_ws();
+        let op = if self.starts_with("==") {
+            self.i += 2;
+            Some(CmpOp::Eq)
+        } else if self.starts_with("!=") {
+            self.i += 2;
+            Some(CmpOp::Ne)
+        } else if self.starts_with("<=") {
+            self.i += 2;
+            Some(CmpOp::Le)
+        } else if self.starts_with(">=") {
+            self.i += 2;
+            Some(CmpOp::Ge)
+        } else if self.peek() == Some('<') {
+            self.bump();
+            Some(CmpOp::Lt)
+        } else if self.peek() == Some('>') {
+            self.bump();
+            Some(CmpOp::Gt)
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            let right = self.parse_project()?;
+            Ok(SelectExpr::Cmp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else {
+            Ok(left)
+        }
+    }
+
     fn parse_project(&mut self) -> Result<SelectExpr, Error> {
         self.skip_ws();
-        // multi-select at start
         if self.peek() == Some('{') {
             return self.parse_multi_hash();
         }
+        // leading bracket: multi-list / index / filter / slice
         if self.peek() == Some('[') {
-            // could be multi-list, index, wildcard, slice, or literal-ish
-            return self.parse_bracket_or_list();
+            return self.parse_bracket_expr();
         }
         let mut expr = self.parse_atom()?;
         loop {
@@ -218,12 +316,43 @@ impl<'a> Parser<'a> {
                 Some('.') => {
                     self.bump();
                     self.skip_ws();
-                    let right = self.parse_atom_key_or_multi()?;
-                    expr = chain_sub(expr, right);
+                    if self.peek() == Some('{') {
+                        let right = self.parse_multi_hash()?;
+                        expr = chain_sub(expr, right);
+                    } else if self.peek() == Some('[') {
+                        let right = self.parse_bracket_expr()?;
+                        expr = chain_sub(expr, right);
+                    } else {
+                        let name = self.parse_ident()?;
+                        // function call after dot? rare. field.
+                        if self.peek() == Some('(') {
+                            // .func( not standard for JMESPath after field chain on left...
+                            // treat as Field then ignore - actually illegal; parse as call on current?
+                            let args = self.parse_arg_list()?;
+                            expr = chain_sub(
+                                expr,
+                                SelectExpr::Call {
+                                    name,
+                                    args,
+                                },
+                            );
+                        } else {
+                            expr = chain_sub(expr, SelectExpr::Field(name));
+                        }
+                    }
                 }
                 Some('[') => {
                     let bracket = self.parse_bracket_suffix()?;
                     expr = chain_sub(expr, bracket);
+                }
+                Some('(') => {
+                    // function call: name already consumed as Field
+                    if let SelectExpr::Field(name) = expr {
+                        let args = self.parse_arg_list()?;
+                        expr = SelectExpr::Call { name, args };
+                    } else {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -238,20 +367,33 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(SelectExpr::Current)
             }
-            Some('"') => self.parse_string_literal(),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number_literal(),
-            Some('{') => self.parse_multi_hash(),
-            Some('[') => self.parse_bracket_or_list(),
-            Some('t') | Some('f') | Some('n') => self.parse_keyword_literal(),
-            Some(c) if is_ident_start(c) => {
-                let name = self.parse_ident()?;
-                Ok(SelectExpr::Field(name))
-            }
             Some('(') => {
                 self.bump();
                 let e = self.parse_pipe()?;
                 self.eat(')')?;
-                Ok(e)
+                Ok(SelectExpr::Paren(Box::new(e)))
+            }
+            Some('"') => self.parse_dq_string_literal(),
+            Some('\'') => self.parse_raw_string_literal(),
+            Some('`') => self.parse_backtick_literal(),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number_literal(),
+            Some('{') => self.parse_multi_hash(),
+            Some('[') => self.parse_bracket_expr(),
+            Some(c) if is_ident_start(c) => {
+                let name = self.parse_ident()?;
+                self.skip_ws();
+                if self.peek() == Some('(') {
+                    let args = self.parse_arg_list()?;
+                    Ok(SelectExpr::Call { name, args })
+                } else if name == "true" {
+                    Ok(SelectExpr::Literal(b"true".to_vec()))
+                } else if name == "false" {
+                    Ok(SelectExpr::Literal(b"false".to_vec()))
+                } else if name == "null" {
+                    Ok(SelectExpr::Literal(b"null".to_vec()))
+                } else {
+                    Ok(SelectExpr::Field(name))
+                }
             }
             _ => Err(Error::InvalidPath {
                 msg: "Expected JMESPath atom",
@@ -259,16 +401,34 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_atom_key_or_multi(&mut self) -> Result<SelectExpr, Error> {
+    fn parse_arg_list(&mut self) -> Result<Vec<SelectExpr>, Error> {
+        self.eat('(')?;
+        let mut args = Vec::new();
         self.skip_ws();
-        if self.peek() == Some('{') {
-            return self.parse_multi_hash();
+        if self.peek() == Some(')') {
+            self.bump();
+            return Ok(args);
         }
-        if self.peek() == Some('[') {
-            return self.parse_bracket_or_list();
+        loop {
+            args.push(self.parse_pipe()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                    continue;
+                }
+                Some(')') => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    return Err(Error::InvalidPath {
+                        msg: "Expected ',' or ')' in function args",
+                    });
+                }
+            }
         }
-        let name = self.parse_ident()?;
-        Ok(SelectExpr::Field(name))
+        Ok(args)
     }
 
     fn parse_ident(&mut self) -> Result<String, Error> {
@@ -284,12 +444,8 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        while let Some(c) = self.peek() {
-            if is_ident_continue(c) {
-                self.bump();
-            } else {
-                break;
-            }
+        while self.peek().is_some_and(is_ident_continue) {
+            self.bump();
         }
         Ok(self.s[start..self.i].to_string())
     }
@@ -305,7 +461,9 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_ws();
             let key = if self.peek() == Some('"') {
-                self.parse_string_raw()?
+                self.parse_dq_string_raw()?
+            } else if self.peek() == Some('\'') {
+                self.parse_raw_string_raw()?
             } else {
                 self.parse_ident()?
             };
@@ -333,14 +491,32 @@ impl<'a> Parser<'a> {
         Ok(SelectExpr::MultiSelectHash(fields))
     }
 
-    fn parse_bracket_or_list(&mut self) -> Result<SelectExpr, Error> {
-        let save = self.i;
+    /// Bracket as a full expression (start of atom/project): list, index, filter, slice.
+    fn parse_bracket_expr(&mut self) -> Result<SelectExpr, Error> {
+        self.parse_bracket_common(true)
+    }
+
+    /// Bracket as a suffix after an expression.
+    fn parse_bracket_suffix(&mut self) -> Result<SelectExpr, Error> {
+        self.parse_bracket_common(false)
+    }
+
+    fn parse_bracket_common(&mut self, allow_multi_list: bool) -> Result<SelectExpr, Error> {
         self.eat('[')?;
         self.skip_ws();
+        // filter
+        if self.peek() == Some('?') {
+            self.bump();
+            let pred = self.parse_pipe()?;
+            self.eat(']')?;
+            return Ok(SelectExpr::Array(ArraySelect::Filter {
+                pred: Box::new(pred),
+                each: Box::new(SelectExpr::Identity),
+            }));
+        }
         // empty / wildcard
         if self.peek() == Some(']') {
             self.bump();
-            // bare `[]` as expression is flatten of current (rare); treat as identity array each
             return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
                 SelectExpr::Identity,
             ))));
@@ -352,58 +528,44 @@ impl<'a> Parser<'a> {
                 SelectExpr::Identity,
             ))));
         }
-        // slice or index or multi-list
-        if self.peek().is_some_and(|c| c == '-' || c.is_ascii_digit() || c == ':') {
-            // try number / slice
+        // peek if slice/index-only: number, colon, minus
+        let save = self.i;
+        if self.peek().is_some_and(|c| c == '-' || c == ':' || c.is_ascii_digit()) {
             let inner_start = self.i;
-            // read until ]
             while self.peek().is_some_and(|c| c != ']') {
                 self.bump();
             }
             let inner = self.s[inner_start..self.i].trim();
-            self.eat(']')?;
-            if let Some((a, b)) = inner.split_once(':') {
-                let start = if a.trim().is_empty() {
-                    0
-                } else {
-                    a.trim().parse().map_err(|_| Error::InvalidPath {
-                        msg: "Invalid slice start",
-                    })?
-                };
-                let end = if b.trim().is_empty() {
-                    None
-                } else {
-                    Some(b.trim().parse().map_err(|_| Error::InvalidPath {
-                        msg: "Invalid slice end",
-                    })?)
-                };
-                return Ok(SelectExpr::Array(ArraySelect::Slice {
-                    start,
-                    end,
-                    each: Box::new(SelectExpr::Identity),
-                }));
+            if self.peek() == Some(']') {
+                self.bump();
+                if inner.contains(':') {
+                    return match parse_slice_inner(inner)? {
+                        ProjectPathSegment::ArraySlice { start, end, step } => {
+                            Ok(SelectExpr::Array(ArraySelect::Slice {
+                                start,
+                                end,
+                                step,
+                                each: Box::new(SelectExpr::Identity),
+                            }))
+                        }
+                        _ => unreachable!(),
+                    };
+                }
+                if let Ok(idx) = parse_signed(inner) {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(idx, SelectExpr::Identity);
+                    return Ok(SelectExpr::Array(ArraySelect::Indices(map)));
+                }
             }
-            if inner.bytes().all(|b| b.is_ascii_digit()) {
-                let idx: usize = inner.parse().map_err(|_| Error::InvalidPath {
-                    msg: "Invalid index",
-                })?;
-                let mut map = std::collections::HashMap::new();
-                map.insert(idx, SelectExpr::Identity);
-                return Ok(SelectExpr::Array(ArraySelect::Indices(map)));
-            }
-            // fall through to multi-list — restore and reparse
             self.i = save;
-        } else {
-            self.i = save;
+        }
+        if !allow_multi_list {
+            return Err(Error::InvalidPath {
+                msg: "Invalid bracket suffix",
+            });
         }
         // multi-select list
-        self.eat('[')?;
         let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.bump();
-            return Ok(SelectExpr::MultiSelectList(items));
-        }
         loop {
             items.push(self.parse_pipe()?);
             self.skip_ws();
@@ -426,86 +588,12 @@ impl<'a> Parser<'a> {
         Ok(SelectExpr::MultiSelectList(items))
     }
 
-    fn parse_bracket_suffix(&mut self) -> Result<SelectExpr, Error> {
-        // Always a projection suffix: [n], [*], [], [a:b]
-        self.eat('[')?;
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.bump();
-            return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
-                SelectExpr::Identity,
-            ))));
-        }
-        if self.peek() == Some('*') {
-            self.bump();
-            self.eat(']')?;
-            return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
-                SelectExpr::Identity,
-            ))));
-        }
-        let inner_start = self.i;
-        while self.peek().is_some_and(|c| c != ']') {
-            self.bump();
-        }
-        let inner = self.s[inner_start..self.i].trim();
-        self.eat(']')?;
-        if let Some((a, b)) = inner.split_once(':') {
-            let start = if a.trim().is_empty() {
-                0
-            } else {
-                a.trim().parse().map_err(|_| Error::InvalidPath {
-                    msg: "Invalid slice start",
-                })?
-            };
-            let end = if b.trim().is_empty() {
-                None
-            } else {
-                Some(b.trim().parse().map_err(|_| Error::InvalidPath {
-                    msg: "Invalid slice end",
-                })?)
-            };
-            return Ok(SelectExpr::Array(ArraySelect::Slice {
-                start,
-                end,
-                each: Box::new(SelectExpr::Identity),
-            }));
-        }
-        if inner.bytes().all(|b| b.is_ascii_digit()) {
-            let idx: usize = inner.parse().map_err(|_| Error::InvalidPath {
-                msg: "Invalid index",
-            })?;
-            let mut map = std::collections::HashMap::new();
-            map.insert(idx, SelectExpr::Identity);
-            return Ok(SelectExpr::Array(ArraySelect::Indices(map)));
-        }
-        Err(Error::InvalidPath {
-            msg: "Invalid bracket suffix in JMESPath",
-        })
+    fn parse_dq_string_literal(&mut self) -> Result<SelectExpr, Error> {
+        let raw = self.parse_dq_string_raw()?;
+        Ok(SelectExpr::Literal(encode_json_string(&raw)))
     }
 
-    fn parse_string_literal(&mut self) -> Result<SelectExpr, Error> {
-        let raw = self.parse_string_raw()?;
-        // emit as JSON string
-        let mut bytes = Vec::with_capacity(raw.len() + 2);
-        bytes.push(b'"');
-        for b in raw.bytes() {
-            match b {
-                b'"' | b'\\' => {
-                    bytes.push(b'\\');
-                    bytes.push(b);
-                }
-                c if c < 0x20 => {
-                    // simple \u00XX
-                    bytes.extend_from_slice(format!("\\u{c:04x}").as_bytes());
-                }
-                c => bytes.push(c),
-            }
-        }
-        bytes.push(b'"');
-        Ok(SelectExpr::Literal(bytes))
-    }
-
-    fn parse_string_raw(&mut self) -> Result<String, Error> {
+    fn parse_dq_string_raw(&mut self) -> Result<String, Error> {
         self.eat('"')?;
         let mut out = String::new();
         while let Some(c) = self.bump() {
@@ -513,24 +601,60 @@ impl<'a> Parser<'a> {
                 '"' => return Ok(out),
                 '\\' => {
                     let e = self.bump().ok_or(Error::InvalidPath {
-                        msg: "Bad escape in string",
+                        msg: "Bad escape",
                     })?;
                     out.push(match e {
                         '"' | '\\' | '/' => e,
                         'n' => '\n',
                         't' => '\t',
                         'r' => '\r',
-                        'b' => '\u{0008}',
-                        'f' => '\u{000c}',
-                        _ => e,
+                        other => other,
                     });
                 }
                 c => out.push(c),
             }
         }
         Err(Error::InvalidPath {
-            msg: "Unclosed string in JMESPath",
+            msg: "Unclosed string",
         })
+    }
+
+    fn parse_raw_string_literal(&mut self) -> Result<SelectExpr, Error> {
+        let raw = self.parse_raw_string_raw()?;
+        Ok(SelectExpr::Literal(encode_json_string(&raw)))
+    }
+
+    fn parse_raw_string_raw(&mut self) -> Result<String, Error> {
+        self.eat('\'')?;
+        let mut out = String::new();
+        while let Some(c) = self.bump() {
+            if c == '\'' {
+                // '' escape
+                if self.peek() == Some('\'') {
+                    self.bump();
+                    out.push('\'');
+                } else {
+                    return Ok(out);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Err(Error::InvalidPath {
+            msg: "Unclosed raw string",
+        })
+    }
+
+    fn parse_backtick_literal(&mut self) -> Result<SelectExpr, Error> {
+        self.eat('`')?;
+        let start = self.i;
+        while self.peek().is_some_and(|c| c != '`') {
+            self.bump();
+        }
+        let inner = self.s[start..self.i].trim();
+        self.eat('`')?;
+        // interpret as JSON fragment
+        Ok(SelectExpr::Literal(inner.as_bytes().to_vec()))
     }
 
     fn parse_number_literal(&mut self) -> Result<SelectExpr, Error> {
@@ -556,25 +680,23 @@ impl<'a> Parser<'a> {
         }
         Ok(SelectExpr::Literal(lit))
     }
+}
 
-    fn parse_keyword_literal(&mut self) -> Result<SelectExpr, Error> {
-        self.skip_ws();
-        if self.s[self.i..].starts_with("true") {
-            self.i += 4;
-            return Ok(SelectExpr::Literal(b"true".to_vec()));
+fn encode_json_string(raw: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(raw.len() + 2);
+    bytes.push(b'"');
+    for b in raw.bytes() {
+        match b {
+            b'"' | b'\\' => {
+                bytes.push(b'\\');
+                bytes.push(b);
+            }
+            c if c < 0x20 => bytes.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+            c => bytes.push(c),
         }
-        if self.s[self.i..].starts_with("false") {
-            self.i += 5;
-            return Ok(SelectExpr::Literal(b"false".to_vec()));
-        }
-        if self.s[self.i..].starts_with("null") {
-            self.i += 4;
-            return Ok(SelectExpr::Literal(b"null".to_vec()));
-        }
-        // identifier starting with t/f/n
-        let name = self.parse_ident()?;
-        Ok(SelectExpr::Field(name))
     }
+    bytes.push(b'"');
+    bytes
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -585,30 +707,28 @@ fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Chain `prefix` then `suffix` as nested selection.
-///
-/// `products` is [`SelectExpr::Field`]; `products[*]` becomes Field then Each;
-/// `products[*].{…}` applies multi-hash per element.
 fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
     match prefix {
         SelectExpr::Field(name) => {
-            // Field then suffix: descend into field, then apply suffix (via Sub).
             SelectExpr::Sub(Box::new(SelectExpr::Field(name)), Box::new(suffix))
-        }
-        SelectExpr::Object(mut obj) if obj.len() == 1 => {
-            let key = obj.keys().next().unwrap().to_string();
-            let inner = obj.fields.remove(&key).unwrap_or(SelectExpr::Identity);
-            let child = chain_into(inner, suffix);
-            obj.insert(key, child);
-            SelectExpr::Object(obj)
         }
         SelectExpr::Array(ArraySelect::Each(inner)) => {
             SelectExpr::Array(ArraySelect::Each(Box::new(chain_into(*inner, suffix))))
         }
-        SelectExpr::Array(ArraySelect::Slice { start, end, each }) => {
-            SelectExpr::Array(ArraySelect::Slice {
-                start,
-                end,
+        SelectExpr::Array(ArraySelect::Slice {
+            start,
+            end,
+            step,
+            each,
+        }) => SelectExpr::Array(ArraySelect::Slice {
+            start,
+            end,
+            step,
+            each: Box::new(chain_into(*each, suffix)),
+        }),
+        SelectExpr::Array(ArraySelect::Filter { pred, each }) => {
+            SelectExpr::Array(ArraySelect::Filter {
+                pred,
                 each: Box::new(chain_into(*each, suffix)),
             })
         }
@@ -620,6 +740,7 @@ fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
         SelectExpr::Sub(left, right) => {
             SelectExpr::Sub(left, Box::new(chain_into(*right, suffix)))
         }
+        SelectExpr::Paren(inner) => chain_sub(*inner, suffix),
         other => SelectExpr::Sub(Box::new(other), Box::new(suffix)),
     }
 }

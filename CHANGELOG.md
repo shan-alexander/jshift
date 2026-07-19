@@ -10,11 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Field projection:** `project`, `project_paths`, `project_jmespath`, `project_into`,
   `project_write`, `ProjectPlan`, `SelectExpr` AST (`Field`, multi-select hash/list,
-  pipe, flatten, slices, literals), `parse_project_path` / `parse_jmespath_expr`,
-  styles (`Compact`, richer `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
+  pipe, flatten, slices, filters, comparisons, `&&`/`||`/`!`, functions, literals),
+  `parse_project_path` / `parse_jmespath_expr`, styles (`Compact`, richer
+  `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
   Derive / `JsonView`: `schema_project_plan`, `project_json` / `project_bytes`.
+- **JMESPath surface:** filters `[?…]`, signed indices/slices, functions
+  (`length`, `keys`, `values`, `type`, `to_string`, `to_number`, `starts_with`,
+  `ends_with`, `contains`, `not_null`, `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`,
+  `abs`/`ceil`/`floor`, `to_array`, `merge`), raw/` backtick literals, parentheses.
 - **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
   (gitignored fixtures under `benches/data/`; skips when absent).
+- **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).
 
 ## [0.4.0] - 2026-07-19
 

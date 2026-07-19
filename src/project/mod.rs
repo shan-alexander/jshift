@@ -18,10 +18,10 @@ mod jmespath;
 mod plan;
 mod select;
 
-pub use jmespath::{parse_jmespath_expr, parse_project_path};
+pub use jmespath::{parse_jmespath_expr, parse_project_path, select_from_project_path};
 pub use plan::{MissingPolicy, ProjectPlan, ProjectStyle};
 pub use select::{
-    ArraySelect, HashField, ObjectSelect, ProjectPathSegment, SelectExpr,
+    ArraySelect, CmpOp, HashField, ObjectSelect, ProjectPathSegment, SelectExpr,
 };
 
 use std::io::Write;
@@ -154,6 +154,45 @@ mod tests {
         let json = br#"{"a":[10,20,30,40]}"#;
         let out = project_jmespath(json, "a[1:3]").unwrap();
         assert_eq!(out, br#"[20,30]"#);
+    }
+
+    #[test]
+    fn project_jmespath_negative_index() {
+        let json = br#"{"a":[10,20,30]}"#;
+        assert_eq!(project_jmespath(json, "a[-1]").unwrap(), b"30");
+        assert_eq!(project_jmespath(json, "a[-2]").unwrap(), b"20");
+    }
+
+    #[test]
+    fn project_jmespath_filter() {
+        let json = br#"{"items":[{"n":1,"ok":true},{"n":2,"ok":false},{"n":3,"ok":true}]}"#;
+        let out = project_jmespath(json, "items[?ok == `true`].n").unwrap();
+        assert_eq!(out, br#"[1,3]"#);
+    }
+
+    #[test]
+    fn project_jmespath_functions() {
+        let json = br#"{"a":[3,1,2],"t":"Hello"}"#;
+        assert_eq!(project_jmespath(json, "length(a)").unwrap(), b"3");
+        assert_eq!(project_jmespath(json, "length(t)").unwrap(), b"5");
+        assert_eq!(project_jmespath(json, "sort(a)").unwrap(), br#"[1,2,3]"#);
+        assert_eq!(project_jmespath(json, "max(a)").unwrap(), b"3");
+        assert_eq!(
+            project_jmespath(json, "starts_with(t, 'He')").unwrap(),
+            b"true"
+        );
+        assert_eq!(project_jmespath(json, "type(a)").unwrap(), br#""array""#);
+    }
+
+    #[test]
+    fn project_jmespath_paren_and_or() {
+        let json = br#"{"x":1,"y":0}"#;
+        assert_eq!(
+            project_jmespath(json, "(x == `1`) && (y == `0`)").unwrap(),
+            b"true"
+        );
+        assert_eq!(project_jmespath(json, "x == `2` || y == `0`").unwrap(), b"true");
+        assert_eq!(project_jmespath(json, "!(x == `2`)").unwrap(), b"true");
     }
 
     #[test]
