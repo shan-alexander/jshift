@@ -139,42 +139,81 @@ fn bench_mutate(c: &mut Criterion) {
 }
 
 fn bench_concurrency(c: &mut Criterion) {
-    let json = generate_large_json_target_last();
     let path = jshift::parse_path("target");
-    let json_str = std::str::from_utf8(&json).unwrap();
 
-    let mut group = c.benchmark_group("JSON Concurrent Reads (10MB key-last)");
-    group.sample_size(10);
+    // --- key-last: each worker must skip the large array ---
+    {
+        let json = generate_large_json_target_last();
+        let json_str = std::str::from_utf8(&json).unwrap();
+        let mut group = c.benchmark_group("JSON Concurrent Reads (10MB key-last)");
+        group.sample_size(10);
 
-    // Same model for all: 8 independent workers each extract `target` from the
-    // shared buffer (no shared parse tree). serde therefore re-parses 8×.
-    group.bench_function("jshift_x8", |b| {
-        b.iter(|| {
-            (0..8).into_par_iter().for_each(|_| {
-                let res = jshift::find_value(&json, &path).unwrap();
-                assert_eq!(res, b"123456");
-            });
-        })
-    });
+        // Same model for all: 8 independent workers each extract `target` from the
+        // shared buffer (no shared parse tree). serde therefore re-parses 8×.
+        group.bench_function("jshift_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    let res = jshift::find_value(&json, &path).unwrap();
+                    assert_eq!(res, b"123456");
+                });
+            })
+        });
 
-    group.bench_function("gjson_x8", |b| {
-        b.iter(|| {
-            (0..8).into_par_iter().for_each(|_| {
-                assert_eq!(gjson::get(json_str, "target").u64(), 123456);
-            });
-        })
-    });
+        group.bench_function("gjson_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    assert_eq!(gjson::get(json_str, "target").u64(), 123456);
+                });
+            })
+        });
 
-    group.bench_function("serde_json_x8", |b| {
-        b.iter(|| {
-            (0..8).into_par_iter().for_each(|_| {
-                let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
-                assert_eq!(val["target"].as_u64().unwrap(), 123456);
-            });
-        })
-    });
+        group.bench_function("serde_json_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                    assert_eq!(val["target"].as_u64().unwrap(), 123456);
+                });
+            })
+        });
 
-    group.finish();
+        group.finish();
+    }
+
+    // --- key-first: early exit; path engines stay in the ns–µs regime ---
+    {
+        let json = generate_large_json_target_first();
+        let json_str = std::str::from_utf8(&json).unwrap();
+        let mut group = c.benchmark_group("JSON Concurrent Reads (10MB key-first)");
+        group.sample_size(20);
+
+        group.bench_function("jshift_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    let res = jshift::find_value(&json, &path).unwrap();
+                    assert_eq!(res, b"123456");
+                });
+            })
+        });
+
+        group.bench_function("gjson_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    assert_eq!(gjson::get(json_str, "target").u64(), 123456);
+                });
+            })
+        });
+
+        group.bench_function("serde_json_x8", |b| {
+            b.iter(|| {
+                (0..8).into_par_iter().for_each(|_| {
+                    let val: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                    assert_eq!(val["target"].as_u64().unwrap(), 123456);
+                });
+            })
+        });
+
+        group.finish();
+    }
 }
 
 // --- fairer groups ----------------------------------------------------------
