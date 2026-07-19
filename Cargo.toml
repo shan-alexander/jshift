@@ -22,6 +22,8 @@ jshift-derive = { version = "0.2.1", path = "./jshift-derive" }
 serde_json = "1.0"
 criterion = "0.5"
 rayon = "1.8"
+gjson = "0.8"
+sonic-rs = "0.5"
 
 [[bench]]
 name = "json_benchmark"
