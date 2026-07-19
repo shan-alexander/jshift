@@ -48,12 +48,11 @@ pub fn parse_path(mut s: &str) -> Vec<PathSegment<'_>> {
                 Some(end_idx) => {
                     let idx_str = &s[1..end_idx];
                     // Accept only non-empty ASCII digit runs so we never emit a segment for
-                    // `[foo]`, `[]`, or `[1x]` (the latter fails `parse` after the digit check).
-                    if !idx_str.is_empty()
-                        && idx_str.bytes().all(|b| b.is_ascii_digit())
-                        && let Ok(idx) = idx_str.parse::<usize>()
-                    {
-                        segments.push(PathSegment::Index(idx));
+                    // `[foo]`, `[]`, or `[1x]`.
+                    if !idx_str.is_empty() && idx_str.bytes().all(|b| b.is_ascii_digit()) {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            segments.push(PathSegment::Index(idx));
+                        }
                     }
                     s = &s[end_idx + 1..];
                 }
