@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Option<T>` for `FromJsonSlice` / `ToJsonBytes` (`null` ↔ `None`); derive maps
   missing paths to `None` for `Option` fields.
 - Derive emits `'static` path segment constants (no `parse_path` on every `set_*` / read).
+- Fair criterion groups: key-first 10MB + ~1KB hot path vs **gjson** / **sonic-rs** /
+  serde_json (legacy key-last 10MB groups retained).
+
+### Changed
+- `delete_key` / `delete_index` pretty-delete: expand the removed span over adjacent
+  whitespace so empties become `{}` / `[]` and first-member deletes do not leave a
+  leading space after `{` / `[`.
 
 ## [0.2.0] - 2026-07-19
 
