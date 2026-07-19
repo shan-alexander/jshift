@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-07-19
+## [0.2.0] - 2026-07-19
+
+Minor bump under Cargo’s `0.y` rules: several **behavior and type** changes vs `0.1.0`
+are intentionally not patch-compatible.
+
+### Breaking
+- New `Error::InvalidPath` variant; `Error` is now `#[non_exhaustive]` (exhaustive
+  `match`es on `Error` need a wildcard arm).
+- `String::from_json_slice` **unescapes** JSON string literals (was raw content between
+  quotes, including escape backslashes).
+- `upsert_object_key` / `delete_key` take **logical** keys and match the escaped on-wire
+  form (callers that passed already-escaped key strings must pass the logical form).
+- `parse_path` edge cases tightened (empty keys skipped, unclosed `[` stops, non-numeric
+  indexes dropped); prefer `try_parse_path` when invalid paths must error.
 
 ### Added
 - `try_parse_path` — strict path parser (`Error::InvalidPath` on bad brackets/indexes).
@@ -22,15 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Document `rust-version = "1.85"` (edition 2024 floor).
 
 ### Changed
-- Split the monolithic `src/lib.rs` into focused modules without changing the public API:
-  `error`, `path`, `scan`, `mutate`, and `convert` (re-exported from `lib.rs`).
-- `parse_path` skips empty key segments, stops on unclosed `[`, and ignores non-numeric
-  bracket contents instead of emitting confusing partial segments (lenient);
-  use `try_parse_path` when failures must be reported.
-- `upsert_object_key` and `delete_key` treat the key argument as a **logical** key and
-  match the escaped on-wire form, so keys containing `"`, `\`, or control characters
-  update/delete correctly instead of duplicating or reverse-scan-failing.
-- `String::from_json_slice` unescapes JSON string literals (`\"`, `\\`, `\n`, `\uXXXX`, …).
+- Split the monolithic `src/lib.rs` into focused modules without changing the public API
+  surface of re-exports: `error`, `path`, `scan`, `mutate`, and `convert`.
 - `mutate_value` docs state the raw splice contract (no value validation).
 - `FromJsonSlice for String` docs clarify unescaping of quoted literals.
 - `JsonMutatorSchema` derive emits `syn::Error` / `compile_error!` for bad shapes and
@@ -51,6 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/shan-alexander/jshift/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/shan-alexander/jshift/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/shan-alexander/jshift/releases/tag/v0.1.0

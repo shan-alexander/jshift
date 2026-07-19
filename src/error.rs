@@ -1,4 +1,8 @@
 /// Errors returned by scanning and mutating operations.
+///
+/// Marked `#[non_exhaustive]` so new variants can be added in minor releases
+/// without breaking downstream `match` expressions (use a wildcard arm).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// The specified JSON path was not found in the document.
