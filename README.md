@@ -239,7 +239,8 @@ These numbers are not a claim that jshift is always fastest for every JSON task.
 
 Linear path scans must `skip_value` every sibling before `products[12500]`. That is correct and fine for streaming “touch once” work; it is wrong for **random / multi-query** access into huge arrays.
 
-**jshift 0.3** adds a **safe** array side-table (not a full simdjson DOM):
+**jshift 0.3+** adds **safe** structural indexing (not a full simdjson DOM): array
+side-tables, optional Stage-1 structural lists, object key maps, and derive auto-index:
 
 ```rust
 use jshift::{IndexedDocument, parse_path};
@@ -265,7 +266,15 @@ doc.for_each_element(&parse_path("products"), |i, elem| {
 
 Indexes bind to a fixed byte snapshot. After in-place mutate/delete, **rebuild** (or drop) the index. Best ETL pattern: **index → many reads / project → write a new buffer → optional reindex**.
 
-This stays `forbid(unsafe_code)`: `Vec<u32>` offsets + existing safe cursors. Full Stage-1 SIMD bitmaps can layer later; array side-tables already rewrite the mid/last-element story.
+This stays `forbid(unsafe_code)`: `Vec<u32>` offsets, `HashMap` key tables, Stage-1
+structural lists, and existing safe cursors.
+
+| Layer | API | Helps |
+| :--- | :--- | :--- |
+| Array side-table | `index_array` / `build` | `products[i].field` mid/last access |
+| Object key map | `index_object` | wide roots / hot config objects |
+| Stage-1 structurals | `index_structural` | faster container skip while building tables |
+| Derive | `indexed_document` / `read_from_json_indexed` | auto-index array prefixes from schema paths |
 
 ```bash
 cargo bench --bench json_benchmark -- "Indexed array"

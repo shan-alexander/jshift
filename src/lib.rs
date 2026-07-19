@@ -76,7 +76,10 @@ pub use convert::{
     write_json_string_content, FromJsonSlice, ToJsonBytes,
 };
 pub use error::Error;
-pub use index::{build_array_index, ArrayIndex, IndexedDocument};
+pub use index::{
+    build_array_index, build_object_key_index, build_structural_index, static_array_prefixes_from_path,
+    ArrayIndex, IndexedDocument, ObjectKeyIndex, StructuralIndex,
+};
 pub use jshift_derive::JsonMutatorSchema;
 pub use mutate::{
     append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,
@@ -736,6 +739,10 @@ mod tests {
         assert_eq!(n.first_tag, "a");
         Nested::mutator(&mut json).set_ver(&2).unwrap();
         assert_eq!(find_value(&json, &parse_path("meta.ver")).unwrap(), b"2");
+        // Auto-index inferred from tags[0]
+        assert!(Nested::INDEXED_ARRAY_PATHS.contains(&"tags"));
+        let n2 = Nested::read_from_json_indexed(&json).unwrap();
+        assert_eq!(n2.first_tag, "a");
     }
 
     #[test]

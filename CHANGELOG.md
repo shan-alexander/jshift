@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-19
+
+### Added
+- **Stage-1 structural index** ([`StructuralIndex`] / `build_structural_index`): safe list of
+  `{ } [ ] : ,` outside strings; container skip via structural walk; optional on
+  [`IndexedDocument`] (`index_structural`, `build_structural`, `build_full`).
+- **Object key maps** ([`ObjectKeyIndex`]): `index_object` / `index_object_str` for O(1)
+  key → value span on wide/hot objects.
+- **Derive auto-index:** `INDEXED_ARRAY_PATHS`, `indexed_document()`,
+  `read_from_json_indexed()` — infers static array prefixes (`products[0].x` → `products`).
+- `static_array_prefixes_from_path` helper for tooling.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added
@@ -106,7 +118,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/shan-alexander/jshift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/shan-alexander/jshift/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/shan-alexander/jshift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/shan-alexander/jshift/compare/v0.2.0...v0.2.1

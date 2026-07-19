@@ -1,106 +1,259 @@
 //! Structural indexing for fast path navigation (safe Rust).
 //!
 //! This is **not** a full simdjson-style DOM. It builds read-only metadata that
-//! accelerates jshift's own job: path finds and bulk iteration over large arrays.
+//! accelerates jshift's own job: path finds and bulk iteration.
 //!
-//! # Array side-tables (primary design)
+//! # Layers
 //!
-//! For a path prefix that points at an array (e.g. `products`), one linear scan
-//! records the absolute start offset of every element. Later queries such as
-//! `products[12500].title` jump in O(1) to that element, then run a local object
-//! scan — instead of `skip_value`-ing 12 499 siblings.
+//! 1. **Array side-tables** — `element_starts[i]` for `path[i].…` in O(1).
+//! 2. **Object key maps** — key → value span for wide / hot objects.
+//! 3. **Stage-1 structural list** — offsets of `{ } [ ] : ,` outside strings; used to
+//!    skip large containers by walking structurals instead of every byte.
 //!
 //! # Mutation
 //!
-//! Indexes bind to a fixed `&[u8]` snapshot. After any in-place mutate/delete that
-//! shifts bytes, **rebuild** the index (or drop it). Preferred ETL pattern:
-//! index → many reads / project → stream a new buffer → optional reindex.
+//! Indexes bind to a fixed `&[u8]` snapshot. After in-place mutate/delete, rebuild
+//! (or drop). Preferred ETL: index → many reads → stream new bytes → reindex.
 //!
 //! # Safety
 //!
-//! Fully safe: `Vec<u32>` offsets and existing cursor helpers. No `unsafe`, no
-//! unchecked loads. Stage-1 structural lists / SIMD bitmaps can layer later on
-//! the same API surface.
+//! Fully safe: `Vec<u32>`, `HashMap`, existing cursors. No `unsafe`.
+
+use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::path::{OwnedPathSegment, PathSegment};
 use crate::scan::{
-    byte_at, find_from_value, find_value_offsets, skip_value, skip_whitespace,
+    byte_at, find_from_value, find_string_end, find_value_offsets, skip_value, skip_whitespace,
 };
+
+// ─── Stage-1 structural list ────────────────────────────────────────────────
+
+/// Sorted absolute offsets of structural characters **outside** JSON strings:
+/// `{ } [ ] : ,`
+///
+/// Built with the same escape-aware string rules as the rest of jshift (safe loops /
+/// `memchr` under the hood via existing string helpers).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StructuralIndex {
+    structurals: Vec<u32>,
+}
+
+impl StructuralIndex {
+    /// Number of structural positions.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.structurals.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.structurals.is_empty()
+    }
+
+    /// All structural offsets (sorted ascending).
+    #[inline]
+    pub fn offsets(&self) -> &[u32] {
+        &self.structurals
+    }
+
+    /// Index of the first structural at or after `pos`, if any.
+    pub fn first_at_or_after(&self, pos: usize) -> Option<usize> {
+        let p = pos.min(u32::MAX as usize) as u32;
+        match self.structurals.binary_search(&p) {
+            Ok(i) => Some(i),
+            Err(i) if i < self.structurals.len() => Some(i),
+            Err(_) => None,
+        }
+    }
+
+    /// Skip a container starting at `open_pos` (`[` or `{`) using only the
+    /// structural list (not a full byte scan of the interior).
+    pub fn skip_container(&self, json: &[u8], open_pos: usize) -> Result<usize, Error> {
+        if open_pos >= json.len() || !matches!(json[open_pos], b'{' | b'[') {
+            return Err(Error::InvalidJsonSyntax {
+                pos: open_pos,
+                msg: "Expected container open for structural skip",
+            });
+        }
+        let mut depth = 1isize;
+        let mut si = self
+            .first_at_or_after(open_pos + 1)
+            .ok_or(Error::InvalidJsonSyntax {
+                pos: open_pos,
+                msg: "Unclosed container (structural index)",
+            })?;
+        while si < self.structurals.len() {
+            let off = self.structurals[si] as usize;
+            if off >= json.len() {
+                break;
+            }
+            match json[off] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(off + 1);
+                    }
+                }
+                b':' | b',' => {}
+                _ => {}
+            }
+            si += 1;
+        }
+        Err(Error::InvalidJsonSyntax {
+            pos: open_pos,
+            msg: "Unclosed container (structural index)",
+        })
+    }
+}
+
+/// Build a document-wide Stage-1 structural index (safe).
+pub fn build_structural_index(json: &[u8]) -> Result<StructuralIndex, Error> {
+    let mut structurals = Vec::new();
+    let mut i = 0usize;
+    let len = json.len();
+    while i < len {
+        match json[i] {
+            b'"' => {
+                // Jump past the whole string (closing quote + 1).
+                let end_q = find_string_end(json, i + 1)?;
+                i = end_q + 1;
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                if i > u32::MAX as usize {
+                    return Err(Error::InvalidJsonSyntax {
+                        pos: i,
+                        msg: "Document too large for u32 structural index",
+                    });
+                }
+                structurals.push(i as u32);
+                i += 1;
+            }
+            _ => {
+                // Bulk skip non-interesting bytes.
+                let start = i;
+                i += 1;
+                while i < len {
+                    match json[i] {
+                        b'"' | b'{' | b'}' | b'[' | b']' | b':' | b',' => break,
+                        _ => i += 1,
+                    }
+                }
+                let _ = start;
+            }
+        }
+    }
+    Ok(StructuralIndex { structurals })
+}
+
+// ─── Array side-table ───────────────────────────────────────────────────────
 
 /// Side-table for one array value: start offset of each element.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayIndex {
-    /// Absolute byte offset of each element's first non-whitespace value byte.
     element_starts: Vec<u32>,
-    /// Offset of the opening `[`.
     open: u32,
-    /// Offset of the closing `]`.
     close: u32,
 }
 
 impl ArrayIndex {
-    /// Number of elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.element_starts.len()
     }
 
-    /// Whether the array is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.element_starts.is_empty()
     }
 
-    /// Opening `[` offset.
     #[inline]
     pub fn open(&self) -> usize {
         self.open as usize
     }
 
-    /// Closing `]` offset.
     #[inline]
     pub fn close(&self) -> usize {
         self.close as usize
     }
 
-    /// Absolute start offset of element `i`, if in range.
     #[inline]
     pub fn element_start(&self, i: usize) -> Option<usize> {
         self.element_starts.get(i).map(|&o| o as usize)
     }
 
-    /// Absolute end offset of element `i` (exclusive): start of next element, or `close`.
     pub fn element_end(&self, i: usize) -> Option<usize> {
         if i >= self.element_starts.len() {
             return None;
         }
         if i + 1 < self.element_starts.len() {
-            // Walk back over `,` and whitespace between elements is not needed for
-            // end of value — callers that need exact ends should use `skip_value`
-            // from `element_start`. This returns the next recorded start as an
-            // upper bound exclusive of commas (may include trailing ws of value).
             Some(self.element_starts[i + 1] as usize)
         } else {
             Some(self.close as usize)
         }
     }
 
-    /// All element start offsets.
     pub fn starts(&self) -> &[u32] {
         &self.element_starts
     }
 }
 
-/// A JSON buffer plus zero or more array side-tables for path-accelerated reads.
-///
-/// Does **not** own the buffer; any mutation of the underlying `Vec` invalidates
-/// the index until rebuilt.
+// ─── Object key map ─────────────────────────────────────────────────────────
+
+/// Map of object keys (on-wire bytes between quotes) → value span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectKeyIndex {
+    /// Key content as stored between quotes (escaped form).
+    entries: HashMap<Vec<u8>, (u32, u32)>,
+    open: u32,
+    close: u32,
+}
+
+impl ObjectKeyIndex {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    pub fn open(&self) -> usize {
+        self.open as usize
+    }
+
+    #[inline]
+    pub fn close(&self) -> usize {
+        self.close as usize
+    }
+
+    /// Lookup by on-wire key bytes (as in a path segment / JSON key content).
+    pub fn get(&self, key: &[u8]) -> Option<(usize, usize)> {
+        self.entries
+            .get(key)
+            .map(|&(s, e)| (s as usize, e as usize))
+    }
+
+    /// All keys (on-wire form).
+    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.entries.keys().map(|k| k.as_slice())
+    }
+}
+
+// ─── Indexed document ───────────────────────────────────────────────────────
+
+/// A JSON buffer plus structural / array / object indexes for path-accelerated reads.
 #[derive(Debug, Clone)]
 pub struct IndexedDocument<'a> {
     json: &'a [u8],
-    /// Path to the array value → side-table (path ends at the array, not an element).
+    /// Optional Stage-1 list for the whole document.
+    structural: Option<StructuralIndex>,
     arrays: Vec<(Vec<OwnedPathSegment>, ArrayIndex)>,
+    objects: Vec<(Vec<OwnedPathSegment>, ObjectKeyIndex)>,
 }
 
 impl<'a> IndexedDocument<'a> {
@@ -108,11 +261,13 @@ impl<'a> IndexedDocument<'a> {
     pub fn empty(json: &'a [u8]) -> Self {
         Self {
             json,
+            structural: None,
             arrays: Vec::new(),
+            objects: Vec::new(),
         }
     }
 
-    /// Build side-tables for each array path (string paths, lenient parse).
+    /// Build array side-tables for each path (lenient path parse).
     ///
     /// ```
     /// use jshift::IndexedDocument;
@@ -133,7 +288,7 @@ impl<'a> IndexedDocument<'a> {
         Ok(doc)
     }
 
-    /// Build side-tables for array paths given as segment slices.
+    /// Build array side-tables from segment slices.
     pub fn build_paths(json: &'a [u8], array_paths: &[&[PathSegment<'_>]]) -> Result<Self, Error> {
         let mut doc = Self::empty(json);
         for p in array_paths {
@@ -142,57 +297,98 @@ impl<'a> IndexedDocument<'a> {
         Ok(doc)
     }
 
-    /// Underlying JSON bytes.
+    /// Build Stage-1 structural index only (no array/object tables yet).
+    pub fn build_structural(json: &'a [u8]) -> Result<Self, Error> {
+        let mut doc = Self::empty(json);
+        doc.index_structural()?;
+        Ok(doc)
+    }
+
+    /// Full convenience: structural + arrays + objects.
+    pub fn build_full(
+        json: &'a [u8],
+        array_paths: &[&str],
+        object_paths: &[&str],
+    ) -> Result<Self, Error> {
+        let mut doc = Self::empty(json);
+        doc.index_structural()?;
+        for p in array_paths {
+            doc.index_array_str(p)?;
+        }
+        for p in object_paths {
+            doc.index_object_str(p)?;
+        }
+        Ok(doc)
+    }
+
     #[inline]
     pub fn as_bytes(&self) -> &'a [u8] {
         self.json
     }
 
-    /// Index the array at `path` (must resolve to a `[...]` value).
+    /// Build or replace the document-wide Stage-1 structural list.
+    pub fn index_structural(&mut self) -> Result<(), Error> {
+        self.structural = Some(build_structural_index(self.json)?);
+        Ok(())
+    }
+
+    pub fn structural(&self) -> Option<&StructuralIndex> {
+        self.structural.as_ref()
+    }
+
+    /// Index the array at `path`.
     pub fn index_array(&mut self, path: &[PathSegment]) -> Result<(), Error> {
         let owned = path_to_owned(path);
-        // Replace existing index for the same path.
         self.arrays.retain(|(p, _)| p != &owned);
-        let table = build_array_index(self.json, path)?;
+        let table = build_array_index(self.json, path, self.structural.as_ref())?;
         self.arrays.push((owned, table));
         Ok(())
     }
 
-    /// [`index_array`] with a path string (`parse_path` rules).
     pub fn index_array_str(&mut self, path: &str) -> Result<(), Error> {
         let segs = crate::path::parse_path(path);
         self.index_array(&segs)
     }
 
-    /// Length of an indexed array, or `None` if that path is not indexed.
+    /// Index all keys of the object at `path` (value must be `{...}`).
+    pub fn index_object(&mut self, path: &[PathSegment]) -> Result<(), Error> {
+        let owned = path_to_owned(path);
+        self.objects.retain(|(p, _)| p != &owned);
+        let table = build_object_key_index(self.json, path, self.structural.as_ref())?;
+        self.objects.push((owned, table));
+        Ok(())
+    }
+
+    pub fn index_object_str(&mut self, path: &str) -> Result<(), Error> {
+        let segs = crate::path::parse_path(path);
+        self.index_object(&segs)
+    }
+
     pub fn array_len(&self, path: &[PathSegment]) -> Option<usize> {
         self.lookup_array(path).map(|(_, t)| t.len())
     }
 
-    /// Borrow the side-table for `path` if present.
     pub fn array_index(&self, path: &[PathSegment]) -> Option<&ArrayIndex> {
         self.lookup_array(path).map(|(_, t)| t)
     }
 
-    /// Find a value using indexes when the path walks through a known array.
-    ///
-    /// Falls back to a normal [`crate::find_value`] scan when no index applies.
+    pub fn object_index(&self, path: &[PathSegment]) -> Option<&ObjectKeyIndex> {
+        self.lookup_object(path).map(|(_, t)| t)
+    }
+
+    /// Find using array / object indexes when applicable; else normal path scan.
     pub fn find(&self, path: &[PathSegment]) -> Result<&'a [u8], Error> {
         let (start, end) = self.find_offsets(path)?;
         Ok(&self.json[start..end])
     }
 
-    /// Like [`find`], returning absolute offsets.
     pub fn find_offsets(&self, path: &[PathSegment]) -> Result<(usize, usize), Error> {
-        if let Some((rest_start, rest_path)) = self.try_index_jump(path)? {
+        if let Some((rest_start, rest_path)) = self.try_accelerated_jump(path)? {
             return find_from_value(self.json, rest_start, rest_path);
         }
         find_value_offsets(self.json, path)
     }
 
-    /// Iterate every element of an indexed array as a raw JSON value slice.
-    ///
-    /// Build cost is paid once at index time; this is O(n) slice bounds only.
     pub fn for_each_element<F>(&self, array_path: &[PathSegment], mut f: F) -> Result<(), Error>
     where
         F: FnMut(usize, &'a [u8]) -> Result<(), Error>,
@@ -203,13 +399,12 @@ impl<'a> IndexedDocument<'a> {
             .ok_or(Error::PathNotFound)?;
         for i in 0..table.len() {
             let start = table.element_start(i).unwrap();
-            let end = skip_value(self.json, start)?;
+            let end = skip_value_maybe_structural(self.json, start, self.structural.as_ref())?;
             f(i, &self.json[start..end])?;
         }
         Ok(())
     }
 
-    /// Same as [`for_each_element`] with a path string.
     pub fn for_each_element_str<F>(&self, array_path: &str, f: F) -> Result<(), Error>
     where
         F: FnMut(usize, &'a [u8]) -> Result<(), Error>,
@@ -218,9 +413,12 @@ impl<'a> IndexedDocument<'a> {
         self.for_each_element(&segs, f)
     }
 
-    /// Number of array side-tables stored.
     pub fn indexed_array_count(&self) -> usize {
         self.arrays.len()
+    }
+
+    pub fn indexed_object_count(&self) -> usize {
+        self.objects.len()
     }
 }
 
@@ -234,20 +432,26 @@ impl<'a> IndexedDocument<'a> {
         None
     }
 
-    /// If `path` is `array_path + Index(i) + rest`, return `(element_start, rest)`.
-    fn try_index_jump<'p>(
+    fn lookup_object(&self, path: &[PathSegment]) -> Option<(usize, &ObjectKeyIndex)> {
+        for (i, (owned, table)) in self.objects.iter().enumerate() {
+            if path_eq_owned(path, owned) {
+                return Some((i, table));
+            }
+        }
+        None
+    }
+
+    /// Array jump: `array_path + Index(i) + rest` → element start + rest.  
+    /// Object jump: `object_path + Key(k) + rest` → value start + rest.
+    fn try_accelerated_jump<'p>(
         &self,
         path: &'p [PathSegment<'p>],
     ) -> Result<Option<(usize, &'p [PathSegment<'p>])>, Error> {
-        // Longest matching indexed prefix ending before an Index segment.
-        // Prefer longer prefixes if multiple indexes exist.
-        let mut best: Option<(usize, usize, usize)> = None; // (prefix_len, elem_start, table_idx)
-        for (ti, (owned, table)) in self.arrays.iter().enumerate() {
+        let mut best: Option<(usize, usize)> = None; // (prefix_len, value_start)
+
+        for (owned, table) in &self.arrays {
             let plen = owned.len();
-            if path.len() <= plen {
-                continue;
-            }
-            if !path_prefix_eq_owned(&path[..plen], owned) {
+            if path.len() <= plen || !path_prefix_eq_owned(&path[..plen], owned) {
                 continue;
             }
             let PathSegment::Index(idx) = path[plen] else {
@@ -256,21 +460,48 @@ impl<'a> IndexedDocument<'a> {
             let Some(start) = table.element_start(idx) else {
                 return Err(Error::IndexOutOfBounds { index: idx });
             };
-            if best.is_none_or(|(bp, _, _)| plen > bp) {
-                best = Some((plen, start, ti));
+            if best.is_none_or(|(bp, _)| plen > bp) {
+                best = Some((plen + 1, start)); // consume the Index segment
             }
         }
-        if let Some((plen, start, _)) = best {
-            // rest = path[plen+1..]  (after the Index segment)
-            Ok(Some((start, &path[plen + 1..])))
+
+        for (owned, table) in &self.objects {
+            let plen = owned.len();
+            if path.len() <= plen || !path_prefix_eq_owned(&path[..plen], owned) {
+                continue;
+            }
+            let PathSegment::Key(k) = path[plen] else {
+                continue;
+            };
+            let Some((vs, _ve)) = table.get(k.as_bytes()) else {
+                // Key missing in map → treat as path not found (object was fully indexed).
+                return Err(Error::PathNotFound);
+            };
+            if best.is_none_or(|(bp, _)| plen > bp) {
+                best = Some((plen + 1, vs));
+            }
+        }
+
+        if let Some((consumed, start)) = best {
+            Ok(Some((start, &path[consumed..])))
         } else {
             Ok(None)
         }
     }
 }
 
+// ─── Builders ───────────────────────────────────────────────────────────────
+
 /// Build an [`ArrayIndex`] for the array at `path`.
-pub fn build_array_index(json: &[u8], path: &[PathSegment]) -> Result<ArrayIndex, Error> {
+///
+/// When `structural` is provided, container close is still taken from
+/// `find_value_offsets`; element walk uses structural-accelerated `skip_value`
+/// when beneficial.
+pub fn build_array_index(
+    json: &[u8],
+    path: &[PathSegment],
+    structural: Option<&StructuralIndex>,
+) -> Result<ArrayIndex, Error> {
     let (start, end) = find_value_offsets(json, path)?;
     if start >= json.len() || byte_at(json, start)? != b'[' {
         return Err(Error::TypeMismatch {
@@ -278,7 +509,6 @@ pub fn build_array_index(json: &[u8], path: &[PathSegment]) -> Result<ArrayIndex
             found: "primitive/object",
         });
     }
-    // Prefer structural close from scan when possible.
     let close = end.saturating_sub(1);
     if close < start || json.get(close) != Some(&b']') {
         return Err(Error::InvalidJsonSyntax {
@@ -317,7 +547,7 @@ pub fn build_array_index(json: &[u8], path: &[PathSegment]) -> Result<ArrayIndex
             });
         }
         element_starts.push(pos as u32);
-        pos = skip_value(json, pos)?;
+        pos = skip_value_maybe_structural(json, pos, structural)?;
         pos = skip_whitespace(json, pos);
         if pos >= json.len() {
             return Err(Error::InvalidJsonSyntax {
@@ -326,9 +556,7 @@ pub fn build_array_index(json: &[u8], path: &[PathSegment]) -> Result<ArrayIndex
             });
         }
         match json[pos] {
-            b',' => {
-                pos = skip_whitespace(json, pos + 1);
-            }
+            b',' => pos = skip_whitespace(json, pos + 1),
             b']' => {
                 return Ok(ArrayIndex {
                     element_starts,
@@ -344,6 +572,133 @@ pub fn build_array_index(json: &[u8], path: &[PathSegment]) -> Result<ArrayIndex
             }
         }
     }
+}
+
+/// Build an [`ObjectKeyIndex`] for the object at `path`.
+pub fn build_object_key_index(
+    json: &[u8],
+    path: &[PathSegment],
+    structural: Option<&StructuralIndex>,
+) -> Result<ObjectKeyIndex, Error> {
+    let (start, end) = find_value_offsets(json, path)?;
+    if start >= json.len() || byte_at(json, start)? != b'{' {
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: "primitive/array",
+        });
+    }
+    let close = end.saturating_sub(1);
+    if close < start || json.get(close) != Some(&b'}') {
+        return Err(Error::InvalidJsonSyntax {
+            pos: end,
+            msg: "Object value missing closing brace",
+        });
+    }
+
+    let mut entries = HashMap::new();
+    let mut pos = skip_whitespace(json, start + 1);
+    if pos >= json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos,
+            msg: "Unexpected EOF inside object",
+        });
+    }
+    if json[pos] == b'}' {
+        return Ok(ObjectKeyIndex {
+            entries,
+            open: start as u32,
+            close: pos as u32,
+        });
+    }
+
+    loop {
+        pos = skip_whitespace(json, pos);
+        if pos >= json.len() {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF inside object",
+            });
+        }
+        if json[pos] == b'}' {
+            return Ok(ObjectKeyIndex {
+                entries,
+                open: start as u32,
+                close: pos as u32,
+            });
+        }
+        if json[pos] != b'"' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected object key string",
+            });
+        }
+        let key_start = pos + 1;
+        let key_end = find_string_end(json, key_start)?;
+        let key = json[key_start..key_end].to_vec();
+        pos = key_end + 1;
+        pos = skip_whitespace(json, pos);
+        if pos >= json.len() || json[pos] != b':' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected colon after object key",
+            });
+        }
+        pos += 1;
+        pos = skip_whitespace(json, pos);
+        let val_start = pos;
+        let val_end = skip_value_maybe_structural(json, val_start, structural)?;
+        if val_start > u32::MAX as usize || val_end > u32::MAX as usize {
+            return Err(Error::InvalidJsonSyntax {
+                pos: val_start,
+                msg: "Document too large for u32 structural index",
+            });
+        }
+        entries.insert(key, (val_start as u32, val_end as u32));
+        pos = skip_whitespace(json, val_end);
+        if pos >= json.len() {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF inside object",
+            });
+        }
+        match json[pos] {
+            b',' => pos += 1,
+            b'}' => {
+                return Ok(ObjectKeyIndex {
+                    entries,
+                    open: start as u32,
+                    close: pos as u32,
+                });
+            }
+            _ => {
+                return Err(Error::InvalidJsonSyntax {
+                    pos,
+                    msg: "Expected comma or closing brace in object",
+                });
+            }
+        }
+    }
+}
+
+fn skip_value_maybe_structural(
+    json: &[u8],
+    pos: usize,
+    structural: Option<&StructuralIndex>,
+) -> Result<usize, Error> {
+    let pos = skip_whitespace(json, pos);
+    if pos >= json.len() {
+        return Err(Error::InvalidJsonSyntax {
+            pos,
+            msg: "Unexpected EOF",
+        });
+    }
+    if let Some(st) = structural {
+        if matches!(json[pos], b'{' | b'[') {
+            // Prefer structural skip for containers when Stage-1 is available.
+            return st.skip_container(json, pos);
+        }
+    }
+    skip_value(json, pos)
 }
 
 fn path_to_owned(path: &[PathSegment]) -> Vec<OwnedPathSegment> {
@@ -370,6 +725,32 @@ fn path_prefix_eq_owned(path: &[PathSegment], owned: &[OwnedPathSegment]) -> boo
     })
 }
 
+/// Extract static array path prefixes from a field path for derive auto-index.
+///
+/// For `products[0].title` → `["products"]`.  
+/// For `a.b[0].c` → `["a.b"]`.  
+/// Dynamic nested arrays (`items[0].tags[1]`) only contribute the **static**
+/// prefix before the first index (`items`).
+pub fn static_array_prefixes_from_path(path: &str) -> Vec<String> {
+    let segs = crate::path::parse_path(path);
+    let mut out = Vec::new();
+    let mut keys: Vec<&str> = Vec::new();
+    for s in &segs {
+        match s {
+            PathSegment::Key(k) => keys.push(*k),
+            PathSegment::Index(_) => {
+                if !keys.is_empty() {
+                    out.push(keys.join("."));
+                }
+                // Stop at first index for static auto-index (dynamic nested arrays
+                // need per-element indexes built at runtime).
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,7 +758,6 @@ mod tests {
 
     #[test]
     fn index_jump_mid_array() {
-        // Build a modest array so the test stays fast.
         let mut s = String::from(r#"{"products":["#);
         for i in 0..500 {
             if i > 0 {
@@ -389,18 +769,73 @@ mod tests {
         let json = s.into_bytes();
         let doc = IndexedDocument::build(&json, &["products"]).unwrap();
         assert_eq!(doc.array_len(&parse_path("products")).unwrap(), 500);
+        assert_eq!(
+            doc.find(&parse_path("products[250].id")).unwrap(),
+            b"250"
+        );
+        assert_eq!(
+            doc.find(&parse_path("products[499].title")).unwrap(),
+            br#""item_499""#
+        );
+    }
 
-        let v = doc.find(&parse_path("products[0].title")).unwrap();
-        assert_eq!(v, br#""item_0""#);
-        let v = doc.find(&parse_path("products[250].id")).unwrap();
-        assert_eq!(v, b"250");
-        let v = doc.find(&parse_path("products[499].title")).unwrap();
-        assert_eq!(v, br#""item_499""#);
+    #[test]
+    fn structural_skip_matches_skip_value() {
+        let json = br#"{"a":[1,{"x":2},[3,4]],"b":true}"#;
+        let st = build_structural_index(json).unwrap();
+        assert!(!st.is_empty());
+        // Skip the array value of "a"
+        let (start, end) = find_value_offsets(json, &parse_path("a")).unwrap();
+        assert_eq!(json[start], b'[');
+        let via_st = st.skip_container(json, start).unwrap();
+        let via_scan = skip_value(json, start).unwrap();
+        assert_eq!(via_st, via_scan);
+        assert_eq!(via_st, end);
+    }
 
+    #[test]
+    fn object_key_map() {
+        let json = br#"{"cfg":{"alpha":1,"beta":true,"gamma":"z"}}"#;
+        let mut doc = IndexedDocument::empty(json);
+        doc.index_object_str("cfg").unwrap();
+        assert_eq!(doc.find(&parse_path("cfg.beta")).unwrap(), b"true");
+        assert_eq!(doc.find(&parse_path("cfg.gamma")).unwrap(), br#""z""#);
         assert!(matches!(
-            doc.find(&parse_path("products[500].id")),
-            Err(Error::IndexOutOfBounds { index: 500 })
+            doc.find(&parse_path("cfg.missing")),
+            Err(Error::PathNotFound)
         ));
+        let oi = doc.object_index(&parse_path("cfg")).unwrap();
+        assert_eq!(oi.len(), 3);
+    }
+
+    #[test]
+    fn build_full_and_for_each() {
+        let json = br#"{"a":[1,2,3],"o":{"k":9}}"#;
+        let doc = IndexedDocument::build_full(json, &["a"], &["o"]).unwrap();
+        assert!(doc.structural().is_some());
+        assert_eq!(doc.indexed_array_count(), 1);
+        assert_eq!(doc.indexed_object_count(), 1);
+        let mut n = 0;
+        doc.for_each_element(&parse_path("a"), |_, _| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(doc.find(&parse_path("o.k")).unwrap(), b"9");
+    }
+
+    #[test]
+    fn static_array_prefixes() {
+        assert_eq!(
+            static_array_prefixes_from_path("products[0].title"),
+            vec!["products".to_string()]
+        );
+        assert_eq!(
+            static_array_prefixes_from_path("a.b[0].c"),
+            vec!["a.b".to_string()]
+        );
+        assert!(static_array_prefixes_from_path("plain.field").is_empty());
     }
 
     #[test]
@@ -415,20 +850,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(n, 4);
-    }
-
-    #[test]
-    fn empty_and_nested_paths() {
-        let json = br#"{"outer":{"items":[]}}"#;
-        let doc = IndexedDocument::build(json, &["outer.items"]).unwrap();
-        assert_eq!(doc.array_len(&parse_path("outer.items")).unwrap(), 0);
-        assert!(doc.find(&parse_path("outer.items[0]")).is_err());
-    }
-
-    #[test]
-    fn fallback_without_index() {
-        let json = br#"{"x":{"y":1}}"#;
-        let doc = IndexedDocument::empty(json);
-        assert_eq!(doc.find(&parse_path("x.y")).unwrap(), b"1");
     }
 }

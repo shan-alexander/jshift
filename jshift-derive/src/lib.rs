@@ -1,5 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
+use std::collections::BTreeSet;
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Ident, Type};
 
 #[proc_macro_derive(JsonMutatorSchema, attributes(json))]
@@ -36,8 +37,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     };
 
     let mut field_reads = Vec::new();
+    let mut field_reads_indexed = Vec::new();
     let mut mutator_setters = Vec::new();
     let mut path_statics = Vec::new();
+    let mut array_prefixes: BTreeSet<String> = BTreeSet::new();
 
     for field in fields {
         let field_name = field.ident.as_ref().ok_or_else(|| {
@@ -52,6 +55,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 format!("invalid #[json(path = ...)] value `{raw_path}`: {msg}"),
             )
         })?;
+
+        for pref in static_array_prefixes_from_segments(&path_segments) {
+            array_prefixes.insert(pref);
+        }
 
         let path_const_name = Ident::new(
             &format!("__JSHIFT_PATH_{}", field_name.to_string().to_uppercase()),
@@ -91,10 +98,35 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                     }
                 }
             });
+            field_reads_indexed.push(quote! {
+                #field_name: {
+                    match doc.find(Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => None,
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
         } else {
             field_reads.push(quote! {
                 #field_name: {
                     let slice = jshift::find_value(json, Self::#path_const_name)?;
+                    jshift::FromJsonSlice::from_json_slice(slice)
+                        .ok_or(jshift::Error::TypeMismatch {
+                            expected: stringify!(#field_type),
+                            found: "invalid format",
+                        })?
+                }
+            });
+            field_reads_indexed.push(quote! {
+                #field_name: {
+                    let slice = doc.find(Self::#path_const_name)?;
                     jshift::FromJsonSlice::from_json_slice(slice)
                         .ok_or(jshift::Error::TypeMismatch {
                             expected: stringify!(#field_type),
@@ -122,13 +154,42 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         }
     }
 
+    let array_path_lits: Vec<_> = array_prefixes.iter().map(|s| quote! { #s }).collect();
+
     Ok(quote! {
         impl #struct_name {
             #(#path_statics)*
 
+            /// Static array path prefixes inferred from field paths (for auto-index).
+            ///
+            /// e.g. `products[0].title` contributes `"products"`.
+            pub const INDEXED_ARRAY_PATHS: &'static [&'static str] = &[
+                #(#array_path_lits),*
+            ];
+
             pub fn read_from_json(json: &[u8]) -> Result<Self, jshift::Error> {
                 Ok(Self {
                     #(#field_reads),*
+                })
+            }
+
+            /// Build an [`jshift::IndexedDocument`] for this schema's array paths
+            /// (Stage-1 structural + array side-tables).
+            pub fn indexed_document(json: &[u8]) -> Result<jshift::IndexedDocument<'_>, jshift::Error> {
+                let mut doc = jshift::IndexedDocument::empty(json);
+                doc.index_structural()?;
+                for p in Self::INDEXED_ARRAY_PATHS {
+                    doc.index_array_str(p)?;
+                }
+                Ok(doc)
+            }
+
+            /// Like [`Self::read_from_json`] but uses [`Self::indexed_document`] so
+            /// paths through large arrays jump via side-tables.
+            pub fn read_from_json_indexed(json: &[u8]) -> Result<Self, jshift::Error> {
+                let doc = Self::indexed_document(json)?;
+                Ok(Self {
+                    #(#field_reads_indexed),*
                 })
             }
 
@@ -194,7 +255,6 @@ enum DerSegment {
     Index(usize),
 }
 
-/// Strict path parse for compile-time constants (mirrors `try_parse_path`).
 fn parse_path_segments(s: &str) -> Result<Vec<DerSegment>, &'static str> {
     let mut rest = s;
     let mut segments = Vec::new();
@@ -231,4 +291,21 @@ fn parse_path_segments(s: &str) -> Result<Vec<DerSegment>, &'static str> {
         }
     }
     Ok(segments)
+}
+
+fn static_array_prefixes_from_segments(segs: &[DerSegment]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut keys: Vec<&str> = Vec::new();
+    for s in segs {
+        match s {
+            DerSegment::Key(k) => keys.push(k.as_str()),
+            DerSegment::Index(_) => {
+                if !keys.is_empty() {
+                    out.push(keys.join("."));
+                }
+                break;
+            }
+        }
+    }
+    out
 }
