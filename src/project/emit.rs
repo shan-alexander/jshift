@@ -1,7 +1,25 @@
 //! Projection emitter: walk input spans, write output per [`SelectExpr`].
+//!
+//! # Span / arena evaluation
+//!
+//! Pure projections (`field`, `index`, identity chains) resolve to document spans
+//! with **no intermediate tree copies**. Pipes and `Sub` evaluate the left side to a
+//! span (document or reclaimable arena), then apply the right side. Only synthesized
+//! JSON (multi-select, many functions) grows the arena. Final output is streamed via
+//! [`EmitOut`].
+//!
+//! # Compact bulk path
+//!
+//! Default [`ProjectStyle::Compact`] is the production bulk style (thin cards, list
+//! projections, one-pass multi-select). On that style the emitter **does not** maintain
+//! pretty indent depth, does not call newline/indent helpers, and closes containers with
+//! a single `]` / `}` byte. Pretty and PreserveSource keep full bookkeeping; Compact
+//! streaming Each and pure-field multi-select write `{k:v,...}` / `[...]` with only
+//! commas and value spans — the path that matters for multi-megabyte catalog rewrites.
 
 use crate::convert::escape_json_key;
 use crate::error::Error;
+use crate::index::IndexedDocument;
 use crate::project::plan::{MissingPolicy, ProjectPlan, ProjectStyle};
 use crate::project::select::{
     resolve_index, resolve_slice, ArraySelect, CmpOp, HashField, ObjectSelect, SelectExpr,
@@ -12,7 +30,28 @@ use crate::scan::{find_string_end, skip_value, skip_whitespace};
 pub(crate) struct EmitCtx<'a> {
     pub plan: &'a ProjectPlan,
     pub depth: usize,
+    /// Optional structural indexes for O(1) array/object hops.
+    pub index: Option<&'a IndexedDocument<'a>>,
+    /// When true (and `parallel` feature + Compact + large side-table), `[*]` may use Rayon.
+    #[cfg(feature = "parallel")]
+    pub allow_parallel: bool,
 }
+
+impl<'a> EmitCtx<'a> {
+    pub fn new(plan: &'a ProjectPlan, index: Option<&'a IndexedDocument<'a>>) -> Self {
+        Self {
+            plan,
+            depth: 0,
+            index,
+            #[cfg(feature = "parallel")]
+            allow_parallel: false,
+        }
+    }
+}
+
+/// Minimum array length before parallel `[*]` emission is considered (avoids pool overhead).
+#[cfg(feature = "parallel")]
+const PARALLEL_EACH_MIN_ELEMS: usize = 64;
 
 pub(crate) fn emit_value(
     json: &[u8],
@@ -28,14 +67,12 @@ pub(crate) fn emit_value(
             Ok(())
         }
         SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
-            // Logical key → on-wire escaped form for matching document bytes.
             let wire = escape_json_key(key);
-            match find_object_value_span(json, start, end, wire.as_bytes()) {
+            match find_object_value_span_idx(json, start, end, wire.as_bytes(), ctx.index) {
                 Ok((s, e)) => {
                     out.emit_bytes(&json[s..e])?;
                     Ok(())
                 }
-                // JMESPath: missing field / non-object → null (when soft policy).
                 Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
                     out.emit_bytes(b"null")?;
                     Ok(())
@@ -52,6 +89,18 @@ pub(crate) fn emit_value(
         SelectExpr::MultiSelectHash(fields) => emit_multi_hash(json, start, end, fields, ctx, out),
         SelectExpr::MultiSelectList(items) => emit_multi_list(json, start, end, items, ctx, out),
         SelectExpr::Pipe(left, right) => {
+            // Pure left: open-ended descent when right continues (same as Sub).
+            if is_pure_focus_expr(left)
+                && !matches!(right.as_ref(), SelectExpr::Identity | SelectExpr::Current)
+            {
+                if let Ok(Some(s)) = resolve_focus_start_idx(json, start, end, left, ctx.index) {
+                    return emit_value(json, s, end, right, ctx, out);
+                }
+            }
+            if let Ok(Some((s, e))) = resolve_focus_idx(json, start, end, left, ctx.index) {
+                return emit_value(json, s, e, right, ctx, out);
+            }
+            // Synthesized left: one intermediate buffer (not a full DOM), then right.
             let mut mid = Vec::new();
             emit_value(json, start, end, left, ctx, &mut mid)?;
             let m0 = skip_whitespace(&mid, 0);
@@ -65,28 +114,82 @@ pub(crate) fn emit_value(
             emit_value(&mid, m0, m1, right, ctx, out)
         }
         SelectExpr::Flatten(inner) => {
+            if let Ok(Some((s, e))) = resolve_focus_idx(json, start, end, inner, ctx.index) {
+                return flatten_emit_on(json, s, e, ctx, out);
+            }
             let mut mid = Vec::new();
             emit_value(json, start, end, inner, ctx, &mut mid)?;
             flatten_emit(&mid, ctx, out)
         }
-        SelectExpr::Sub(left, right) => match resolve_focus(json, start, end, left) {
-            Ok(Some((s, e))) => emit_value(json, s, e, right, ctx, out),
-            Ok(None) if soft_null(ctx) => {
-                // Missing intermediate (JMESPath → null).
-                out.emit_bytes(b"null")?;
-                Ok(())
+        SelectExpr::Sub(left, right) => {
+            // Open-ended pure descent: only need the *start* of intermediate containers
+            // (e.g. `products` array open) so we never `skip_value` a multi-hundred-MB array
+            // just to discover its end before `products[0]`.
+            //
+            // Note: `right` is `&Box<SelectExpr>`; match on `**right` / `right.as_ref()`.
+            let right_is_identity =
+                matches!(right.as_ref(), SelectExpr::Identity | SelectExpr::Current);
+            if is_pure_focus_expr(left) && !right_is_identity {
+                match resolve_focus_start_idx(json, start, end, left, ctx.index) {
+                    Ok(Some(s)) => {
+                        return emit_value(json, s, end, right, ctx, out);
+                    }
+                    Ok(None) | Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. })
+                        if soft_null(ctx) =>
+                    {
+                        out.emit_bytes(b"null")?;
+                        return Ok(());
+                    }
+                    Ok(None) => return Err(Error::PathNotFound),
+                    Err(e) => return Err(e),
+                }
             }
-            Ok(None) => Err(Error::PathNotFound),
-            Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
-                out.emit_bytes(b"null")?;
-                Ok(())
+            // Pure focus with exact span (Identity right, or leaf field copy).
+            if is_pure_focus_expr(left) {
+                match resolve_focus_idx(json, start, end, left, ctx.index) {
+                    Ok(Some((s, e))) => return emit_value(json, s, e, right, ctx, out),
+                    Ok(None) | Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. })
+                        if soft_null(ctx) =>
+                    {
+                        out.emit_bytes(b"null")?;
+                        return Ok(());
+                    }
+                    Ok(None) => return Err(Error::PathNotFound),
+                    Err(e) => return Err(e),
+                }
             }
-            Err(e) => Err(e),
-        },
+            // Full left evaluation (sort_by(...), flatten, multi-select, …) into one mid buffer.
+            let mut mid = Vec::new();
+            match emit_value(json, start, end, left, ctx, &mut mid) {
+                Ok(()) => {}
+                Err(Error::PathNotFound)
+                | Err(Error::TypeMismatch { .. })
+                | Err(Error::IndexOutOfBounds { .. })
+                    if soft_null(ctx) =>
+                {
+                    out.emit_bytes(b"null")?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+            let m0 = skip_whitespace(&mid, 0);
+            if m0 >= mid.len() {
+                if soft_null(ctx) {
+                    out.emit_bytes(b"null")?;
+                    return Ok(());
+                }
+                return Err(Error::PathNotFound);
+            }
+            let m1 = skip_value(&mid, m0)?;
+            if soft_null(ctx) && trim_json(&mid[m0..m1]) == b"null" {
+                out.emit_bytes(b"null")?;
+                return Ok(());
+            }
+            emit_value(&mid, m0, m1, right, ctx, out)
+        }
         SelectExpr::Cmp { op, left, right } => {
             let lv = eval_buf(json, start, end, left, ctx)?;
             let rv = eval_buf(json, start, end, right, ctx)?;
-            // JMESPath: incomparable types → null (not false).
             match cmp_values(&lv, &rv, *op) {
                 Some(t) => {
                     out.emit_bytes(if t { b"true" } else { b"false" })?;
@@ -99,7 +202,6 @@ pub(crate) fn emit_value(
             }
         }
         SelectExpr::And(a, b) => {
-            // JMESPath && : if left is falsey return **left value**; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if !is_truthy(&av) {
                 out.emit_bytes(trim_json(&av))?;
@@ -108,7 +210,6 @@ pub(crate) fn emit_value(
             emit_value(json, start, end, b, ctx, out)
         }
         SelectExpr::Or(a, b) => {
-            // JMESPath || : if left is truthy return left; else return right.
             let av = eval_buf(json, start, end, a, ctx)?;
             if is_truthy(&av) {
                 out.emit_bytes(trim_json(&av))?;
@@ -122,10 +223,7 @@ pub(crate) fn emit_value(
             Ok(())
         }
         SelectExpr::Call { name, args } => emit_call(json, start, end, name, args, ctx, out),
-        SelectExpr::Expref(inner) => {
-            // Bare expref is invalid at runtime; treat as identity of current for debug.
-            emit_value(json, start, end, inner, ctx, out)
-        }
+        SelectExpr::Expref(inner) => emit_value(json, start, end, inner, ctx, out),
         SelectExpr::ObjectProjection(each) => emit_object_projection(json, start, end, each, ctx, out),
         SelectExpr::Paren(inner) => emit_value(json, start, end, inner, ctx, out),
     }
@@ -198,6 +296,24 @@ fn soft_null(ctx: &EmitCtx<'_>) -> bool {
     ctx.plan.missing == MissingPolicy::Skip
 }
 
+/// Expressions that resolve to a document/arena span without synthesizing JSON.
+fn is_pure_focus_expr(expr: &SelectExpr) -> bool {
+    match expr {
+        SelectExpr::Identity | SelectExpr::Current => true,
+        SelectExpr::Field(_) | SelectExpr::FieldQuoted(_) => true,
+        SelectExpr::Paren(inner) => is_pure_focus_expr(inner),
+        SelectExpr::Sub(l, r) => is_pure_focus_expr(l) && is_pure_focus_expr(r),
+        SelectExpr::Object(obj) if obj.len() == 1 => {
+            let child = obj.get(obj.keys().next().unwrap()).unwrap();
+            is_pure_focus_expr(child)
+        }
+        SelectExpr::Array(ArraySelect::Indices(map)) if map.len() == 1 => {
+            is_pure_focus_expr(map.values().next().unwrap())
+        }
+        _ => false,
+    }
+}
+
 fn eval_buf(
     json: &[u8],
     start: usize,
@@ -205,6 +321,12 @@ fn eval_buf(
     expr: &SelectExpr,
     ctx: &mut EmitCtx<'_>,
 ) -> Result<Vec<u8>, Error> {
+    // Pure focus: return a copy of the span only (no full-tree re-encode path).
+    if is_pure_focus_expr(expr) {
+        if let Ok(Some((s, e))) = resolve_focus_idx(json, start, end, expr, ctx.index) {
+            return Ok(json[s..e].to_vec());
+        }
+    }
     let mut v = Vec::new();
     match emit_value(json, start, end, expr, ctx, &mut v) {
         Ok(()) => Ok(v),
@@ -216,6 +338,633 @@ fn eval_buf(
         }
         Err(e) => Err(e),
     }
+}
+
+fn resolve_focus_idx(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    expr: &SelectExpr,
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<Option<(usize, usize)>, Error> {
+    match expr {
+        SelectExpr::Identity | SelectExpr::Current => Ok(Some((start, end))),
+        SelectExpr::Paren(inner) => resolve_focus_idx(json, start, end, inner, index),
+        SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
+            let wire = escape_json_key(key);
+            match find_object_value_span_idx(json, start, end, wire.as_bytes(), index) {
+                Ok((s, e)) => Ok(Some((s, e))),
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        SelectExpr::Object(obj) if obj.len() == 1 => {
+            let key = obj.keys().next().unwrap();
+            let child = obj.get(key).unwrap();
+            let (s, e) = match find_object_value_span_idx(json, start, end, key.as_bytes(), index) {
+                Ok(x) => x,
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+                Ok(Some((s, e)))
+            } else {
+                resolve_focus_idx(json, s, e, child, index)
+            }
+        }
+        SelectExpr::Array(ArraySelect::Indices(map)) if map.len() == 1 => {
+            let (idx, child) = map.iter().next().unwrap();
+            let Some((s, e)) = nth_array_element(json, start, end, *idx, index)? else {
+                return Ok(None);
+            };
+            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+                Ok(Some((s, e)))
+            } else {
+                resolve_focus_idx(json, s, e, child, index)
+            }
+        }
+        SelectExpr::Sub(left, right) => {
+            if let Some((s, e)) = resolve_focus_idx(json, start, end, left, index)? {
+                resolve_focus_idx(json, s, e, right, index)
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn find_object_value_span_idx(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    key: &[u8],
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<(usize, usize), Error> {
+    let start = skip_whitespace(json, start);
+    if start < json.len() && json[start] == b'{' {
+        if let Some(doc) = index {
+            if let Some(oi) = doc.object_index_at_open(start) {
+                return oi.get(key).ok_or(Error::PathNotFound);
+            }
+        }
+    }
+    find_object_value_span(json, start, end, key)
+}
+
+/// Byte offset of a field's value start (after `:`) without scanning the value body.
+/// Prior siblings are still skipped (required to reach the key).
+fn find_object_value_start(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    key: &[u8],
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<usize, Error> {
+    let start = skip_whitespace(json, start);
+    if start < json.len() && json[start] == b'{' {
+        if let Some(doc) = index {
+            if let Some(oi) = doc.object_index_at_open(start) {
+                return oi.get(key).map(|(s, _)| s).ok_or(Error::PathNotFound);
+            }
+        }
+    }
+    if start >= json.len() || json[start] != b'{' {
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: type_name_at(json, start),
+        });
+    }
+    let mut pos = start + 1;
+    loop {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b'}' {
+            return Err(Error::PathNotFound);
+        }
+        if json[pos] != b'"' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected object key",
+            });
+        }
+        let key_inner_end = find_string_end(json, pos + 1)?;
+        let key_on_wire = &json[pos + 1..key_inner_end];
+        pos = key_inner_end + 1;
+        pos = skip_whitespace(json, pos);
+        if pos >= json.len() || json[pos] != b':' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ':' after object key",
+            });
+        }
+        pos += 1;
+        pos = skip_whitespace(json, pos);
+        let val_start = pos;
+        if key_on_wire == key {
+            return Ok(val_start);
+        }
+        // Skip non-matching values to continue the scan.
+        let val_end = skip_value_smart(json, val_start, index)?;
+        pos = skip_whitespace(json, val_end);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        } else if pos < json.len() && json[pos] == b'}' {
+            return Err(Error::PathNotFound);
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ',' or '}' in object",
+            });
+        }
+    }
+}
+
+/// `skip_value` accelerated by Stage-1 structural list when present on the document index.
+fn skip_value_smart(
+    json: &[u8],
+    start: usize,
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<usize, Error> {
+    let start = skip_whitespace(json, start);
+    if start < json.len()
+        && matches!(json[start], b'{' | b'[')
+        && let Some(doc) = index
+        && let Some(st) = doc.structural()
+    {
+        return st.skip_container(json, start);
+    }
+    skip_value(json, start)
+}
+
+/// Resolve pure-focus expression to a **start offset only** (no full value close).
+/// Used for intermediate descent into huge arrays/objects.
+fn resolve_focus_start_idx(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    expr: &SelectExpr,
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<Option<usize>, Error> {
+    match expr {
+        SelectExpr::Identity | SelectExpr::Current => Ok(Some(start)),
+        SelectExpr::Paren(inner) => resolve_focus_start_idx(json, start, end, inner, index),
+        SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
+            let wire = escape_json_key(key);
+            match find_object_value_start(json, start, end, wire.as_bytes(), index) {
+                Ok(s) => Ok(Some(s)),
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+        SelectExpr::Object(obj) if obj.len() == 1 => {
+            let key = obj.keys().next().unwrap();
+            let child = obj.get(key).unwrap();
+            let s = match find_object_value_start(json, start, end, key.as_bytes(), index) {
+                Ok(s) => s,
+                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+                Ok(Some(s))
+            } else {
+                resolve_focus_start_idx(json, s, end, child, index)
+            }
+        }
+        SelectExpr::Array(ArraySelect::Indices(map)) if map.len() == 1 => {
+            let (idx, child) = map.iter().next().unwrap();
+            let Some((s, _e)) = nth_array_element(json, start, end, *idx, index)? else {
+                return Ok(None);
+            };
+            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+                Ok(Some(s))
+            } else {
+                resolve_focus_start_idx(json, s, end, child, index)
+            }
+        }
+        SelectExpr::Sub(left, right) => {
+            if let Some(s) = resolve_focus_start_idx(json, start, end, left, index)? {
+                resolve_focus_start_idx(json, s, end, right, index)
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Side-table for the array value starting at `start` (after optional leading ws), if indexed.
+#[inline]
+fn array_side_table<'a>(
+    json: &[u8],
+    start: usize,
+    index: Option<&'a IndexedDocument<'a>>,
+) -> Option<&'a crate::index::ArrayIndex> {
+    let open = skip_whitespace(json, start);
+    if open >= json.len() || json[open] != b'[' {
+        return None;
+    }
+    index.and_then(|doc| doc.array_index_at_open(open))
+}
+
+/// Length of the array at `start` without building full element spans when indexed.
+#[allow(dead_code)] // available for slice/filter planning helpers
+fn array_len_fast(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<usize, Error> {
+    if let Some(ai) = array_side_table(json, start, index) {
+        return Ok(ai.len());
+    }
+    Ok(array_element_starts_scan(json, skip_whitespace(json, start), end)?.len())
+}
+
+/// Locate a single array element by JMESPath signed index **without** materializing
+/// sibling spans.
+///
+/// | Index table | Positive `i` | Negative `i` |
+/// | --- | --- | --- |
+/// | present | O(1) jump + `skip_value` | O(1) |
+/// | absent | O(`i`) scan, stop early | O(n) one pass (`-1` tracks last only) |
+///
+/// Returns `Ok(None)` when the index is out of range (JMESPath soft-null path).
+fn nth_array_element(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    index: i64,
+    doc_index: Option<&IndexedDocument<'_>>,
+) -> Result<Option<(usize, usize)>, Error> {
+    let open = skip_whitespace(json, start);
+    if open >= json.len() || json[open] != b'[' {
+        return Err(Error::TypeMismatch {
+            expected: "array",
+            found: type_name_at(json, open),
+        });
+    }
+
+    if let Some(ai) = array_side_table(json, open, doc_index) {
+        let Some(i) = resolve_index(index, ai.len()) else {
+            return Ok(None);
+        };
+        return ai.element_value_span(json, i).map(Some);
+    }
+
+    // No side-table: sparse scan.
+    if index >= 0 {
+        return nth_array_element_scan_positive(json, open, end, index as usize);
+    }
+    nth_array_element_scan_negative(json, open, end, index)
+}
+
+/// Walk only as far as element `target` (0-based). Never visits later siblings.
+fn nth_array_element_scan_positive(
+    json: &[u8],
+    open: usize,
+    end: usize,
+    target: usize,
+) -> Result<Option<(usize, usize)>, Error> {
+    let mut pos = skip_whitespace(json, open + 1);
+    if pos < end && json[pos] == b']' {
+        return Ok(None);
+    }
+    let mut i = 0usize;
+    loop {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b']' {
+            return Ok(None);
+        }
+        let e_start = pos;
+        let e_end = skip_value(json, e_start)?;
+        if i == target {
+            return Ok(Some((e_start, e_end)));
+        }
+        i += 1;
+        pos = skip_whitespace(json, e_end);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        } else if pos < json.len() && json[pos] == b']' {
+            return Ok(None);
+        } else if pos >= json.len() {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF in array index scan",
+            });
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ',' or ']' in array index scan",
+            });
+        }
+    }
+}
+
+/// Negative index without a side-table. `-1` keeps only the last span (O(n) time, O(1) mem).
+/// Other negatives collect start offsets only once, then resolve.
+fn nth_array_element_scan_negative(
+    json: &[u8],
+    open: usize,
+    end: usize,
+    index: i64,
+) -> Result<Option<(usize, usize)>, Error> {
+    debug_assert!(index < 0);
+    if index == -1 {
+        let mut pos = skip_whitespace(json, open + 1);
+        if pos < end && json[pos] == b']' {
+            return Ok(None);
+        }
+        let mut last: Option<(usize, usize)> = None;
+        loop {
+            pos = skip_whitespace(json, pos);
+            if pos >= end || json[pos] == b']' {
+                return Ok(last);
+            }
+            let e_start = pos;
+            let e_end = skip_value(json, e_start)?;
+            last = Some((e_start, e_end));
+            pos = skip_whitespace(json, e_end);
+            if pos < json.len() && json[pos] == b',' {
+                pos += 1;
+            } else if pos < json.len() && json[pos] == b']' {
+                return Ok(last);
+            } else {
+                return Err(Error::InvalidJsonSyntax {
+                    pos,
+                    msg: "Expected ',' or ']' in array index scan",
+                });
+            }
+        }
+    }
+
+    // General negative: one pass of start offsets (u32), then skip_value for the winner.
+    let starts = array_element_starts_scan(json, open, end)?;
+    let Some(i) = resolve_index(index, starts.len()) else {
+        return Ok(None);
+    };
+    let s = starts[i] as usize;
+    let e = skip_value(json, s)?;
+    Ok(Some((s, e)))
+}
+
+/// Collect only element start offsets (u32) — cheaper than full `(start,end)` pairs when
+/// ends are computed lazily.
+fn array_element_starts_scan(json: &[u8], open: usize, end: usize) -> Result<Vec<u32>, Error> {
+    let mut starts = Vec::new();
+    let mut pos = skip_whitespace(json, open + 1);
+    if pos < end && json[pos] == b']' {
+        return Ok(starts);
+    }
+    loop {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b']' {
+            break;
+        }
+        if pos > u32::MAX as usize {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Document too large for u32 array starts",
+            });
+        }
+        starts.push(pos as u32);
+        let e_end = skip_value(json, pos)?;
+        pos = skip_whitespace(json, e_end);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        } else if pos < json.len() && json[pos] == b']' {
+            break;
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ',' or ']' in array",
+            });
+        }
+    }
+    Ok(starts)
+}
+
+/// Resolve several signed indices into spans without building unused sibling ends when
+/// a side-table exists. Multi-index result order follows sorted signed keys (stable plan).
+fn resolve_indices_sparse(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    keys: &[i64],
+    doc_index: Option<&IndexedDocument<'_>>,
+) -> Result<Vec<(usize, usize, i64)>, Error> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if keys.len() == 1 {
+        return match nth_array_element(json, start, end, keys[0], doc_index)? {
+            Some((s, e)) => Ok(vec![(s, e, keys[0])]),
+            None => Ok(Vec::new()),
+        };
+    }
+
+    if let Some(ai) = array_side_table(json, start, doc_index) {
+        let mut out = Vec::with_capacity(keys.len());
+        for &k in keys {
+            if let Some(i) = resolve_index(k, ai.len()) {
+                let (s, e) = ai.element_value_span(json, i)?;
+                out.push((s, e, k));
+            }
+        }
+        return Ok(out);
+    }
+
+    // No side-table: if any key is negative, need length → start table once.
+    let needs_len = keys.iter().any(|&k| k < 0);
+    if needs_len {
+        let starts = {
+            let open = skip_whitespace(json, start);
+            array_element_starts_scan(json, open, end)?
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        for &k in keys {
+            if let Some(i) = resolve_index(k, starts.len()) {
+                let s = starts[i] as usize;
+                let e = skip_value(json, s)?;
+                out.push((s, e, k));
+            }
+        }
+        return Ok(out);
+    }
+
+    // All non-negative: single forward scan, stop after max needed index.
+    let mut needed: Vec<usize> = keys.iter().map(|&k| k as usize).collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let max_need = *needed.last().unwrap();
+    let mut want = needed.into_iter().peekable();
+    let mut found: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
+
+    let open = skip_whitespace(json, start);
+    let mut pos = skip_whitespace(json, open + 1);
+    let mut i = 0usize;
+    if pos < end && json[pos] == b']' {
+        return Ok(Vec::new());
+    }
+    while want.peek().is_some() {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b']' {
+            break;
+        }
+        let e_start = pos;
+        let e_end = skip_value(json, e_start)?;
+        if want.peek() == Some(&i) {
+            found.insert(i, (e_start, e_end));
+            want.next();
+        }
+        if i >= max_need {
+            break;
+        }
+        i += 1;
+        pos = skip_whitespace(json, e_end);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut out = Vec::with_capacity(keys.len());
+    for &k in keys {
+        let ui = k as usize;
+        if let Some(&(s, e)) = found.get(&ui) {
+            out.push((s, e, k));
+        }
+    }
+    Ok(out)
+}
+
+fn collect_array_elems_idx(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    index: Option<&IndexedDocument<'_>>,
+) -> Result<Vec<(usize, usize)>, Error> {
+    // Prefer side-table starts + lazy skip_value (still O(n) if caller needs all elems,
+    // but avoids a second structural walk to discover starts).
+    if let Some(ai) = array_side_table(json, start, index) {
+        let mut elems = Vec::with_capacity(ai.len());
+        for i in 0..ai.len() {
+            elems.push(ai.element_value_span(json, i)?);
+        }
+        return Ok(elems);
+    }
+    collect_array_elems_scan(json, start, end)
+}
+
+/// Iterate every array element without materializing a full `Vec` of spans first.
+///
+/// With a side-table: O(1) start per element via [`ArrayIndex::element_start`], then
+/// a single `skip_value` for that element's end (siblings are never scanned to *find*
+/// the start). Without a table: sequential scan.
+///
+/// Used by streaming list emit and by [`crate::project::project_each`] (per-card /
+/// JSONL paths that must not build one giant output array).
+pub(crate) fn for_each_array_element<F>(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    doc_index: Option<&IndexedDocument<'_>>,
+    mut f: F,
+) -> Result<(), Error>
+where
+    F: FnMut(usize, usize, usize) -> Result<(), Error>, // (elem_index, start, end)
+{
+    if let Some(ai) = array_side_table(json, start, doc_index) {
+        // Prefer start table + local skip_value (not a full pre-collect of ends).
+        let n = ai.len();
+        for i in 0..n {
+            let s = ai.element_start(i).expect("i < len");
+            let e = skip_value_smart(json, s, doc_index)?;
+            f(i, s, e)?;
+        }
+        return Ok(());
+    }
+    let open = skip_whitespace(json, start);
+    if open >= json.len() || json[open] != b'[' {
+        return Err(Error::TypeMismatch {
+            expected: "array",
+            found: type_name_at(json, open),
+        });
+    }
+    let mut pos = skip_whitespace(json, open + 1);
+    if pos < end && json[pos] == b']' {
+        return Ok(());
+    }
+    let mut i = 0usize;
+    loop {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b']' {
+            break;
+        }
+        let e_start = pos;
+        let e_end = skip_value(json, e_start)?;
+        f(i, e_start, e_end)?;
+        i += 1;
+        pos = skip_whitespace(json, e_end);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        } else if pos < json.len() && json[pos] == b']' {
+            break;
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ',' or ']' in array",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn flatten_emit_on(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    let start = skip_whitespace(json, start);
+    if start >= end || json.get(start) != Some(&b'[') {
+        // non-array: identity (JMESPath flatten of non-array is the value itself? Spec: null)
+        // jmespath.rs: Flatten of non-array → null
+        if soft_null(ctx) {
+            out.emit_bytes(b"null")?;
+            return Ok(());
+        }
+        out.emit_bytes(&json[start..end])?;
+        return Ok(());
+    }
+    let outer = collect_array_elems_idx(json, start, end, ctx.index)?;
+    out.emit_byte(b'[')?;
+    let mut first = true;
+    for (s, e) in outer {
+        let s = skip_whitespace(json, s);
+        if s < json.len() && json[s] == b'[' {
+            let inner = collect_array_elems_idx(json, s, e, ctx.index)?;
+            for (is, ie) in inner {
+                if !first {
+                    out.emit_byte(b',')?;
+                }
+                maybe_pretty_newline_indent(ctx, out, true)?;
+                out.emit_bytes(&json[is..ie])?;
+                first = false;
+            }
+        } else {
+            if !first {
+                out.emit_byte(b',')?;
+            }
+            maybe_pretty_newline_indent(ctx, out, true)?;
+            out.emit_bytes(&json[s..e])?;
+            first = false;
+        }
+    }
+    emit_close_array(ctx, out)?;
+    Ok(())
 }
 
 /// JMESPath truthiness: false, null, empty string/array/object are falsey.
@@ -297,8 +1046,13 @@ fn cmp_values(left: &[u8], right: &[u8], op: CmpOp) -> Option<bool> {
             CmpOp::Ge => ls >= rs,
         });
     }
-    // incomparable types
-    None
+    // JMESPath: equality/inequality across different types is false/true (not null).
+    // Order comparisons across types → null.
+    match op {
+        CmpOp::Eq => Some(false),
+        CmpOp::Ne => Some(true),
+        _ => None,
+    }
 }
 
 /// Deep structural equality for JSON objects/arrays (order-sensitive for arrays;
@@ -380,59 +1134,6 @@ fn json_string_content(v: &[u8]) -> Option<&[u8]> {
         Some(&v[1..v.len() - 1])
     } else {
         None
-    }
-}
-
-/// If `expr` is a pure focus (single key identity / single index), return child span.
-fn resolve_focus(
-    json: &[u8],
-    start: usize,
-    end: usize,
-    expr: &SelectExpr,
-) -> Result<Option<(usize, usize)>, Error> {
-    match expr {
-        SelectExpr::Identity | SelectExpr::Current => Ok(Some((start, end))),
-        SelectExpr::Paren(inner) => resolve_focus(json, start, end, inner),
-        SelectExpr::Field(key) | SelectExpr::FieldQuoted(key) => {
-            let wire = escape_json_key(key);
-            match find_object_value_span(json, start, end, wire.as_bytes()) {
-                Ok((s, e)) => Ok(Some((s, e))),
-                Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => Ok(None),
-                Err(e) => Err(e),
-            }
-        }
-        SelectExpr::Object(obj) if obj.len() == 1 => {
-            let key = obj.keys().next().unwrap();
-            let child = obj.get(key).unwrap();
-            let (s, e) = find_object_value_span(json, start, end, key.as_bytes())?;
-            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
-                Ok(Some((s, e)))
-            } else {
-                resolve_focus(json, s, e, child)
-            }
-        }
-        SelectExpr::Array(ArraySelect::Indices(map)) if map.len() == 1 => {
-            let (idx, child) = map.iter().next().unwrap();
-            let elems = collect_array_elems(json, start, end)?;
-            let i = resolve_index(*idx, elems.len()).ok_or(Error::PathNotFound)?;
-            let (s, e) = elems[i];
-            if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
-                Ok(Some((s, e)))
-            } else {
-                resolve_focus(json, s, e, child)
-            }
-        }
-        SelectExpr::Array(ArraySelect::Each(_))
-        | SelectExpr::Array(ArraySelect::Slice { .. })
-        | SelectExpr::Array(ArraySelect::Filter { .. }) => Ok(None),
-        SelectExpr::Sub(left, right) => {
-            if let Some((s, e)) = resolve_focus(json, start, end, left)? {
-                resolve_focus(json, s, e, right)
-            } else {
-                Ok(None)
-            }
-        }
-        _ => Ok(None),
     }
 }
 
@@ -544,6 +1245,14 @@ fn find_object_value_span(
 }
 
 fn collect_array_elems(json: &[u8], start: usize, end: usize) -> Result<Vec<(usize, usize)>, Error> {
+    collect_array_elems_idx(json, start, end, None)
+}
+
+fn collect_array_elems_scan(
+    json: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<Vec<(usize, usize)>, Error> {
     let start = skip_whitespace(json, start);
     if start >= json.len() || json[start] != b'[' {
         return Err(Error::TypeMismatch {
@@ -600,6 +1309,146 @@ fn emit_object(
     ctx: &mut EmitCtx<'_>,
     out: &mut impl EmitOut,
 ) -> Result<(), Error> {
+    // Compact/Pretty: selective scan — do not `skip_value` a kept field's body when it is
+    // the last kept key (e.g. root `{"products":[ 25k… ]}` keep-list only needs value start).
+    // PreserveSource still collects members for whitespace fidelity.
+    if !matches!(ctx.plan.style, ProjectStyle::PreserveSource) {
+        return emit_object_selective(json, start, end, sel, ctx, out);
+    }
+    emit_object_preserve(json, start, end, sel, ctx, out)
+}
+
+/// Keep-list / multi-field object emit without pre-scanning huge kept values.
+fn emit_object_selective(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    sel: &ObjectSelect,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    let obj_start = skip_whitespace(json, start);
+    if obj_start >= json.len() || json[obj_start] != b'{' {
+        if soft_null(ctx) {
+            out.emit_bytes(b"null")?;
+            return Ok(());
+        }
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: type_name_at(json, obj_start),
+        });
+    }
+
+    let mut remaining: std::collections::HashSet<&str> = sel.fields.keys().map(|s| s.as_str()).collect();
+    let missing_err = ctx.plan.missing == MissingPolicy::Error;
+    let total_keep = remaining.len();
+
+    out.emit_byte(b'{')?;
+    let mut wrote = 0usize;
+    let mut pos = obj_start + 1;
+
+    while !remaining.is_empty() {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json[pos] == b'}' {
+            break;
+        }
+        if json[pos] != b'"' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected object key in project",
+            });
+        }
+        let key_open = pos;
+        let key_inner_end = find_string_end(json, pos + 1)?;
+        let key_on_wire = &json[pos + 1..key_inner_end];
+        let key_str = std::str::from_utf8(key_on_wire).map_err(|_| Error::InvalidJsonSyntax {
+            pos: key_open,
+            msg: "Object key is not UTF-8",
+        })?;
+        pos = key_inner_end + 1;
+        pos = skip_whitespace(json, pos);
+        if pos >= json.len() || json[pos] != b':' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ':' in project object",
+            });
+        }
+        pos += 1;
+        pos = skip_whitespace(json, pos);
+        let val_start = pos;
+
+        if let Some(child) = sel.fields.get(key_str) {
+            if wrote > 0 {
+                out.emit_byte(b',')?;
+            }
+            // Compact: no indent depth / pretty newline; Pretty: full bookkeeping.
+            let compact = matches!(ctx.plan.style, ProjectStyle::Compact);
+            if !compact {
+                maybe_pretty_newline_indent(ctx, out, true)?;
+            }
+            // key + colon (compact / pretty)
+            out.emit_bytes(&json[key_open..key_inner_end + 1])?;
+            match ctx.plan.style {
+                ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
+                _ => out.emit_byte(b':')?,
+            }
+            // Open-ended child bound: descent uses value start; Identity still needs a real end.
+            let child_end = if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+                skip_value_smart(json, val_start, ctx.index)?
+            } else {
+                end
+            };
+            if compact {
+                emit_value(json, val_start, child_end, child, ctx, out)?;
+            } else {
+                ctx.depth += 1;
+                emit_value(json, val_start, child_end, child, ctx, out)?;
+                ctx.depth -= 1;
+            }
+            wrote += 1;
+            remaining.remove(key_str);
+
+            if remaining.is_empty() {
+                // Last kept field: do **not** skip its (possibly huge) original value.
+                break;
+            }
+            // More kept keys later: advance past this value.
+            let val_end = skip_value_smart(json, val_start, ctx.index)?;
+            pos = skip_whitespace(json, val_end);
+            if pos < json.len() && json[pos] == b',' {
+                pos += 1;
+            }
+        } else {
+            let val_end = skip_value_smart(json, val_start, ctx.index)?;
+            pos = skip_whitespace(json, val_end);
+            if pos < json.len() && json[pos] == b',' {
+                pos += 1;
+            } else if pos < json.len() && json[pos] == b'}' {
+                break;
+            } else if pos >= json.len() {
+                return Err(Error::InvalidJsonSyntax {
+                    pos,
+                    msg: "Unclosed object in project",
+                });
+            }
+        }
+    }
+
+    if missing_err && wrote != total_keep {
+        return Err(Error::PathNotFound);
+    }
+    emit_close_object(ctx, out)?;
+    Ok(())
+}
+
+fn emit_object_preserve(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    sel: &ObjectSelect,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
     let (obj_start, members, close_pos) = match collect_object_members(json, start, end) {
         Ok(x) => x,
         Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
@@ -629,13 +1478,7 @@ fn emit_object(
     }
 
     out.emit_byte(b'{')?;
-    // PreserveSource: leading ws after `{` when first kept is first member.
-    if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
-        && let Some((first_m, _)) = kept.first()
-        && members
-            .first()
-            .is_some_and(|m| m.member_start == first_m.member_start)
-    {
+    if let Some((first_m, _)) = kept.first() {
         let between = &json[obj_start + 1..first_m.member_start];
         if is_ws_only(between) {
             out.emit_bytes(between)?;
@@ -651,9 +1494,7 @@ fn emit_object(
         ctx.depth += 1;
         emit_value(json, m.val_start, m.val_end, child, ctx, out)?;
         ctx.depth -= 1;
-        // PreserveSource: trailing space after value before comma (not last)
-        if matches!(ctx.plan.style, ProjectStyle::PreserveSource) && i + 1 < kept.len() {
-            // copy ws after value up to comma if original had comma after this member
+        if i + 1 < kept.len() {
             if let Some(c) = m.comma {
                 let mid = &json[m.after_value..c];
                 if is_ws_only(mid) {
@@ -663,10 +1504,7 @@ fn emit_object(
         }
     }
 
-    // PreserveSource: whitespace after last kept value (before its comma or `}`).
-    if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
-        && let Some((last_m, _)) = kept.last()
-    {
+    if let Some((last_m, _)) = kept.last() {
         if let Some(c) = last_m.comma {
             let between = &json[last_m.after_value..c];
             if is_ws_only(between) {
@@ -713,6 +1551,395 @@ fn emit_member_sep(
     Ok(())
 }
 
+/// Stream `[*]` / filter / slice projections without cloning the child AST per element.
+///
+/// [`ProjectStyle::Compact`] uses a dedicated streaming path that never touches indent
+/// depth or pretty helpers (see module docs). Pretty / PreserveSource keep full style
+/// bookkeeping via [`stream_projection_elem`].
+fn emit_array_stream(
+    json: &[u8],
+    open: usize,
+    end: usize,
+    sel: &ArraySelect,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    let omit_nulls = matches!(
+        sel,
+        ArraySelect::Each(_) | ArraySelect::Slice { .. } | ArraySelect::Filter { .. }
+    );
+    let compact = matches!(ctx.plan.style, ProjectStyle::Compact);
+
+    let side = ctx.index;
+    match sel {
+        ArraySelect::Each(child) => {
+            #[cfg(feature = "parallel")]
+            if ctx.allow_parallel
+                && compact
+                && let Some(ai) = array_side_table(json, open, side)
+                && ai.len() >= PARALLEL_EACH_MIN_ELEMS
+            {
+                // Owns brackets end-to-end (do not emit `[` before this return).
+                return emit_array_each_parallel(json, open, ai, child.as_ref(), omit_nulls, ctx, out);
+            }
+            out.emit_byte(b'[')?;
+            let mut first = true;
+            if compact {
+                for_each_array_element(json, open, end, side, |_, s, e| {
+                    stream_projection_elem_compact(
+                        json,
+                        s,
+                        e,
+                        child.as_ref(),
+                        omit_nulls,
+                        ctx,
+                        out,
+                        &mut first,
+                    )
+                })?;
+                out.emit_byte(b']')?;
+            } else {
+                for_each_array_element(json, open, end, side, |_, s, e| {
+                    stream_projection_elem(
+                        json,
+                        s,
+                        e,
+                        child.as_ref(),
+                        omit_nulls,
+                        ctx,
+                        out,
+                        &mut first,
+                    )
+                })?;
+                emit_close_array(ctx, out)?;
+            }
+            return Ok(());
+        }
+        ArraySelect::Filter { pred, each } => {
+            out.emit_byte(b'[')?;
+            let mut first = true;
+            let mut kept: Vec<(usize, usize)> = Vec::new();
+            for_each_array_element(json, open, end, side, |_, s, e| {
+                let pv = eval_buf(json, s, e, pred, ctx)?;
+                if is_truthy(&pv) {
+                    kept.push((s, e));
+                }
+                Ok(())
+            })?;
+            if compact {
+                for (s, e) in kept {
+                    stream_projection_elem_compact(
+                        json,
+                        s,
+                        e,
+                        each.as_ref(),
+                        omit_nulls,
+                        ctx,
+                        out,
+                        &mut first,
+                    )?;
+                }
+                out.emit_byte(b']')?;
+            } else {
+                for (s, e) in kept {
+                    stream_projection_elem(
+                        json,
+                        s,
+                        e,
+                        each.as_ref(),
+                        omit_nulls,
+                        ctx,
+                        out,
+                        &mut first,
+                    )?;
+                }
+                emit_close_array(ctx, out)?;
+            }
+        }
+        ArraySelect::Slice {
+            start: st,
+            end: en,
+            step,
+            each,
+        } => {
+            if step == &Some(0) {
+                return Err(Error::Jmespath {
+                    msg: "Invalid slice: step cannot be 0",
+                });
+            }
+            out.emit_byte(b'[')?;
+            let mut first = true;
+            if let Some(ai) = array_side_table(json, open, ctx.index) {
+                let idxs = resolve_slice(ai.len(), *st, *en, *step);
+                for i in idxs {
+                    let s = ai.element_start(i).unwrap();
+                    let e = skip_value_smart(json, s, ctx.index)?;
+                    if compact {
+                        stream_projection_elem_compact(
+                            json,
+                            s,
+                            e,
+                            each.as_ref(),
+                            omit_nulls,
+                            ctx,
+                            out,
+                            &mut first,
+                        )?;
+                    } else {
+                        stream_projection_elem(
+                            json,
+                            s,
+                            e,
+                            each.as_ref(),
+                            omit_nulls,
+                            ctx,
+                            out,
+                            &mut first,
+                        )?;
+                    }
+                }
+            } else {
+                let starts = array_element_starts_scan(json, open, end)?;
+                let idxs = resolve_slice(starts.len(), *st, *en, *step);
+                for i in idxs {
+                    let s = starts[i] as usize;
+                    let e = skip_value(json, s)?;
+                    if compact {
+                        stream_projection_elem_compact(
+                            json,
+                            s,
+                            e,
+                            each.as_ref(),
+                            omit_nulls,
+                            ctx,
+                            out,
+                            &mut first,
+                        )?;
+                    } else {
+                        stream_projection_elem(
+                            json,
+                            s,
+                            e,
+                            each.as_ref(),
+                            omit_nulls,
+                            ctx,
+                            out,
+                            &mut first,
+                        )?;
+                    }
+                }
+            }
+            if compact {
+                out.emit_byte(b']')?;
+            } else {
+                emit_close_array(ctx, out)?;
+            }
+        }
+        ArraySelect::Indices(_) => unreachable!("indices handled before stream"),
+    }
+    Ok(())
+}
+
+/// Parallel `[*]` over a side-table: each Rayon task owns a contiguous index range and
+/// writes its own buffer; the parent concatenates with commas. Domain-agnostic — any
+/// array shape that has been indexed.
+#[cfg(feature = "parallel")]
+fn emit_array_each_parallel(
+    json: &[u8],
+    open: usize,
+    ai: &crate::index::ArrayIndex,
+    child: &SelectExpr,
+    omit_nulls: bool,
+    ctx: &EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    use rayon::prelude::*;
+
+    let _ = open;
+    let n = ai.len();
+    let threads = rayon::current_num_threads().max(1);
+    let chunk = (n + threads - 1) / threads;
+    let plan = ctx.plan;
+    let index = ctx.index;
+    let base_depth = ctx.depth;
+
+    // IndexedDocument / ArrayIndex are read-only here; element spans never overlap writes.
+    let parts: Vec<Result<Vec<u8>, Error>> = (0..threads)
+        .into_par_iter()
+        .map(|c| {
+            let lo = c * chunk;
+            let hi = (lo + chunk).min(n);
+            if lo >= hi {
+                return Ok(Vec::new());
+            }
+            let mut buf = Vec::new();
+            let mut local = EmitCtx {
+                plan,
+                depth: base_depth,
+                index,
+                allow_parallel: false, // nested parallel not useful
+            };
+            let mut first = true;
+            for i in lo..hi {
+                let s = match ai.element_start(i) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let e = skip_value(json, s)?;
+                // Parallel gate is Compact-only; skip pretty depth bookkeeping.
+                stream_projection_elem_compact(
+                    json,
+                    s,
+                    e,
+                    child,
+                    omit_nulls,
+                    &mut local,
+                    &mut buf,
+                    &mut first,
+                )?;
+            }
+            Ok(buf)
+        })
+        .collect();
+
+    out.emit_byte(b'[')?;
+    let mut any = false;
+    for part in parts {
+        let part = part?;
+        if part.is_empty() {
+            continue;
+        }
+        if any {
+            out.emit_byte(b',')?;
+        }
+        out.emit_bytes(&part)?;
+        any = true;
+    }
+    // Pretty close not used (Compact only).
+    out.emit_byte(b']')?;
+    Ok(())
+}
+
+/// Compact list-projection element: comma + value only (no indent depth, no pretty hooks).
+///
+/// Used exclusively when [`ProjectStyle::Compact`]. Parallel Each also lands here via the
+/// same Compact-only gate. Pretty / PreserveSource must use [`stream_projection_elem`].
+#[inline]
+fn stream_projection_elem_compact(
+    json: &[u8],
+    s: usize,
+    e: usize,
+    child: &SelectExpr,
+    omit_nulls: bool,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+    first: &mut bool,
+) -> Result<(), Error> {
+    if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+        if omit_nulls && trim_json(&json[s..e]) == b"null" {
+            return Ok(());
+        }
+        if !*first {
+            out.emit_byte(b',')?;
+        }
+        out.emit_bytes(&json[s..e])?;
+        *first = false;
+        return Ok(());
+    }
+    // Multi-select / objects are not bare JSON null; stream straight to `out`.
+    let stream_direct = !omit_nulls
+        || matches!(
+            child,
+            SelectExpr::MultiSelectHash(_)
+                | SelectExpr::MultiSelectList(_)
+                | SelectExpr::Object(_)
+                | SelectExpr::Literal(_)
+        );
+    if stream_direct {
+        if !*first {
+            out.emit_byte(b',')?;
+        }
+        emit_value(json, s, e, child, ctx, out)?;
+        *first = false;
+        return Ok(());
+    }
+    let mut piece = Vec::new();
+    emit_value(json, s, e, child, ctx, &mut piece)?;
+    if omit_nulls && trim_json(&piece) == b"null" {
+        return Ok(());
+    }
+    if !*first {
+        out.emit_byte(b',')?;
+    }
+    out.emit_bytes(&piece)?;
+    *first = false;
+    Ok(())
+}
+
+/// Emit one list-projection element with pretty / PreserveSource bookkeeping.
+///
+/// Updates `first` when something is written. Prefer [`stream_projection_elem_compact`]
+/// on the default Compact bulk path.
+fn stream_projection_elem(
+    json: &[u8],
+    s: usize,
+    e: usize,
+    child: &SelectExpr,
+    omit_nulls: bool,
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+    first: &mut bool,
+) -> Result<(), Error> {
+    if matches!(child, SelectExpr::Identity | SelectExpr::Current) {
+        if omit_nulls && trim_json(&json[s..e]) == b"null" {
+            return Ok(());
+        }
+        if !*first {
+            out.emit_byte(b',')?;
+        }
+        maybe_pretty_newline_indent(ctx, out, true)?;
+        ctx.depth += 1;
+        out.emit_bytes(&json[s..e])?;
+        ctx.depth -= 1;
+        *first = false;
+        return Ok(());
+    }
+    // Multi-select / objects are not bare JSON null; stream straight to `out`.
+    let stream_direct = !omit_nulls
+        || matches!(
+            child,
+            SelectExpr::MultiSelectHash(_)
+                | SelectExpr::MultiSelectList(_)
+                | SelectExpr::Object(_)
+                | SelectExpr::Literal(_)
+        );
+    if stream_direct {
+        if !*first {
+            out.emit_byte(b',')?;
+        }
+        maybe_pretty_newline_indent(ctx, out, true)?;
+        ctx.depth += 1;
+        emit_value(json, s, e, child, ctx, out)?;
+        ctx.depth -= 1;
+        *first = false;
+        return Ok(());
+    }
+    let mut piece = Vec::new();
+    emit_value(json, s, e, child, ctx, &mut piece)?;
+    if omit_nulls && trim_json(&piece) == b"null" {
+        return Ok(());
+    }
+    if !*first {
+        out.emit_byte(b',')?;
+    }
+    maybe_pretty_newline_indent(ctx, out, true)?;
+    ctx.depth += 1;
+    out.emit_bytes(&piece)?;
+    ctx.depth -= 1;
+    *first = false;
+    Ok(())
+}
+
 fn emit_array(
     json: &[u8],
     start: usize,
@@ -721,30 +1948,42 @@ fn emit_array(
     ctx: &mut EmitCtx<'_>,
     out: &mut impl EmitOut,
 ) -> Result<(), Error> {
-    let elems = match collect_array_elems(json, start, end) {
-        Ok(e) => e,
-        Err(Error::TypeMismatch { .. }) if soft_null(ctx) => {
+    // Type-check array open early (soft-null for non-arrays under Skip policy).
+    let open = skip_whitespace(json, start);
+    if open >= json.len() || json[open] != b'[' {
+        if soft_null(ctx) {
             out.emit_bytes(b"null")?;
             return Ok(());
         }
-        Err(e) => return Err(e),
-    };
+        return Err(Error::TypeMismatch {
+            expected: "array",
+            found: type_name_at(json, open),
+        });
+    }
+
+    // Compact/Pretty list projections stream without per-element AST clones or a
+    // full `kept` buffer (critical for products[*].{…} on 25k-element catalogs).
+    // PreserveSource still materializes for whitespace fidelity.
+    if !matches!(ctx.plan.style, ProjectStyle::PreserveSource)
+        && matches!(
+            sel,
+            ArraySelect::Each(_) | ArraySelect::Filter { .. } | ArraySelect::Slice { .. }
+        )
+    {
+        return emit_array_stream(json, open, end, sel, ctx, out);
+    }
+
     let mut kept: Vec<(usize, usize, SelectExpr)> = Vec::new();
     match sel {
-        ArraySelect::Each(child) => {
-            for &(s, e) in &elems {
-                kept.push((s, e, (*child.as_ref()).clone()));
-            }
-        }
+        // ── Sparse index: never materialize sibling spans ─────────────────
         ArraySelect::Indices(map) => {
             let mut keys: Vec<i64> = map.keys().copied().collect();
             keys.sort_unstable();
             // JMESPath: a single index expression yields the element, not a 1-array.
             if map.len() == 1 {
                 let k = keys[0];
-                match resolve_index(k, elems.len()) {
-                    Some(i) => {
-                        let (s, e) = elems[i];
+                match nth_array_element(json, open, end, k, ctx.index)? {
+                    Some((s, e)) => {
                         return emit_value(json, s, e, map.get(&k).unwrap(), ctx, out);
                     }
                     None if ctx.plan.missing == MissingPolicy::Error => {
@@ -756,37 +1995,56 @@ fn emit_array(
                     }
                 }
             }
-            for k in keys {
-                match resolve_index(k, elems.len()) {
-                    Some(i) => {
-                        let (s, e) = elems[i];
-                        kept.push((s, e, map.get(&k).unwrap().clone()));
-                    }
-                    None if ctx.plan.missing == MissingPolicy::Error => {
-                        return Err(Error::PathNotFound);
-                    }
-                    None => {}
-                }
+            let resolved = resolve_indices_sparse(json, open, end, &keys, ctx.index)?;
+            if ctx.plan.missing == MissingPolicy::Error && resolved.len() != keys.len() {
+                return Err(Error::PathNotFound);
+            }
+            for (s, e, k) in resolved {
+                kept.push((s, e, map.get(&k).unwrap().clone()));
             }
         }
+        // ── Slice: with side-table only touch selected indices ────────────
         ArraySelect::Slice {
             start: st,
             end: en,
             step,
             each,
         } => {
-            for i in resolve_slice(elems.len(), *st, *en, *step) {
-                let (s, e) = elems[i];
-                kept.push((s, e, (*each.as_ref()).clone()));
+            if step == &Some(0) {
+                return Err(Error::Jmespath {
+                    msg: "Invalid slice: step cannot be 0",
+                });
+            }
+            if let Some(ai) = array_side_table(json, open, ctx.index) {
+                for i in resolve_slice(ai.len(), *st, *en, *step) {
+                    let (s, e) = ai.element_value_span(json, i)?;
+                    kept.push((s, e, (*each.as_ref()).clone()));
+                }
+            } else {
+                // No side-table: need length for slice bounds → start offsets once.
+                let starts = array_element_starts_scan(json, open, end)?;
+                for i in resolve_slice(starts.len(), *st, *en, *step) {
+                    let s = starts[i] as usize;
+                    let e = skip_value(json, s)?;
+                    kept.push((s, e, (*each.as_ref()).clone()));
+                }
             }
         }
+        // ── Each / filter: stream elements; only store kept ───────────────
+        ArraySelect::Each(child) => {
+            for_each_array_element(json, open, end, ctx.index, |_i, s, e| {
+                kept.push((s, e, (*child.as_ref()).clone()));
+                Ok(())
+            })?;
+        }
         ArraySelect::Filter { pred, each } => {
-            for &(s, e) in &elems {
+            for_each_array_element(json, open, end, ctx.index, |_i, s, e| {
                 let pv = eval_buf(json, s, e, pred, ctx)?;
                 if is_truthy(&pv) {
                     kept.push((s, e, (*each.as_ref()).clone()));
                 }
-            }
+                Ok(())
+            })?;
         }
     }
 
@@ -798,10 +2056,9 @@ fn emit_array(
     );
     let arr_open = skip_whitespace(json, start);
     out.emit_byte(b'[')?;
-    // PreserveSource: whitespace after `[` when first kept is first element.
+    // PreserveSource: whitespace after `[` up to first kept element (full tree replay).
     if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
         && let Some((fs, _, _)) = kept.first()
-        && elems.first().is_some_and(|&(s, _)| s == *fs)
     {
         let between = &json[arr_open + 1..*fs];
         if is_ws_only(between) {
@@ -810,17 +2067,28 @@ fn emit_array(
     }
     let mut first = true;
     let mut prev_end: Option<usize> = None;
+    let mut last_emitted_end: Option<usize> = None;
     for (s, e, child) in &kept {
-        let mut piece = Vec::new();
-        emit_value(json, *s, *e, child, ctx, &mut piece)?;
-        if omit_nulls && trim_json(&piece) == b"null" {
+        // Identity / pure leaves: stream without intermediate piece when possible.
+        let is_identity = matches!(child, SelectExpr::Identity | SelectExpr::Current);
+        let piece = if is_identity {
+            None
+        } else {
+            let mut piece = Vec::new();
+            emit_value(json, *s, *e, child, ctx, &mut piece)?;
+            if omit_nulls && trim_json(&piece) == b"null" {
+                continue;
+            }
+            Some(piece)
+        };
+        if omit_nulls && is_identity && trim_json(&json[*s..*e]) == b"null" {
             continue;
         }
         if !first {
             if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
                 && let Some(pe) = prev_end
             {
-                // Copy original comma + whitespace between consecutive source elements.
+                // Replay original comma + whitespace between source element ends.
                 let p = skip_whitespace(json, pe);
                 if p < json.len() && json[p] == b',' {
                     out.emit_byte(b',')?;
@@ -829,7 +2097,19 @@ fn emit_array(
                         out.emit_bytes(between)?;
                     }
                 } else {
+                    // Non-adjacent kept elements: still emit comma; copy trailing
+                    // ws before current element if present.
                     out.emit_byte(b',')?;
+                    let between = &json[pe..*s];
+                    // Skip non-ws (dropped elements); take only trailing ws before curr.
+                    let mut i = between.len();
+                    while i > 0 && matches!(between[i - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                        i -= 1;
+                    }
+                    let tail = &between[i..];
+                    if !tail.is_empty() {
+                        out.emit_bytes(tail)?;
+                    }
                 }
             } else {
                 out.emit_byte(b',')?;
@@ -837,10 +2117,57 @@ fn emit_array(
         }
         maybe_pretty_newline_indent(ctx, out, true)?;
         ctx.depth += 1;
-        out.emit_bytes(&piece)?;
+        if let Some(ref piece) = piece {
+            out.emit_bytes(piece)?;
+        } else {
+            out.emit_bytes(&json[*s..*e])?;
+        }
         ctx.depth -= 1;
         first = false;
         prev_end = Some(*e);
+        last_emitted_end = Some(*e);
+    }
+    // PreserveSource: whitespace after last kept element before `]`.
+    if matches!(ctx.plan.style, ProjectStyle::PreserveSource)
+        && let Some(le) = last_emitted_end
+    {
+        let close = {
+            let mut p = skip_whitespace(json, le);
+            while p < end && json[p] != b']' {
+                // skip dropped elements / commas
+                if json[p] == b',' {
+                    p += 1;
+                    p = skip_whitespace(json, p);
+                    if p < end && json[p] != b']' {
+                        let _ = skip_value(json, p).map(|n| p = n);
+                        p = skip_whitespace(json, p);
+                    }
+                } else {
+                    break;
+                }
+            }
+            p
+        };
+        if close < json.len() && json[close] == b']' {
+            // Prefer original trailing ws immediately before `]` from last value.
+            let mut ws_start = le;
+            let mut ws_end = le;
+            let mut p = le;
+            while p < close {
+                if matches!(json[p], b' ' | b'\t' | b'\n' | b'\r') {
+                    if ws_end == ws_start {
+                        ws_start = p;
+                    }
+                    ws_end = p + 1;
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+            if ws_end > ws_start {
+                out.emit_bytes(&json[ws_start..ws_end])?;
+            }
+        }
     }
     emit_close_array(ctx, out)?;
     let _ = end;
@@ -890,8 +2217,9 @@ fn emit_call(
                 // Already a JSON string.
                 out.emit_bytes(t)?;
             } else {
-                // Numbers, bools, null, objects, arrays → JSON text as a string value.
-                write_json_string_out(out, std::str::from_utf8(t).unwrap_or(""))?;
+                // Compact form (strip insignificant whitespace) then JSON-string-escape.
+                let compact = compact_json(t);
+                write_json_string_out(out, std::str::from_utf8(&compact).unwrap_or(""))?;
             }
             Ok(())
         }
@@ -1100,24 +2428,22 @@ fn emit_call(
             let elems = collect_array_elems(arr, 0, arr.len())?;
             let mut keyed: Vec<(Vec<u8>, usize, usize)> = Vec::with_capacity(elems.len());
             for &(s, e) in &elems {
-                let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
-                keyed.push((trim_json(&key).to_vec(), s, e));
+                let key = eval_buf(arr, s, e, &key_expr, ctx)?;
+                let key = trim_json(&key).to_vec();
+                // sort_by requires comparable non-null keys of a single type.
+                if key.as_slice() == b"null" {
+                    return Err(Error::Jmespath {
+                        msg: "sort_by key evaluated to null",
+                    });
+                }
+                keyed.push((key, s, e));
             }
             for i in 0..keyed.len() {
                 for j in i + 1..keyed.len() {
-                    if keyed[i].0 != b"null" && keyed[j].0 != b"null" {
-                        let _ = cmp_sort_keys_strict(&keyed[i].0, &keyed[j].0)?;
-                    }
+                    let _ = cmp_sort_keys_strict(&keyed[i].0, &keyed[j].0)?;
                 }
             }
-            keyed.sort_by(|a, b| {
-                match (a.0.as_slice() == b"null", b.0.as_slice() == b"null") {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => cmp_sort_keys(&a.0, &b.0),
-                }
-            });
+            keyed.sort_by(|a, b| cmp_sort_keys(&a.0, &b.0));
             out.emit_byte(b'[')?;
             for (i, (_, s, e)) in keyed.iter().enumerate() {
                 if i > 0 {
@@ -1209,10 +2535,13 @@ fn emit_call(
             let mut best_i = 0usize;
             let mut best_key: Option<Vec<u8>> = None;
             for (i, &(s, e)) in elems.iter().enumerate() {
-                let key = eval_buf(arr, s, e, &key_expr, ctx).unwrap_or_else(|_| b"null".to_vec());
+                let key = eval_buf(arr, s, e, &key_expr, ctx)?;
                 let key = trim_json(&key).to_vec();
+                // Any null key is a type error (missing fields, etc.).
                 if key.as_slice() == b"null" {
-                    continue;
+                    return Err(Error::Jmespath {
+                        msg: "max_by/min_by key evaluated to null",
+                    });
                 }
                 match &best_key {
                     None => {
@@ -1617,35 +2946,232 @@ fn emit_multi_hash(
     ctx: &mut EmitCtx<'_>,
     out: &mut impl EmitOut,
 ) -> Result<(), Error> {
+    // Pure-field multi-select (`{a: a, b: b}` or renames `{out: src}`): **one** object
+    // scan for all requested keys (any domain / key names). Avoids N× full key hunts.
+    if !fields.is_empty()
+        && fields
+            .iter()
+            .all(|f| matches!(f.expr, SelectExpr::Field(_) | SelectExpr::FieldQuoted(_)))
+    {
+        return emit_multi_hash_fields_one_pass(json, start, end, fields, ctx, out);
+    }
+
+    // Mixed / nested exprs: evaluate each field expression independently.
+    let compact = matches!(ctx.plan.style, ProjectStyle::Compact);
     out.emit_byte(b'{')?;
     let mut wrote = false;
     for f in fields {
         let mut val = Vec::new();
         match emit_value(json, start, end, &f.expr, ctx, &mut val) {
             Ok(()) => {}
-            Err(Error::PathNotFound) if ctx.plan.missing == MissingPolicy::Skip => continue,
+            Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. })
+                if ctx.plan.missing == MissingPolicy::Skip =>
+            {
+                // Nested expr failed soft → JSON null (JMESPath multi-select).
+                if wrote {
+                    out.emit_byte(b',')?;
+                }
+                if !compact {
+                    maybe_pretty_newline_indent(ctx, out, true)?;
+                }
+                write_json_key(out, &f.output_key)?;
+                if compact {
+                    out.emit_byte(b':')?;
+                } else {
+                    match ctx.plan.style {
+                        ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
+                        _ => out.emit_byte(b':')?,
+                    }
+                }
+                out.emit_bytes(b"null")?;
+                wrote = true;
+                continue;
+            }
             Err(e) => return Err(e),
-        }
-        if val.is_empty() && ctx.plan.missing == MissingPolicy::Skip {
-            // treat empty as skip only if PathNotFound was converted — keep empty literals
         }
         if wrote {
             out.emit_byte(b',')?;
         }
+        if !compact {
+            maybe_pretty_newline_indent(ctx, out, true)?;
+        }
+        write_json_key(out, &f.output_key)?;
+        if compact {
+            out.emit_byte(b':')?;
+            out.emit_bytes(&val)?;
+        } else {
+            match ctx.plan.style {
+                ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
+                _ => out.emit_byte(b':')?,
+            }
+            ctx.depth += 1;
+            out.emit_bytes(&val)?;
+            ctx.depth -= 1;
+        }
+        wrote = true;
+    }
+    if compact {
+        out.emit_byte(b'}')?;
+    } else {
+        emit_close_object(ctx, out)?;
+    }
+    let _ = end;
+    Ok(())
+}
+
+/// Collect pure-field multi-select values in **one** left-to-right object scan.
+///
+/// - Works for any key set / rename map (`{title: name}` reads on-wire `name`).
+/// - Stops early once every requested key is found (skips trailing noise fields).
+/// - Uses object side-tables when indexed.
+/// - Missing keys → `null` under [`MissingPolicy::Skip`] (JMESPath multi-select).
+/// - Emit phase: under [`ProjectStyle::Compact`] writes `{k:v,...}` with no indent
+///   depth or pretty colon/newline bookkeeping (see [`emit_multi_hash_from_spans`]).
+fn emit_multi_hash_fields_one_pass(
+    json: &[u8],
+    start: usize,
+    end: usize,
+    fields: &[HashField],
+    ctx: &mut EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    use std::collections::HashMap;
+
+    // on-wire key bytes → output slot indices (same source field can map to several outputs).
+    let mut want: HashMap<Vec<u8>, Vec<usize>> = HashMap::with_capacity(fields.len());
+    for (i, f) in fields.iter().enumerate() {
+        let name = match &f.expr {
+            SelectExpr::Field(k) | SelectExpr::FieldQuoted(k) => escape_json_key(k),
+            _ => unreachable!("caller guarantees pure Field/FieldQuoted"),
+        };
+        want.entry(name.into_bytes()).or_default().push(i);
+    }
+
+    let mut spans: Vec<Option<(usize, usize)>> = vec![None; fields.len()];
+    let obj_start = skip_whitespace(json, start);
+    if obj_start >= json.len() || json[obj_start] != b'{' {
+        if soft_null(ctx) {
+            return emit_multi_hash_from_spans(fields, &spans, json, ctx, out);
+        }
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: type_name_at(json, obj_start),
+        });
+    }
+
+    // O(k) via object key map when this object was indexed.
+    if let Some(doc) = ctx.index {
+        if let Some(oi) = doc.object_index_at_open(obj_start) {
+            for (wire, idxs) in &want {
+                if let Some((vs, ve)) = oi.get(wire) {
+                    for &i in idxs {
+                        spans[i] = Some((vs, ve));
+                    }
+                }
+            }
+            return emit_multi_hash_from_spans(fields, &spans, json, ctx, out);
+        }
+    }
+
+    // Single linear scan: each member visited at most once.
+    let mut pos = obj_start + 1;
+    let mut remaining = want.len();
+    while remaining > 0 {
+        pos = skip_whitespace(json, pos);
+        if pos >= end || json.get(pos) == Some(&b'}') {
+            break;
+        }
+        if json.get(pos) != Some(&b'"') {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected object key in multi-select",
+            });
+        }
+        let key_end = find_string_end(json, pos + 1)?;
+        let key_on_wire = &json[pos + 1..key_end];
+        pos = key_end + 1;
+        pos = skip_whitespace(json, pos);
+        if pos >= json.len() || json[pos] != b':' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected ':' after object key",
+            });
+        }
+        pos += 1;
+        pos = skip_whitespace(json, pos);
+        let vs = pos;
+        let ve = skip_value_smart(json, vs, ctx.index)?;
+        if let Some(idxs) = want.get(key_on_wire) {
+            for &i in idxs {
+                spans[i] = Some((vs, ve));
+            }
+            remaining -= 1;
+        }
+        pos = skip_whitespace(json, ve);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+        }
+    }
+
+    emit_multi_hash_from_spans(fields, &spans, json, ctx, out)
+}
+
+/// Write a multi-select hash from pre-collected value spans.
+///
+/// **Compact bulk path:** no `depth` updates, no pretty newline/indent, colon is a
+/// single `:` byte, close is a single `}`. This is the hot path for thin-card
+/// `[*].{a: a, b: b}` over large arrays. Pretty keeps full indent bookkeeping.
+fn emit_multi_hash_from_spans(
+    fields: &[HashField],
+    spans: &[Option<(usize, usize)>],
+    json: &[u8],
+    ctx: &EmitCtx<'_>,
+    out: &mut impl EmitOut,
+) -> Result<(), Error> {
+    if ctx.plan.missing == MissingPolicy::Error {
+        for sp in spans.iter() {
+            if sp.is_none() {
+                return Err(Error::PathNotFound);
+            }
+        }
+    }
+
+    // Fast path: Compact (default) — pure bytes, no style branches per field.
+    if matches!(ctx.plan.style, ProjectStyle::Compact) {
+        out.emit_byte(b'{')?;
+        for (i, f) in fields.iter().enumerate() {
+            if i > 0 {
+                out.emit_byte(b',')?;
+            }
+            write_json_key(out, &f.output_key)?;
+            out.emit_byte(b':')?;
+            match spans[i] {
+                Some((vs, ve)) => out.emit_bytes(&json[vs..ve])?,
+                None => out.emit_bytes(b"null")?,
+            }
+        }
+        out.emit_byte(b'}')?;
+        return Ok(());
+    }
+
+    out.emit_byte(b'{')?;
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.emit_byte(b',')?;
+        }
         maybe_pretty_newline_indent(ctx, out, true)?;
-        // key
         write_json_key(out, &f.output_key)?;
         match ctx.plan.style {
             ProjectStyle::Pretty { .. } => out.emit_bytes(b": ")?,
-            _ => out.emit_byte(b':')?,
+            ProjectStyle::Compact | ProjectStyle::PreserveSource => out.emit_byte(b':')?,
         }
-        ctx.depth += 1;
-        out.emit_bytes(&val)?;
-        ctx.depth -= 1;
-        wrote = true;
+        match spans[i] {
+            Some((vs, ve)) => out.emit_bytes(&json[vs..ve])?,
+            // JMESPath multi-select hash: missing → null (Skip policy).
+            None => out.emit_bytes(b"null")?,
+        }
     }
     emit_close_object(ctx, out)?;
-    let _ = end;
     Ok(())
 }
 
@@ -1657,6 +3183,7 @@ fn emit_multi_list(
     ctx: &mut EmitCtx<'_>,
     out: &mut impl EmitOut,
 ) -> Result<(), Error> {
+    let compact = matches!(ctx.plan.style, ProjectStyle::Compact);
     out.emit_byte(b'[')?;
     let mut wrote = false;
     for expr in items {
@@ -1669,13 +3196,21 @@ fn emit_multi_list(
         if wrote {
             out.emit_byte(b',')?;
         }
-        maybe_pretty_newline_indent(ctx, out, true)?;
-        ctx.depth += 1;
-        out.emit_bytes(&val)?;
-        ctx.depth -= 1;
+        if compact {
+            out.emit_bytes(&val)?;
+        } else {
+            maybe_pretty_newline_indent(ctx, out, true)?;
+            ctx.depth += 1;
+            out.emit_bytes(&val)?;
+            ctx.depth -= 1;
+        }
         wrote = true;
     }
-    emit_close_array(ctx, out)?;
+    if compact {
+        out.emit_byte(b']')?;
+    } else {
+        emit_close_array(ctx, out)?;
+    }
     let _ = end;
     Ok(())
 }
@@ -1685,8 +3220,10 @@ fn flatten_emit(mid: &[u8], ctx: &mut EmitCtx<'_>, out: &mut impl EmitOut) -> Re
     let end = skip_value(mid, start)?;
     let start = skip_whitespace(mid, start);
     if start >= mid.len() || mid[start] != b'[' {
-        // non-array: identity
-        out.emit_bytes(&mid[start..end])?;
+        // JMESPath: flatten of non-array → null
+        out.emit_bytes(b"null")?;
+        let _ = end;
+        let _ = ctx;
         return Ok(());
     }
     let outer = collect_array_elems(mid, start, end)?;
@@ -1721,6 +3258,39 @@ fn write_json_key(out: &mut impl EmitOut, key: &str) -> Result<(), Error> {
     write_json_string_out(out, key)
 }
 
+/// Strip insignificant whitespace outside JSON strings (for `to_string` compactness).
+fn compact_json(v: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    while i < v.len() {
+        let b = v[i];
+        if in_string {
+            out.push(b);
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                out.push(b);
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => {}
+            _ => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
 
 fn emit_object_key(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { .. }) {
@@ -1744,7 +3314,9 @@ fn emit_colon(json: &[u8], m: &Member<'_>, ctx: &EmitCtx<'_>, out: &mut impl Emi
     Ok(())
 }
 
+#[inline]
 fn emit_close_object(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
+    // Compact / PreserveSource: just `}`. Pretty may need a closing indent line.
     if matches!(ctx.plan.style, ProjectStyle::Pretty { indent: n } if n > 0)
         && out.last_byte() != Some(b'{')
     {
@@ -1755,7 +3327,9 @@ fn emit_close_object(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Er
     Ok(())
 }
 
+#[inline]
 fn emit_close_array(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Error> {
+    // Compact / PreserveSource: just `]`. Pretty may need a closing indent line.
     if matches!(ctx.plan.style, ProjectStyle::Pretty { indent: n } if n > 0)
         && out.last_byte() != Some(b'[')
     {
@@ -1766,6 +3340,9 @@ fn emit_close_array(ctx: &EmitCtx<'_>, out: &mut impl EmitOut) -> Result<(), Err
     Ok(())
 }
 
+/// Pretty-only newline + indent before an array/object element. **No-op on Compact**
+/// (callers on the Compact bulk path should not invoke this at all).
+#[inline]
 fn maybe_pretty_newline_indent(ctx: &EmitCtx<'_>, out: &mut impl EmitOut, for_element: bool) -> Result<(), Error> {
     if matches!(ctx.plan.style, ProjectStyle::Pretty { .. }) && for_element {
         out.emit_byte(b'\n')?;

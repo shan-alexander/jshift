@@ -220,42 +220,27 @@ fn jmespath_compliance_full_suite_gate() {
         stats.unexpected.len()
     );
 
-    // Floors — raise as coverage improves.
+    // Floors — full official suite (ex-benchmarks) must pass with zero residuals.
     assert!(
-        stats.pass >= 650,
-        "expected >= 650 value passes, got {}",
+        stats.pass >= 740,
+        "expected >= 740 value passes, got {}",
         stats.pass
     );
     assert!(
-        stats.pass + stats.error_ok >= 800,
-        "expected >= 800 pass+error_ok, got {}",
+        stats.pass + stats.error_ok >= 880,
+        "expected >= 880 pass+error_ok, got {}",
         stats.pass + stats.error_ok
     );
-    assert!(
-        stats.unexpected.len() <= 100,
-        "too many residual mismatches ({})",
-        stats.unexpected.len()
-    );
-
-    // Full suite still fails CI on unexpected mismatches (strict).
-    // If this is too harsh while growing coverage, convert remaining to is_unsupported.
     if !stats.unexpected.is_empty() {
-        let show = stats.unexpected.len().min(25);
+        let show = stats.unexpected.len().min(40);
         for line in stats.unexpected.iter().take(show) {
             eprintln!("FAIL: {line}");
         }
         if stats.unexpected.len() > show {
             eprintln!("... and {} more", stats.unexpected.len() - show);
         }
-        // Soft gate: allow residual failures but require tier A + floors.
-        // Report count for visibility; fail only if residual is huge (regression).
-        assert!(
-            stats.unexpected.len() < 400,
-            "too many unexpected failures ({}); possible regression",
-            stats.unexpected.len()
-        );
-        eprintln!(
-            "note: {} residual full-suite mismatches (allowed under soft gate; tier A is strict)",
+        panic!(
+            "full suite has {} residual mismatches (must be 0)",
             stats.unexpected.len()
         );
     }

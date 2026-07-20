@@ -2,10 +2,490 @@
 
 **jshift** is a schema-guided, **100% safe Rust** JSON path reader and **in-place** mutator.
 
-It is built for high-performance middleboxes, API gateways, webhook routers, edge filters, and data pipelines that need to **selectively query and modify** JSON on raw byte buffers without the full AST allocate / serialize cycle of traditional parsers.
+![safe Rust](https://img.shields.io/badge/safe-Rust-brightgreen)
+![zero-copy](https://img.shields.io/badge/zero-copy-blue)
+![raw-bytes](https://img.shields.io/badge/raw-bytes-red)
+![in-place](https://img.shields.io/badge/in--place-mutation-blueviolet)
+![fast-json](https://img.shields.io/badge/fast-json-orange)
 
-If you only need “read one field,” other path engines exist.  
-If you need **read + rewrite the same buffer** under real production constraints (safe Rust, no second serialize pass), **jshift is the product**.
+It's built for high-performance; selectively **query** and **modify** JSON on **raw byte buffers** without the full AST allocate / serialize cycle of traditional parsers. In other words:
+
+> `jshift` can be used in place of `serde` for 
+
+> 🚀 **+2x to +20000x speed gains** 🚀
+
+> on common JSON tasks.
+
+`jshift` is ideal for optimizing **data engineering** pipelines, API gateways and request/response transformers, webhook routers, event processors, telemetry, edge filters, and any system that handles JSON.
+
+- If you only need “read a field from a JSON message” other path engines exist, like `gjson`.  
+- If you need **read + rewrite the same buffer** under real production constraints (safe Rust, no second serialize pass), **jshift is the product**. 
+
+
+**A simple analogy:** most JSON libraries ask you to *unpack the whole filing cabinet* to change 1 paper document. jshift is built for the scenario where you already know which cabinet drawer and folder you need, and you want to make your find/edit/extract without unpacking and repacking every paper in every drawer.
+
+Simple mental model:
+
+- **Find**: Extract the value(s) you're looking for, via a slice of the original bytes 
+- **Mutate**: Edit the same Vec<u8> of raw bytes without making a copy or reading into memory 
+- **Project** (as in field projection): Output new smaller JSON document (or NDJSON lines) efficiently
+
+That’s the whole product: peek, patch same buffer, and/or project thinner JSON, without unpacking and reading the whole filing cabinet.
+
+---
+
+## Benchmarks on JSON tasks
+
+The bench is designed to provide a fair comparison between jshift, serde, gjson, and sonic-rs.
+
+**JSON files used on each bench task:**
+
+| Scale |  Size |
+| :--- |  :--- |
+| **Small** | **~500 KiB** |
+| **Medium** | **~10 MiB** |
+| **Large (find/mutate)** |  **~50 MiB** |
+| **Large (catalog)** | **~338 MiB**, ~25k products from a Shopify public API |
+
+---
+
+### Benchmark Task 1: Key-first find
+
+Hot field is the **first** key; a bulk array trails behind.
+
+- **APIs**
+  - **jshift:** `find_value(json, &parse_path("target"))`
+  - **serde:** `serde_json::from_slice` → `v["target"]`
+  - **gjson:** `gjson::get(s, "target")`
+  - **sonic-rs:** `sonic_rs::get(json, &pointer!["target"])`
+- **Why jshift is fast:** stops at the first key; never materializes the trailing bulk. Serde always builds a full tree of the whole buffer.
+- **Ratios (medium):** vs serde **~3 000 000×**; vs gjson **~1.5×**; vs sonic **~2.1×**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (~50 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | **jshift** | **~80 ns** | **~80 ns** | **~80 ns** |
+  | serde | ~12 ms | ~253 ms | ~856 ms |
+  | gjson | ~140 ns | ~120 ns | ~140 ns |
+  | sonic | ~190 ns | ~171 ns | ~241 ns |
+
+- **When to use:** default API / gateway shape — “Is `status` ok?” near the root. Common production case; **not** the adversarial key-last row.
+
+#### Code Example of Key-first find
+
+```rust
+use jshift::{find_value, parse_path};
+
+let json = br#"{"status":"ok","items":[1,2,3,4,5]}"#;
+
+// jshift makes `v` a zero-copy slice into `json`:
+let v = find_value(json, &parse_path("status")).unwrap();
+
+assert_eq!(v, br#""ok""#);
+```
+> The jshift concept: stop at status; never build a tree of items (ie what `serde` does).
+
+---
+
+### Benchmark Task 2: Key-last find
+
+Hot field sits **after** a giant array (adversarial skip).
+
+- **APIs**
+  - **jshift:** `find_value(…, "target")` after bulk `data`
+  - **serde:** full `from_slice` + index
+  - **gjson:** `gjson::get(s, "target")`
+  - **sonic-rs:** pointer get `"target"`
+- **Why:** everyone must skip the bulk. gjson’s unsafe-hot skip can win pure find; jshift stays safe and multi-× vs full parse.
+- **Ratios (medium):** vs serde **~10×**; vs gjson **~0.38×** *(gjson faster)*; vs sonic **~2.4×**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (~50 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | **jshift** | ~655 µs | ~13.5 ms | ~66 ms |
+  | serde | ~6.3 ms | ~140 ms | ~717 ms |
+  | **gjson** | ~259 µs | ~5.2 ms | ~26 ms |
+  | sonic | ~1.6 ms | ~32 ms | ~152 ms |
+
+- **When to use:** the key you're looking up is structured to come after other large fields, especially when you still need **safe mutate / project** on the same buffer (jshift's forte), not only a get (gjson's forte).
+
+#### Code Example of Key-last find
+
+```rust
+use jshift::{find_value, parse_path};
+
+let json = br#"{"items":[0,1,2,3,4,5,6,7,8,9],"target":123456}"#;
+
+let v = find_value(json, &parse_path("target")).unwrap();
+assert_eq!(v, b"123456");
+```
+> The jshift concept: this is still a path scan, ie skip the array as one value, then read target. Cost is higher when the bulk is huge. This is one of the few scenario's in which `gjson` is more performant, using unsafe rust to achieve the speed, but `jshift` is still extremely performant.
+
+---
+
+### Benchmark Task 3: 🏆 In-place mutate 🏆
+
+Same-length overwrite of one field.
+
+This is the mutator feature that jshift provides, which no other rust crate offers.
+
+- **APIs**
+  - **jshift:** `mutate_value(&mut buf, &path, b"654321")`
+  - **serde:** `from_slice` → set → `to_vec` (new document)
+  - **gjson:** — *no in-place mutate*
+  - **sonic-rs:** — *no jshift-style splice mutate*
+- **Why:** jshift splices bytes in the same `Vec<u8>`. Serde rebuilds a full document. Peers are not mutators.
+- **Ratios (medium):** vs serde **~9.3×**; gjson/sonic **N/A**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (~50 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | **jshift** | **~1.3 ms** | **~28 ms** | **~139 ms** |
+  | serde | ~7.4 ms | ~257 ms | ~1.0 s |
+  | gjson | — | — | — |
+  | sonic | — | — | — |
+
+- **When to use:** gateways, JSONL cleaners, feature flags — change `status`, keep shipping the rest of the bytes. Prefer `mutate_value_checked` for untrusted payloads.
+
+#### Code Example of In-place Mutate
+
+```rust
+use jshift::{find_value, mutate_value, parse_path};
+
+let mut json = br#"{"status":"new","id":7}"#.to_vec();
+
+mutate_value(&mut json, &parse_path("status"), br#""accepted""#).unwrap();
+
+assert_eq!(&json[..], br#"{"status":"accepted","id":7}"#);
+// output document (same Vec): {"status":"accepted","id":7}
+
+assert_eq!(find_value(&json, &parse_path("id")).unwrap(), b"7");
+```
+
+> The jshift concept: splice bytes in place. (Same-length edits are the cheapest case; longer/shorter values still work via tail rotate.)
+
+---
+
+### Benchmark Task 4: Sparse find first array element
+
+`products[0].title` without walking the catalog.
+
+- **APIs**
+  - **jshift:** `find_value(…, "products[0].title")`
+  - **serde:** parse → `v["products"][0]["title"]`
+  - **gjson:** `products.0.title`
+  - **sonic-rs:** `pointer!["products", 0, "title"]`
+- **Why:** early exit into the first element; no catalog DOM. Path engines stay ns–µs; full parse pays for every product.
+- **Ratios (medium):** vs serde **~1 300 000×**; vs gjson **~2.5×**; vs sonic **~1.9×**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (338 MiB catalog) |
+  | :--- | ---: | ---: | ---: |
+  | **jshift** | **~120 ns** | **~120 ns** | **~150 ns** |
+  | serde | ~6.3 ms | ~153 ms | ~3.4 s |
+  | gjson | ~301 ns | ~301 ns | ~3.8 µs |
+  | sonic | ~231 ns | ~231 ns | ~270 ns |
+
+- **When to use:** sample one record from a huge export, health checks, “show me the first listing.” On huge real dumps serde is multi-second; jshift stays in nanoseconds.
+
+
+#### Code Example of Sparse find first array element
+
+```rust
+use jshift::{find_value, parse_path};
+
+let json = br#"{
+  "products": [
+    {"id":1,"title":"Hat","noise":true},
+    {"id":2,"title":"Mug","noise":false}
+  ]
+}"#;
+
+// find products[0].title without caring about the rest of the catalog.
+let v = find_value(json, &parse_path("products[0].title")).unwrap();
+assert_eq!(v, br#""Hat""#);
+```
+
+> The jshift concept: walk only to the first product’s title; leave later products unread.
+
+---
+
+### Benchmark Task 5: Sparse find mid element (linear)
+
+`products[mid].title` **without** an index (sibling skip).
+
+- **APIs**
+  - **jshift:** `find_value(…, "products[N].title")` scan
+  - **serde:** full parse + index
+  - **gjson:** `products.N.title`
+  - **sonic-rs:** parse or pointer walk
+- **Why:** linear sibling skip is O(N). Correct for one-shot streaming; painful for random access. gjson is a strong pure scanner.
+- **Ratios (medium):** vs serde **~26×**; vs gjson **~0.59×** *(gjson faster)*; vs sonic **~3.5×**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (338 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | jshift | ~292 µs | ~6.0 ms | ~178 ms |
+  | serde | ~7.0 ms | ~154 ms | ~3.4 s |
+  | **gjson** | **~173 µs** | **~3.6 ms** | **~109 ms** |
+  | sonic | ~986 µs | ~21 ms | ~469 ms |
+
+- **When to use:** rare one-off mid hits only. If you query mid/last often, pay the upfront cost for the **indexed** entry which provides blazing fast speeds after the initial index creation (examples provided lower in the doc).
+
+#### Code Example of Sparse find mid element (linear)
+
+```rust
+use jshift::{find_value, parse_path};
+
+let json = br#"{
+  "products": [
+    {"id":0,"title":"A"},
+    {"id":1,"title":"B"},
+    {"id":2,"title":"C"}
+  ]
+}"#;
+
+let v = find_value(json, &parse_path("products[2].title")).unwrap();
+assert_eq!(v, br#""C""#);
+```
+
+> The jshift concept: fine for a one-off, however each mid/last hit re-skips earlier siblings, therefore use the index approach instead of this approach if you'll make several calls to find a mid-placed element. 
+
+---
+
+### Benchmark Task 6: Sparse find mid element (🏆 indexed 🏆)
+
+Opt-in array side-table (`IndexedDocument`).
+
+- **APIs**
+  - **jshift:** `doc.index_array_str("products")?; doc.find(&parse_path("products[N].title"))?`
+  - **serde / gjson / sonic:** no jshift-style side-table — still full parse or full scan each time
+- **Why:** side-table bookmarks every element start (table of contents). Lookup is O(1) jump + tiny local scan. Index build is opt-in **(~0.7 to 0.9 s once on 338 MiB)**.
+- **Ratios (medium):** vs serde **~1 500 000×**; vs gjson **~36 000×**; vs sonic **~210 000×** *(peers re-scan/parse)*
+- **Timings** (peers = same as linear row above)
+
+  | Engine | ~500 KiB | ~10 MiB | Large (338 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | **jshift indexed** | **~100 ns** | **~100 ns** | **~110 ns** |
+  | serde | ~7.0 ms | ~154 ms | ~3.4 s |
+  | gjson | ~173 µs | ~3.6 ms | ~109 ms |
+  | sonic | ~986 µs | ~21 ms | ~469 ms |
+
+- **When to use:** random access / multi-query on one snapshot. Build once (`IndexedDocument` / `index_for_plan`), then many finds/projects. Indexes go stale after in-place mutate.
+
+#### Code Example of Sparse find mid element (indexed)
+
+```rust
+use jshift::{IndexedDocument, parse_path};
+
+let json = br#"{
+  "products": [
+    {"id":0,"title":"A"},
+    {"id":1,"title":"B"},
+    {"id":2,"title":"C"}
+  ]
+}"#;
+
+let mut doc = IndexedDocument::empty(json);
+doc.index_array_str("products").unwrap(); // pay once
+
+let v = doc.find(&parse_path("products[2].title")).unwrap();
+assert_eq!(v, br#""C""#);
+```
+
+> The jshift concept: index = “table of contents” for array starts; then mid/last is a jump, not a marathon to skip each sibling.
+
+---
+
+### Benchmark Task 7: Sparse project first card
+
+Keep-list / schema card for `products[0]` (`id` / `title` / `handle`).
+
+- **APIs**
+  - **jshift:** `project(json, &ProjectPlan::from_paths(&["products[0].id", "products[0].title", "products[0].handle"])?)?`
+  - **serde:** parse → build map → `to_vec`
+  - **gjson:** 3× get + string rebuild
+  - **sonic-rs:** 3× pointer + string rebuild
+- **Why:** jshift emits a **schema-shaped** mini document without parsing the catalog (P0 open-ended descent). sonic/gjson win “hand me three fragments”; jshift wins “hand me JSON I can forward.”
+- **Ratios (medium):** vs serde **~140 000×**; vs gjson **~0.85×** *(gjson slightly faster on synthetic medium)*; vs sonic **~0.59×** *(sonic faster on pure fragments)*
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (338 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | jshift | ~1.1 µs | ~1.1 µs | **~7.7 µs** |
+  | serde | ~6.4 ms | ~156 ms | ~3.2 s |
+  | gjson | ~962 ns | ~962 ns | ~11.7 µs |
+  | **sonic** | **~691 ns** | **~672 ns** | **~991 ns** |
+
+- **When to use:** admin sample cards, support tools. Prefer jshift when output must be valid nested JSON / keep-list schema; prefer sonic when you only need raw field strings.
+
+#### Code Example of Sparse project first card
+
+```rust
+use jshift::{project, ProjectPlan};
+
+let json = br#"{
+  "products": [
+    {"id":1,"title":"Hat","handle":"hat","blob":[1,2,3]},
+    {"id":2,"title":"Mug","handle":"mug","blob":[]}
+  ]
+}"#;
+
+let plan = ProjectPlan::from_paths(&[
+    "products[0].id",
+    "products[0].title",
+    "products[0].handle",
+]).unwrap();
+
+let out = project(json, &plan).unwrap();
+assert_eq!(
+    out,
+    br#"{"products":{"id":1,"title":"Hat","handle":"hat"}}"#
+);
+// output:
+// {"products":{"id":1,"title":"Hat","handle":"hat"}}
+```
+
+> The jshift concept: schema-shaped card you can forward; blob never enters the output. (JMES `products[0].{id: id, title: title, handle: handle}` yields a flat object instead of nesting under products—different shape, same “first card” job.)
+
+---
+
+### Benchmark Task 8: Full-catalog thin cards
+
+When you want a thinned full-catalog of any array of objects, for example removing all but 2 keys from the full catalog → `{id, title}`.
+
+- **APIs**
+  - **jshift:** `index_for_plan` + `project_indexed` / `project_object_fields("products", &["id","title"])`
+  - **serde:** parse all → map each → `to_vec`
+  - **gjson:** each product + rebuild array string
+  - **sonic-rs:** `Value` map + serialize
+- **Why:** one-pass multi-select + streaming list emit + array side-table. Avoids a full DOM of every product. Medium synthetic is dense/small (scanner-friendly); **large real catalog** is where jshift’s stack pulls ahead clearly.
+- **Ratios:** medium synthetic vs serde **~6.3×**, vs gjson **~0.73×**, vs sonic **~3.0×**; **338 MiB real** vs serde **~63×**, vs gjson **~8.8×**, vs sonic **~10×**
+- **Timings**
+
+  | Engine | ~500 KiB | ~10 MiB | Large (338 MiB) |
+  | :--- | ---: | ---: | ---: |
+  | jshift | ~1.6 ms | ~32 ms | **~50 ms** |
+  | serde | ~8.3 ms | ~203 ms | ~3.2 s |
+  | gjson | **~1.2 ms** | **~24 ms** | ~444 ms |
+  | sonic | ~2.9 ms | ~95 ms | ~503 ms |
+
+- **When to use:** domain-agnostic thin cards (any array path). For NDJSON / one-card-at-a-time use `project_jsonl_write` / `project_each`. Use `project_indexed_auto` when plans may be CPU-heavy.
+
+
+#### Code Example of Full-catalog thin cards
+
+The standard example:
+```rust
+use jshift::project_object_fields;
+
+let json = br#"{
+  "products": [
+    {"id":1,"title":"Hat","price":9.99,"images":[1,2]},
+    {"id":2,"title":"Mug","price":5.00,"images":[]}
+  ]
+}"#;
+
+let out = project_object_fields(json, "products", &["id", "title"]).unwrap();
+assert_eq!(
+    out,
+    br#"[{"id":1,"title":"Hat"},{"id":2,"title":"Mug"}]"#
+);
+// output:
+// [{"id":1,"title":"Hat"},{"id":2,"title":"Mug"}]
+```
+
+JMES example with optional index:
+```rust
+use jshift::{project_indexed, IndexedDocument, ProjectPlan};
+
+let plan = ProjectPlan::from_jmespath("products[*].{id: id, title: title}").unwrap();
+let mut doc = IndexedDocument::empty(json);
+doc.index_for_plan(&plan).unwrap();
+
+let out = project_indexed(&doc, &plan).unwrap();
+// same: [{"id":1,"title":"Hat"},{"id":2,"title":"Mug"}]
+```
+
+> The jshift concept: one small card per element; fat fields stay in the source and never get a DOM.
+
+---
+
+### A few more shapes
+
+**JSONL lines**
+```rust
+use jshift::{find_value, json_lines, parse_path, project_paths};
+
+let buf = br#"{"topic":"rust neural networks","messages":[{"role":"user","content":"…huge…"}],"record_id":"abc"}
+"#;
+
+for line in json_lines(buf) {
+    let topic = find_value(line, &parse_path("topic")).unwrap();
+    // topic == "rust neural networks" (with quotes in the slice)
+
+    let all_topic_records = project_paths(line, &["topic", "record_id"]).unwrap();
+    // all_topic_records: {"topic":"rust neural networks","record_id":"abc"}
+}
+```
+
+> The jshift concept: You've got gigabytes, maybe terabytes, of JSONL training data for LoRA tuning your favorite open-source LLM. You don’t want to fully deserialize every record just to keep a couple of fields, filter by topic, or rewrite a system prompt. jshift lets you do path-based reads and mutations directly on the raw bytes at blazing speeds and with minimal allocation, so your data prep finishes faster and your time goes toward actual training instead of waiting on the data pipeline.
+
+**NDJSON stream of cards (without a giant [...] in memory)**
+
+```rust
+use jshift::{project_object_fields_jsonl_write, ProjectPlan};
+// or project_jsonl_write with a list-projection plan
+
+let json = br#"{
+  "messages": [
+    {"id":1,"title":"How to debug borrow checker","difficulty":9,"related_topics":["rust","rust lifetimes",...], ...},
+    {"id":2,"title":"Best crates for JSON","difficulty":3,"related_topics":["jshift","serde",...], ...}
+  ]
+}"#;
+
+let mut out = Vec::new();
+project_object_fields_jsonl_write(json, "messages", &["id", "title"], &mut out).unwrap();
+// out as text:
+// [{"id":1,"title":"How to debug borrow checker"}, {"id":2,"title":"Best crates for JSON"}, ...]
+```
+
+> The jshift concept: Efficiently output a new smaller JSON document or NDJSON lines. 
+
+---
+
+## Key Features
+
+* **Path-selective scans:** Walk only the path you need on raw `&[u8]` / `Vec<u8>`.
+* **In-place mutations:** Upsize and downsize with safe slice rotations (compiles to `memmove`-class moves).
+* **100% Safe Rust:** `#![forbid(unsafe_code)]`, no `get_unchecked` in the hot path. 
+* **Zero-copy reads:** `find_value` returns a subslice of the input buffer.
+* **`JsonView` trait:** one protocol surface for “this Rust type is a projection of JSON bytes” (`read_from` / `read_from_indexed` / `write_into`), generic pipelines without ad-hoc methods.
+* **Schema derive:** `#[derive(JsonView)]` or `JsonMutatorSchema`, typed readers/mutators, `FIELD_PATHS`, schema-guided `INDEXED_ARRAY_PATHS` / `prepare()`.
+* **Open projections:** fields you don’t name are **unread** and **byte-preserved** on write (API evolution as a feature).
+* **Shared documents:** `SharedDocument` (`Arc<[u8]>`) for cheap clone + many concurrent readers.
+* **JSONL helpers:** `json_lines` / `read_jsonl` -- index **per line**, not one giant merge; array→NDJSON cards via `project_jsonl_write` / `project_object_fields_jsonl_write`.
+* **Field projection:** `project` / `project_paths` / `project_jmespath` / `project_write` / `project_indexed` / `ProjectPlan` (keep-list + **byte-oriented** JMESPath subset on raw spans, not a DOM port of jmespath.rs; Compact / PreserveSource / Pretty).
+* **Streaming cards:** `project_each` / `project_object_fields_each` — one callback per list element (no giant output array); peak RAM ≈ one card.
+* **Parallel auto-pick:** `plan_prefers_parallel` + `project_indexed_auto` / `project_parallel_auto` (Rayon only when the plan is likely CPU-bound; thin cards stay sequential).
+* **Projection estimates:** `estimate_projected_len` / `projected_len` (planning vs exact).
+* **Transforms:** `Transform` / `TransformPipeline` (KeepPaths, Jmes, Rename, Drop, Inject, Style).
+* **Derive JMES:** `#[json(jmes = "...")]` + `FIELD_JMES` multi-select project plan.
+* **Object & array CRUD:** Update, upsert, delete keys; append, index, delete elements; nested `upsert_at_path`.
+* **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
+* **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
+* **Option / null:** first-class for training JSONL and partial records.
+* **Structural indexes (opt-in):** [`IndexedDocument`] side-tables so mid/last `products[i].field` jumps instead of scanning every sibling.
+
+**In other words, the feature set is three jobs that share one engine:**
+
+| Job | Everyday phrase | Typical API |
+| :--- | :--- | :--- |
+| **Peek** | “What’s at this path?” | `find_value`, `JsonView::read_from` |
+| **Patch** | “Change this field, keep the rest of the bytes.” | `mutate_value`, derive mutator |
+| **Projection** | “Emit a smaller JSON with only the fields I need.” | `project`, `project_object_fields`, JMES |
+
+> jshift is a **non-validating** path engine. It assumes mostly well-formed JSON along the path you traverse. Callers must supply complete JSON value bytes for raw mutations (or use `ToJsonBytes` / `mutate_value_checked`).
 
 ---
 
@@ -13,9 +493,7 @@ If you need **read + rewrite the same buffer** under real production constraints
 
 Typical stack today:
 
-```text
-bytes → serde_json::from_slice → Value tree → change a field → to_vec → bytes
-```
+> bytes → serde_json::from_slice → Value tree → change a field → to_vec → bytes
 
 That is correct and ergonomic. It is also expensive when:
 
@@ -24,67 +502,26 @@ That is correct and ergonomic. It is also expensive when:
 * you run many concurrent workers on the same shape of traffic,
 * you only care about **one path** (or a small schema of paths).
 
+**In other words:** the cost is not “JSON is text.” The cost is *materializing a second representation of everything* so you can touch a tiny slice of it. That is the right default for application models; it is the wrong default for gateways, cleaners, and data pipeline projections.
+
 jshift flips the model:
 
-```text
-bytes → path scan to byte offsets → splice / shift bytes in place → same Vec<u8>
-```
+> bytes → path scan to byte offsets → splice / shift bytes in place → same Vec<u8>
 
 No tree. No second full document serialize. Reads return **zero-copy** slices into the original buffer.
+
+**Analogy:** think of a paper book versus photocopying the entire library to highlight one sentence. Serde often photocopies (parse → tree → re-print). jshift walks the aisle, opens the right volume, and edits the margin... still carefully, still with bounds and `Result`s, but without reprinting the shelves.
 
 ### Real-world example: API JSON ingestion (what IT teams do today)
 
 A common pattern in platform / integration teams looks like this:
 
 1. **Pull** a large JSON payload from a partner or SaaS API (catalog, events, orders, transaction dumps... often multi‑MB or hundreds of MB).
-2. **Ingest** into an internal service: validate a couple of fields, stamp metadata (`ingested_at`, `source`, `tenant_id`), maybe drop or rewrite a status flag, then forward the body to a queue, object store, or downstream microservice.
+2. **Ingest** into an internal service: validate a couple of fields, stamp metadata (`ingested_at`, `source`, `status`), maybe drop or rewrite a status flag, then forward the body to a queue, object store, or downstream microservice.
 3. **Today’s default stack** is almost always: `HTTP body → serde_json::from_slice` (or equivalent) → walk a full in-memory tree → change one or two fields → `to_vec` / re-serialize → publish. That is simple to write and easy to reason about but on a **300 MB json catalog** you still allocate and walk the entire tree, then allocate and write another ~300 MB of output, even if you only needed `products[0].title` and a top-level `status`. Under bursty multi-worker ingestion, that becomes CPU, memory, and GC (or allocator) pressure, not “JSON is slow because HTTP is slow.”
 4. **With jshift**, the same job is: keep the body as `Vec<u8>` → path-scan only the fields you need → **splice** stamps or flags in place with safe byte rotations → hand the same buffer downstream. Peers that only need a header field never pay for the giant `products` array. Teams that must stay on **safe Rust** (no `unsafe` hot loops) get selective R/W without becoming a second full parser.
 
-Impact in practice: lower p99 on hot ingestion paths, less memory headroom for concurrent workers, and fewer “we only touch three fields but clone the whole document” incidents while serde remains the right tool when you truly need a full typed domain model.
-
----
-
-## Key Features
-
-* **Path-selective scans:** Walk only the path you need on raw `&[u8]` / `Vec<u8>`.
-* **In-place mutations:** Upsize and downsize with safe slice rotations (compiles to `memmove`-class moves).
-* **100% Safe Rust:** `#![forbid(unsafe_code)]`, no `get_unchecked` in the hot path.
-* **Zero-copy reads:** `find_value` returns a subslice of the input buffer.
-* **`JsonView` trait:** one protocol surface for “this Rust type is a projection of JSON bytes” (`read_from` / `read_from_indexed` / `write_into`), generic pipelines without ad-hoc methods.
-* **Schema derive:** `#[derive(JsonView)]` or `JsonMutatorSchema`, typed readers/mutators, `FIELD_PATHS`, schema-guided `INDEXED_ARRAY_PATHS` / `prepare()`.
-* **Open projections:** fields you don’t name are **unread** and **byte-preserved** on write (API evolution as a feature).
-* **Shared documents:** `SharedDocument` (`Arc<[u8]>`) for cheap clone + many concurrent readers.
-* **JSONL helpers:** `json_lines` / `read_jsonl` -- index **per line**, not one giant merge.
-* **Field projection:** `project` / `project_paths` / `project_jmespath` / `ProjectPlan` (keep-list + JMESPath subset: multi-select, pipe, flatten, slices, literals; Compact / PreserveSource / Pretty).
-* **Projection estimates:** `estimate_projected_len` / `projected_len` (planning vs exact).
-* **Object & array CRUD:** Update, upsert, delete keys; append, index, delete elements; nested `upsert_at_path`.
-* **Correct string encoding:** `ToJsonBytes` and key upserts escape `"`, `\`, and control characters.
-* **Owned + pointer paths:** `Path`, `try_parse_path`, JSON Pointer (`Path::from_json_pointer`).
-* **Option / null:** first-class for training JSONL and partial records.
-* **Structural indexes (opt-in):** [`IndexedDocument`] side-tables so mid/last `products[i].field` jumps instead of scanning every sibling.
-
-> **Contract:** jshift is a **non-validating** path engine. It assumes mostly well-formed JSON along the path you traverse. Callers must supply complete JSON value bytes for raw mutations (or use `ToJsonBytes` / `mutate_value_checked`).
-
-### Cargo features
-
-```toml
-jshift = "0.4"                              # default: derive on
-jshift = { version = "0.4", default-features = false }  # core only (no proc-macros)
-```
-
-Structural indexing APIs always compile; they are opt-in at the call site (never forced on default finds). CI runs both default and `--no-default-features` test matrices.
-
-### Non-goals (deliberate)
-
-| Do | Don’t |
-| :--- | :--- |
-| Path index + mutate | Full JSON DOM |
-| Schema-guided projection | Replace serde for fully typed apps |
-| Safe structural tables | Promise simdjson Stage-1 crowns |
-| Preserve unmentioned fields | Full RFC validator (unless optional later) |
-
-Clear non-goals keep jshift the **safe path-mutate / field-projection** crate, not a second full parser.
+**When this is impactful:** multi-worker ingestion of multi‑MB bodies, JSONL cleaners at millions of lines/day, feature-flag or status rewrites in a gateway, bronze-to-silver “keep ten fields, drop the rest.” **When it is not:** a request handler that already deserializes into a rich domain struct and never ships the raw bytes again --> this ought to stay on serde.
 
 ---
 
@@ -98,16 +535,18 @@ Clear non-goals keep jshift the **safe path-mutate / field-projection** crate, n
 
 **Rule of thumb**
 
-* “Filter / tag / rewrite `status` on every JSONL line” → **jshift**.
+* “Filter, add tags, or rewrite `status` on every JSONL line” → **jshift**.
 * “Deserialize into `struct Request { … }` with dozens of fields and nested enums” → **serde**.
 * “Gateway: inspect `headers.x-request-id`, maybe set `status`, forward body” → **jshift**.
 * “Partial view struct (`ListingCard { id, title }`) over a fat catalog object” → **`JsonView`**.
+
+**In other words:** choose by *how much of the document becomes your domain model*. If the answer is “almost all of it, with types and invariants,” serde wins. If the answer is “a few paths, then forward or slim the bytes,” jshift wins. Many production systems can benefit from both: jshift on the wire edge, serde inside the application core.
 
 ---
 
 ## How it works under the hood (byte shifts, not magic)
 
-You do not need a systems-programming background to use jshift, but understanding the mechanism explains the speed.
+You do not need a systems-programming background to use jshift, but understanding the mechanism explains the speed — and when *not* to expect miracles.
 
 ### 1. Find = locate byte offsets, not build a tree
 
@@ -126,6 +565,8 @@ So for:
 a path `"target"` means: skip the entire `data` array as one bulk value, then read the number.  
 No heap tree of every object in `data`.
 
+**In other words:** skipping is not “ignoring data forever”; it is *refusing to build furniture for rooms you will never enter*. The bytes stay in the buffer; they just never become `Value::Object` nodes.
+
 ### 2. Mutate = splice into the same `Vec<u8>`
 
 When you replace a value:
@@ -140,15 +581,17 @@ When you replace a value:
 
 Deletes work the same way: compute a span (including commas), expand over adjacent whitespace for tidy output (“pretty delete”), then shift the tail left.
 
+**In other words:** the “hard” part of editing a JSON string in place is not finding the field — it is *keeping commas and braces honest* when the replacement changes length. jshift’s job is that bookkeeping, with the tail of the document treated like a sliding window of bytes.
+
 ### 3. Why that is faster than serde for selective work
 
-serde’s happy path is:
+serde’s mutation happy path is:
 
 1. Parse **every** token into a `Value` (or a typed struct).
 2. Mutate the tree.
 3. Walk the tree and **write a new document**.
 
-jshift’s happy path is:
+jshift’s mutation happy path is:
 
 1. Scan until the path of interest.
 2. Move only the **tail after the edit**.
@@ -176,305 +619,116 @@ We **do** absorb a few *ideas* that transfer cleanly to safe Rust:
 
 …and left the remaining gap on pure “key-last + 10MB array” finds as a conscious trade for **memory safety and mutator correctness**. If your only requirement is the absolute fastest read and you accept unsafe, evaluate gjson. If you need **safe in-place mutation**, jshift is the fit.
 
----
-
-## Performance
-
-**Fresh Criterion run** on this repo’s `benches/json_benchmark.rs` (quiet machine, release, ~6 s measurement windows). Means below are the criterion mid estimate. Re-run before putting numbers on a slide deck, the absolute times vary by CPU, but **ratios** are the story.
-
-**Legend**
-
-* **jshift** — path scan / in-place mutate, **`#![forbid(unsafe_code)]`**
-* **gjson** — path **read** (hot skip path may use **unchecked** loads)
-* **sonic-rs** — high-performance JSON library (pointer get)
-* **serde_json** — full `Value` parse (+ re-serialize on mutate)
-
-### Find: path engines + full parse
-
-| Workload | jshift | gjson | sonic-rs | serde_json | **jshift vs serde** | **jshift vs gjson** | **jshift vs sonic** |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Key-last ~10MB** (target after huge array) | ~11.0 ms | ~4.9 ms | ~27.4 ms | ~223 ms | **~20× faster** | ~2.3× slower | **~2.5× faster** |
-| **Key-first ~10MB** (target is first field) | ~39 ns | ~87 ns | ~97 ns | ~222 ms | **~5,700,000× faster** | **~2.2× faster** | **~2.5× faster** |
-| **Small ~1KB** top-level key | ~39 ns | ~89 ns | ~96 ns | ~6.1 µs | **~160× faster** | **~2.3× faster** | **~2.5× faster** |
-| **Small ~1KB** nested `meta.ver` | ~80 ns | ~143 ns | ~153 ns | ~6.4 µs | **~80× faster** | **~1.8× faster** | **~1.9× faster** |
-
-**Interpretation:** *On selective finds, jshift is typically **~20×–millions×** faster than full `serde_json` parse, and on most shapes here **~2×** faster than gjson/sonic while remaining 100% safe Rust; gjson can still win pure “skip a giant trailing array” finds (~2×).*
-
-The key-first row might seem absurd and that is the point. Serde still parses the entire multi‑megabyte document. jshift matches the first key and stops.
-
-**Path-engine honesty**
-
-* On **key-last + giant array**, **gjson** can win pure find (~2× here). We optimize that path in **safe** code, still beat **sonic-rs (~2.5×)**, and still crush full parse (**~20×** vs serde).
-* On **key-first** and **small / nested** finds in this run, **jshift leads** gjson and sonic-rs while remaining safe.
-* jshift’s killer feature is not “always #1 find”; it is **find → mutate same buffer**.
-
-### Mutate: the product story
-
-| Workload | jshift | serde_json (parse + set + `to_vec`) | **jshift vs serde** |
-| :--- | ---: | ---: | ---: |
-| **Key-last ~10MB** (same-length overwrite) | ~11.3 ms | ~198 ms | **~18× faster** |
-| **Small ~1KB** | ~76 ns | ~7.3 µs | **~95× faster** |
-
-**Interpretation:** *Selective in-place mutate is where jshift shines, about **~18×** (large) to **~100×** (small) versus “parse whole tree, change one field, re-serialize.”*
-
-This is the “gateway / JSONL cleaner / feature-flag rewrite” workload: change a field, keep shipping the rest of the bytes.
-
-### Concurrent find with 8 independent workers
-
-Same model for every engine: **eight concurrent workers**, each extracts `target` from a **shared** buffer. No shared parse tree. That means **serde re-parses eight times**.
-
-#### Key-last ~10MB (must skip the array)
-
-| Engine | Mean (8-way wall) | **vs serde** | **vs gjson** |
-| :--- | ---: | ---: | ---: |
-| gjson ×8 | ~10.3 ms | **~43× faster** | 1× |
-| jshift ×8 | ~20.1 ms | **~22× faster** | ~2.0× slower |
-| serde_json ×8 | ~442 ms | 1× | — |
-
-**Interpretation:** *Under 8-way key-last load, jshift is still **~22×** faster than parallel full parses; gjson leads pure read (~2×) on this shape.*
-
-#### Key-first ~10MB (early exit)
-
-| Engine | Mean (8-way wall) | **vs serde** | **vs gjson** |
-| :--- | ---: | ---: | ---: |
-| **jshift ×8** | **~18.7 µs** | **~22,000× faster** | **~1.02× (≈tie / slight win)** |
-| gjson ×8 | ~19.1 µs | **~21,000× faster** | 1× |
-| serde_json ×8 | ~404 ms | 1× | — |
-
-**Interpretation:** *When the hot field is near the front (the common API case) eight workers finish in **~19 µs** with jshift vs serde's **~400 ms** of full re-parses (ie jshift is **~22,000×** faster than serde).*
-
-```bash
-# Full suite
-cargo bench
-
-# Head-to-head find (jshift / gjson / sonic-rs / serde_json)
-cargo bench --bench json_benchmark -- "Compete Find"
-
-# Parallel groups (key-last + key-first)
-cargo bench --bench json_benchmark -- "JSON Concurrent"
-```
-
-These numbers are not a claim that jshift is always fastest for every JSON task. Serde, gjson, and other crates still have purpose.
+**In other words:** speed without safety is a different product. jshift optimizes *under the constraint* `forbid(unsafe_code)` because many teams cannot take “we `get_unchecked` in a skip loop” into a security review — even when that loop is carefully written.
 
 ---
 
-
-### Structural indexing, opt-in mid-array / wide-object access
-
-**Indexing is never forced.** Default APIs (`find_value`, `mutate_value`, `read_from_json`, …) do **not** build indexes and pay **no** index tax. You only build metadata when you call `IndexedDocument::build`, `index_array`, `index_object`, `index_structural`, `indexed_document()`, or `read_from_json_indexed()`.
-
-Linear path scans must `skip_value` every sibling before `products[12500]`. That is correct and fine for streaming “touch once” work; it is wrong for **random / multi-query** access into huge arrays. Structural indexing is the lever for the second case.
-
-**jshift 0.3+** adds **safe** structural indexing (not a full simdjson DOM): array side-tables, optional Stage-1 structural lists, object key maps, and derive helpers that *offer* auto-index without changing the default path.
-
-```rust
-use jshift::{IndexedDocument, parse_path, find_value};
-
-// Default path.  no index, no build cost:
-let _ = find_value(&json, &parse_path("status"));
-
-// Opt-in: pay build once, then many random hops:
-let doc = IndexedDocument::build(&json, &["products"])?;
-let title = doc.find(&parse_path("products[12500].title"))?;
-```
-
-| Phase | Cost class | When you pay |
-| :--- | :--- | :--- |
-| Default `find_value` / `read_from_json` | Same as always | **Never** builds an index |
-| `IndexedDocument::build` / `index_*` | One linear pass over chosen arrays/objects | **Only if you call it** |
-| `doc.find(products[i].…)` after index | **O(1)** jump + small local scan | After opt-in build |
-| Unindexed `find_value(products[i].…)` | **O(i)** sibling skips | Default |
-
-#### Compete: mid/last array element (50k products, quiet Criterion)
-
-Prebuilt jshift index vs peers on the **same** buffer (index build timed separately).
-
-| Access | jshift **indexed** | jshift linear | gjson | sonic-rs | serde_json | **indexed vs serde** | **indexed vs gjson** |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Mid** `products[25000].title` | **~76 ns** | ~1.02 ms | ~974 µs | ~2.42 ms | ~52.9 ms | **~700,000×** | **~13,000×** |
-| **Last** `products[49999].title` | **~76 ns** | ~2.06 ms | ~1.98 ms | ~4.81 ms | ~52.7 ms | **~690,000×** | **~26,000×** |
-| **First** `products[0].title` | **~68 ns** | ~83 ns | ~202 ns | ~160 ns | ~53.1 ms | **~780,000×** | **~3×** |
-
-**One-liner:** *With an opt-in array index, mid/last element hops are **~10⁴–10⁶×** faster than full parse and **~10³–10⁴×** faster than linear path engines that must walk siblings while default jshift paths stay zero-overhead if you never build an index.*
-
-| Index build (opt-in, once) | Mean |
-| :--- | ---: |
-| Array side-table `products` only | ~4.3 ms |
-| Stage-1 structural + array | ~8.5 ms |
-
-#### Compete: wide object last key (2 000 keys at root)
-
-| Access | jshift **key map** | jshift linear | gjson | sonic-rs | serde_json | **map vs serde** | **map vs gjson** |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Last key `k1999` | **~47 ns** | ~52.6 µs | ~49.4 µs | ~98.7 µs | ~554 µs | **~12,000×** | **~1,050×** |
-| Build root object map (once) | ~328 µs | — | — | — | — | — | — |
-
-**One-liner:** *Object key maps are also opt-in: pay ~0.3 ms once on a 2k-key object, then last-key lookup at **~47 ns** instead of tens of microseconds of linear scan.*
-
-**Indexes go stale after mutation.** They bind to a fixed byte snapshot. After any in-place mutate/delete/upsert that shifts bytes, the index is invalid (no dirty flag in 0.4). **Rebuild or drop** it. Best ETL pattern: **index → many reads → write a new buffer (or rebuild) → optional reindex**.
-
-This stays `forbid(unsafe_code)`: `Vec<u32>` offsets, `HashMap` key tables, Stage-1 structural lists, and existing safe cursors.
-
-| Layer | API | Helps | Forced? |
-| :--- | :--- | :--- | :--- |
-| Array side-table | `index_array` / `build` | `products[i].field` mid/last | **No** |
-| Object key map | `index_object` | wide roots / hot config | **No** |
-| Stage-1 structurals | `index_structural` | faster container skip while building tables | **No** |
-| Derive | `indexed_document` / `read_from_json_indexed` | auto-index array prefixes when *you* call it | **No** (`read_from_json` unchanged) |
-
-```bash
-cargo bench --bench json_benchmark -- "Indexed"
-```
-
-
-## Installation
-
-```toml
-[dependencies]
-jshift = "0.3"
-```
-
-Requires a recent stable Rust (see `rust-version` in `Cargo.toml`; edition 2024).
-
----
-
-## Quick Start: AI dataset cleaning (JSONL)
-
-In pipelines that filter or tag training samples, records are often JSON Lines. Instead of parse → allocate → re-serialize millions of lines, update fields in-place on raw bytes.
-
-### 1. Define a schema
-
-```rust
-use jshift::JsonMutatorSchema;
-
-#[derive(JsonMutatorSchema)]
-struct TrainingRecord {
-    #[json(path = "tokens")]
-    tokens: usize,
-    #[json(path = "status")]
-    status: String,
-    #[json(path = "tags")]
-    tags: Vec<String>,
-}
-```
-
-The derive emits **`'static` path constants** (no re-parsing the path string on every `set_*`).
-
-### 2. Selective reads
-
-```rust
-let mut line = b"{\"instruction\": \"Translate...\", \"tokens\": 1024, \"status\": \"pending\", \"tags\": [\"llm\"]}".to_vec();
-
-let record = TrainingRecord::read_from_json(&line).unwrap();
-assert_eq!(record.tokens, 1024);
-assert_eq!(record.tags[0], "llm");
-```
-
-### 3. In-place mutations & array append
-
-```rust
-let mut mutator = TrainingRecord::mutator(&mut line);
-
-if record.tokens > 512 {
-    mutator.set_status("skipped").unwrap();
-    mutator.append_tags("oversized").unwrap();
-}
-
-let updated = TrainingRecord::read_from_json(&line).unwrap();
-assert_eq!(updated.status, "skipped");
-assert_eq!(updated.tags, vec!["llm".to_string(), "oversized".to_string()]);
-```
-
-### Low-level API
-
-```rust
-use jshift::{find_value, mutate_value, mutate_value_checked, parse_path, Path, ToJsonBytes, upsert_at_path};
-
-let mut json = b"{\"user\": \"farmer\", \"score\": 9.5}".to_vec();
-let path = parse_path("score");
-// Or reuse an owned path:
-// let path = Path::parse("score");
-
-assert_eq!(find_value(&json, &path).unwrap(), b"9.5");
-mutate_value(&mut json, &path, b"10.0").unwrap();
-
-// Prefer checked mutate when the payload might be garbage:
-mutate_value_checked(&mut json, &path, b"11.0").unwrap();
-
-// Strings are escaped for you:
-mutate_value(&mut json, &parse_path("user"), &r#"o'reilly "x""#.to_json_bytes()).unwrap();
-
-// Create nested parents if missing:
-let mut empty = b"{}".to_vec();
-upsert_at_path(&mut empty, &parse_path("a.b.c"), b"1").unwrap();
-```
-
-### Optional fields (`null` / missing)
-
-```rust
-#[derive(JsonMutatorSchema)]
-struct Row {
-    #[json(path = "label")]
-    label: Option<String>, // JSON null or missing path → None
-}
-```
-
----
-
-## How mutations work (detail)
-
-When a replacement changes size, jshift resizes the `Vec<u8>` and rotates the tail:
-
-```text
-Upsize:   [prefix | OLD | tail....]
-          resize
-          [prefix | OLD | ....tail | pad]
-          rotate_right(delta)
-          [prefix | gap | tail....]
-          write NEW
-          [prefix | NEW | tail....]
-
-Downsize: [prefix | OLDVALUE | tail]
-          rotate_left(delta)
-          [prefix | NEW | tail | garbage]
-          truncate
-          [prefix | NEW | tail]
-```
-
-Deletes:
-
-1. Locate the member (keys use **logical** names; matching uses escaped on-wire form).
-2. Expand the delete span to include the correct comma and adjacent whitespace (pretty delete → `{}` / `[]` when empty).
-3. Shift the tail left.
-
----
-
-## Capabilities
-
-### Object operations
-
-* `mutate_value` / `mutate_value_checked` — overwrite at a path  
-* `upsert_object_key` — insert or update a key (logical keys, JSON-escaped on write)  
-* `upsert_at_path` — upsert a leaf and create missing **object** parents as `{}`  
-* `delete_key` — remove a key/value, fix commas, trim whitespace  
-
-### Array operations
-
-* `append_to_array` — append with comma injection  
-* `array_len` — count elements without allocating  
-* `delete_index` — remove an element, fix commas, pretty-trim  
-
-### Paths
-
-* Dot / bracket: `metadata.tags[0].name` via `parse_path` / `try_parse_path` / `Path`  
-* JSON Pointer: `Path::from_json_pointer("/a~1b/0")`  
-* Derive validates paths at compile time and caches segment tables  
-* **`IndexedDocument`**: array side-tables for O(1) element jumps (`build`, `find`, `for_each_element`)  
-
-### Convert
-
-* `FromJsonSlice` / `ToJsonBytes` for numbers, bool, `String`, `Vec`, `Option`  
-* `from_json_string` / `escape_json_string` / `escape_json_key`  
+## Capabilities (full API map)
+
+Public surface as of **0.4** (`#![forbid(unsafe_code)]`). Providing here as a convenience to support agentic workflows, AI Agents reading the README on crates.io or github.
+
+### Find (zero-copy path scan)
+
+| API | Role |
+| :--- | :--- |
+| `find_value` | Locate a path → `&[u8]` subslice into the buffer |
+| `parse_path` / `try_parse_path` | Dot/bracket paths → `PathSegment`s |
+| `Path` / `Path::parse` / `Path::from_json_pointer` | Owned paths; JSON Pointer support |
+| `OwnedPathSegment` / `PathSegment` | Path AST types |
+
+### Mutate (in-place on `Vec<u8>`)
+
+| API | Role |
+| :--- | :--- |
+| `mutate_value` | Overwrite value at path (caller supplies JSON bytes) |
+| `mutate_value_checked` | Same + validates the replacement span |
+| `upsert_object_key` | Insert or update a key under an object path |
+| `upsert_at_path` | Upsert leaf; create missing **object** parents as `{}` |
+| `delete_key` | Remove key/value; fix commas / whitespace |
+| `append_to_array` | Append element with comma injection |
+| `delete_index` | Remove array element; fix commas |
+| `array_len` | Count array elements without allocating a `Vec` of them |
+
+### Project (emit smaller JSON)
+
+| API | Role |
+| :--- | :--- |
+| `project` / `project_into` | Run a `ProjectPlan` → new buffer |
+| `project_paths` | Keep-list convenience |
+| `project_jmespath` | JMESPath **subset** on raw spans (not a DOM port) |
+| `project_write` | Stream projected document into any `Write` |
+| `projected_len` / `estimate_projected_len` / `estimate_values_len` | Exact / ballpark sizes |
+| `ProjectPlan` / `ProjectStyle` / `MissingPolicy` | Compact / Pretty / PreserveSource; missing policy |
+| `SelectExpr` / `ArraySelect` / `ObjectSelect` / `HashField` / `CmpOp` | Selection AST |
+| `parse_jmespath_expr` / `parse_project_path` / `select_from_project_path` | Parsers |
+| `WriteSink` / `CountingSink` | Emit sinks |
+| `Transform` / `TransformPipeline` | KeepPaths, Jmes, Rename, Drop, Inject, Style |
+
+### Thin cards & streaming (no giant output array)
+
+| API | Role |
+| :--- | :--- |
+| `project_object_fields` / `plan_object_fields` | Array path + field list → card array (any schema) |
+| `project_each` / `project_each_indexed` | Callback per list-projection element |
+| `project_object_fields_each` / `_indexed` | Thin-field each-callback |
+| `project_jsonl_write` / `project_jsonl_write_indexed` | NDJSON lines to `Write` |
+| `project_object_fields_jsonl_write` | Thin-field NDJSON |
+
+### Index-wired project & parallel
+
+| API | Role |
+| :--- | :--- |
+| `project_indexed` | Project with prebuilt `IndexedDocument` |
+| `project_indexed_prepare` / `project_auto_indexed` | Index plan paths then project |
+| `plan_prefers_parallel` | Heuristic: heavy filters/calls vs thin pure fields |
+| `project_indexed_auto` / `project_parallel_auto` | Seq vs Rayon by heuristic |
+| `project_parallel` / `project_indexed_parallel` / `project_object_fields_parallel` | Feature **`parallel`** (Rayon) |
+
+### Structural indexes (opt-in)
+
+| API | Role |
+| :--- | :--- |
+| `IndexedDocument` | Side-tables for arrays/objects; `find`, `for_each_element`, `index_for_plan` |
+| `index_array` / `index_array_str` / `index_object` / `index_structural` | Build tables (via `IndexedDocument` methods) |
+| `build_array_index` / `build_object_key_index` / `build_structural_index` | Free functions |
+| `ArrayIndex` / `ObjectKeyIndex` / `StructuralIndex` | Table types |
+| `static_array_prefixes_from_path` | Derive helper for schema array prefixes |
+
+**Never forced** on default `find_value` / `project` / `read_from_json`.
+
+### JSONL / multi-document
+
+| API | Role |
+| :--- | :--- |
+| `json_lines` / `JsonLines` | Zero-copy iterator over non-empty lines |
+| `read_jsonl` | Map each line through `JsonView` |
+| `read_jsonl_indexed` / `read_line_indexed` | Per-line index + view |
+
+### Views, documents, derive
+
+| API | Role |
+| :--- | :--- |
+| `JsonView` | Trait: `read_from` / `read_from_indexed` / `write_into` / project helpers |
+| `read_view` / `write_view` | Free helpers |
+| `SharedDocument` | `Arc<[u8]>` shared buffer |
+| `#[derive(JsonView)]` / `JsonMutatorSchema` | Feature **`derive`** (default): `FIELD_PATHS`, mutators, `project_json`, optional `jmes` |
+| `Error` | Path / syntax / JMES / type errors (`non_exhaustive`) |
+
+### Convert / escape
+
+| API | Role |
+| :--- | :--- |
+| `FromJsonSlice` / `ToJsonBytes` | Numbers, bool, `String`, `Vec`, `Option`, … |
+| `from_json_string` / `escape_json_string` / `escape_json_key` | String helpers |
+| `write_json_string` / `write_json_string_content` | Append escaped strings into a buffer |
+
+### Cargo features
+
+| Feature | Default | Enables |
+| :--- | :---: | :--- |
+| `derive` | yes | Proc-macro schemas |
+| `parallel` | no | Rayon list project APIs |
+| `dhat-heap` | no | Allocator profiling example only |
 
 ---
 
@@ -486,6 +740,8 @@ Deletes:
 | **gjson** | Fast path **reads** (may use unsafe in hot loops) | Read-only queries; absolute max skip speed |
 | **sonic-rs** / simd-json | High-performance parse | Full document parse with speed focus |
 | **jshift** | Path scan + **in-place mutate** + schema derive + **safe** | Selective R/W, JSONL, gateways, safe-only codebases |
+
+**In other words:** these crates are not enemies on a single leaderboard — they are tools for different jobs. Serde owns the typed application core. gjson/sonic own pure read races (sometimes with different safety trade-offs). jshift owns **safe selective read+write and projection** on raw buffers. Mature systems often use more than one.
 
 ---
 

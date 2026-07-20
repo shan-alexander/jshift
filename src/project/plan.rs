@@ -5,10 +5,20 @@ use crate::project::jmespath::{parse_jmespath_expr, parse_project_path};
 use crate::project::select::{ArraySelect, ObjectSelect, ProjectPathSegment, SelectExpr};
 
 /// How projected structure is formatted.
+///
+/// # Compact bulk path
+///
+/// [`ProjectStyle::Compact`] is the default and the production bulk style for thin
+/// cards and list projections. The emitter treats Compact as a **specialized path**:
+/// no indent-depth counters, no pretty newline/indent helpers, container close is a
+/// single `]` / `}` byte, multi-select hashes write `{k:v,...}` without per-field
+/// style branches. Prefer Compact for multi-megabyte rewrites; use
+/// [`ProjectStyle::Pretty`] only when human-readable output is required (more bytes
+/// and full indent bookkeeping). Input scan usually dominates wall time either way.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProjectStyle {
-    /// Minimal separators: `{"a":1,"b":2}`. Default.
+    /// Minimal separators: `{"a":1,"b":2}`. Default bulk path (see enum docs).
     #[default]
     Compact,
     /// Prefer source spacing around kept keys, colons, commas, and braces when
@@ -127,6 +137,124 @@ impl ProjectPlan {
 
     pub fn missing(&self) -> MissingPolicy {
         self.missing
+    }
+
+    /// Dot-path prefixes of arrays this plan will walk (for [`crate::IndexedDocument`] side-tables).
+    ///
+    /// Examples:
+    /// * keep-list `products[0].title` → `["products"]`
+    /// * JMES `products[*].{id:id}` → `["products"]`
+    /// * nested `a.b[].c` → `["a.b"]` when representable as field chain + array
+    ///
+    /// Used by [`crate::IndexedDocument::index_for_plan`] / [`crate::project_auto_indexed`].
+    pub fn array_paths_for_index(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        collect_array_index_paths(&self.root, "", &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// Walk the selection AST and record field-chain prefixes of array projections.
+fn collect_array_index_paths(expr: &SelectExpr, prefix: &str, out: &mut Vec<String>) {
+    match expr {
+        SelectExpr::Object(obj) => {
+            for (k, child) in &obj.fields {
+                let p = join_path(prefix, k);
+                collect_array_index_paths(child, &p, out);
+            }
+        }
+        SelectExpr::Array(sel) => {
+            if !prefix.is_empty() {
+                out.push(prefix.to_string());
+            }
+            match sel {
+                ArraySelect::Each(each) | ArraySelect::Slice { each, .. } => {
+                    collect_array_index_paths(each, prefix, out);
+                }
+                ArraySelect::Filter { pred, each } => {
+                    collect_array_index_paths(pred, prefix, out);
+                    collect_array_index_paths(each, prefix, out);
+                }
+                ArraySelect::Indices(map) => {
+                    for child in map.values() {
+                        collect_array_index_paths(child, prefix, out);
+                    }
+                }
+            }
+        }
+        SelectExpr::Sub(left, right) | SelectExpr::Pipe(left, right) => {
+            // Field / field chain on the left, array (or more) on the right.
+            if let Some(p) = field_chain_prefix(left, prefix) {
+                collect_array_index_paths(right, &p, out);
+            } else {
+                collect_array_index_paths(left, prefix, out);
+                collect_array_index_paths(right, prefix, out);
+            }
+        }
+        SelectExpr::Flatten(inner)
+        | SelectExpr::Paren(inner)
+        | SelectExpr::Not(inner)
+        | SelectExpr::Expref(inner)
+        | SelectExpr::ObjectProjection(inner) => {
+            collect_array_index_paths(inner, prefix, out);
+        }
+        SelectExpr::MultiSelectHash(fields) => {
+            for f in fields {
+                collect_array_index_paths(&f.expr, prefix, out);
+            }
+        }
+        SelectExpr::MultiSelectList(items) => {
+            for it in items {
+                collect_array_index_paths(it, prefix, out);
+            }
+        }
+        SelectExpr::Cmp { left, right, .. }
+        | SelectExpr::And(left, right)
+        | SelectExpr::Or(left, right) => {
+            collect_array_index_paths(left, prefix, out);
+            collect_array_index_paths(right, prefix, out);
+        }
+        SelectExpr::Call { args, .. } => {
+            for a in args {
+                collect_array_index_paths(a, prefix, out);
+            }
+        }
+        SelectExpr::Identity
+        | SelectExpr::Current
+        | SelectExpr::Field(_)
+        | SelectExpr::FieldQuoted(_)
+        | SelectExpr::Literal(_) => {}
+    }
+}
+
+fn join_path(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// If `expr` is a pure field / quoted-field chain (optionally under `prefix`), return
+/// the dotted path to that focus.
+fn field_chain_prefix(expr: &SelectExpr, prefix: &str) -> Option<String> {
+    match expr {
+        SelectExpr::Field(k) | SelectExpr::FieldQuoted(k) => Some(join_path(prefix, k)),
+        SelectExpr::Paren(inner) => field_chain_prefix(inner, prefix),
+        SelectExpr::Sub(left, right) | SelectExpr::Pipe(left, right) => {
+            let p = field_chain_prefix(left, prefix)?;
+            field_chain_prefix(right, &p)
+        }
+        SelectExpr::Identity | SelectExpr::Current => {
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_string())
+            }
+        }
+        _ => None,
     }
 }
 

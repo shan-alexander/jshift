@@ -349,9 +349,39 @@ impl<'a> Parser<'a> {
                         );
                     } else if self.peek() == Some('{') {
                         let right = self.parse_multi_hash()?;
+                        // Empty multi-hash after `.` is a syntax error (`a.{}`).
+                        if matches!(&right, SelectExpr::MultiSelectHash(f) if f.is_empty()) {
+                            return Err(Error::InvalidPath {
+                                msg: "Empty multi-select hash after '.'",
+                            });
+                        }
                         expr = chain_sub(expr, right);
                     } else if self.peek() == Some('[') {
+                        // Multi-select list after `.` cannot start with a bare number
+                        // (jmespath: `foo.[0]` / `foo.[0,1]` are invalid).
+                        let save = self.i;
+                        self.bump(); // '['
+                        self.skip_ws();
+                        let bad_number = self
+                            .peek()
+                            .is_some_and(|c| c == '-' || c.is_ascii_digit());
+                        self.i = save;
+                        if bad_number {
+                            return Err(Error::InvalidPath {
+                                msg: "Multi-select list after '.' cannot start with a number",
+                            });
+                        }
                         let right = self.parse_bracket_expr()?;
+                        // Reject multi-list items that are bare number literals mixed in.
+                        if let SelectExpr::MultiSelectList(items) = &right {
+                            for it in items {
+                                if matches!(it, SelectExpr::Literal(b) if is_json_number_lit(b)) {
+                                    return Err(Error::InvalidPath {
+                                        msg: "Number not allowed as multi-select list item here",
+                                    });
+                                }
+                            }
+                        }
                         expr = chain_sub(expr, right);
                     } else if self.peek() == Some('"') {
                         // Quoted identifier: "foo.bar", "foo bar", escapes
@@ -550,8 +580,7 @@ impl<'a> Parser<'a> {
 
     fn parse_bracket_common(&mut self, allow_multi_list: bool) -> Result<SelectExpr, Error> {
         self.eat('[')?;
-        self.skip_ws();
-        // filter
+        // Filter `?` must be immediately after `[` (no whitespace): `foo[?x]` ok, `foo[ ?x]` error.
         if self.peek() == Some('?') {
             self.bump();
             let pred = self.parse_pipe()?;
@@ -561,21 +590,26 @@ impl<'a> Parser<'a> {
                 each: Box::new(SelectExpr::Identity),
             }));
         }
-        // empty [] — list/flatten projection (acts like [*] on object arrays; flattens
-        // nested arrays when the projection result is nested). Represented as Each;
-        // trailing flatten is applied via Flatten when chained after filters/etc.
+        self.skip_ws();
+        // empty `[]` — JMESPath flatten operator / flatten-projection (not `[*]`).
+        // Represented as Flatten(Identity); chain_sub wraps prior expr as Flatten(prefix)
+        // and subsequent `.field` as Sub(Flatten(prefix), Each(field)).
         if self.peek() == Some(']') {
             self.bump();
-            return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
-                SelectExpr::Identity,
-            ))));
+            return Ok(SelectExpr::Flatten(Box::new(SelectExpr::Identity)));
         }
+        // `[*]` — list projection (no flatten). `[*.*]` is a multi-select list.
         if self.peek() == Some('*') {
+            let save = self.i;
             self.bump();
-            self.eat(']')?;
-            return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
-                SelectExpr::Identity,
-            ))));
+            if self.peek() == Some(']') {
+                self.bump();
+                return Ok(SelectExpr::Array(ArraySelect::Each(Box::new(
+                    SelectExpr::Identity,
+                ))));
+            }
+            self.i = save;
+            // fall through to multi-select list / other forms
         }
         // peek if slice/index-only: number, colon, minus
         let save = self.i;
@@ -647,13 +681,19 @@ impl<'a> Parser<'a> {
                     let e = self.bump().ok_or(Error::InvalidPath {
                         msg: "Bad escape",
                     })?;
-                    out.push(match e {
-                        '"' | '\\' | '/' => e,
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        other => other,
-                    });
+                    match e {
+                        '"' | '\\' | '/' => out.push(e),
+                        'b' => out.push('\u{0008}'),
+                        'f' => out.push('\u{000c}'),
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        'u' => {
+                            let ch = self.parse_unicode_escape()?;
+                            out.push(ch);
+                        }
+                        other => out.push(other),
+                    }
                 }
                 c => out.push(c),
             }
@@ -661,6 +701,58 @@ impl<'a> Parser<'a> {
         Err(Error::InvalidPath {
             msg: "Unclosed string",
         })
+    }
+
+    /// Parse `\uXXXX` (and surrogate pairs) after the `u` has already been consumed.
+    fn parse_unicode_escape(&mut self) -> Result<char, Error> {
+        let hi = self.read_u4_hex()?;
+        if (0xD800..=0xDBFF).contains(&hi) {
+            // High surrogate — require `\u` low surrogate.
+            if self.peek() != Some('\\') {
+                return Err(Error::InvalidPath {
+                    msg: "Lone UTF-16 high surrogate in quoted identifier",
+                });
+            }
+            self.bump();
+            if self.peek() != Some('u') {
+                return Err(Error::InvalidPath {
+                    msg: "Expected \\u after high surrogate",
+                });
+            }
+            self.bump();
+            let lo = self.read_u4_hex()?;
+            if !(0xDC00..=0xDFFF).contains(&lo) {
+                return Err(Error::InvalidPath {
+                    msg: "Invalid UTF-16 low surrogate",
+                });
+            }
+            let cp = 0x10000 + (((u32::from(hi) - 0xD800) << 10) | (u32::from(lo) - 0xDC00));
+            char::from_u32(cp).ok_or(Error::InvalidPath {
+                msg: "Invalid Unicode code point",
+            })
+        } else if (0xDC00..=0xDFFF).contains(&hi) {
+            Err(Error::InvalidPath {
+                msg: "Lone UTF-16 low surrogate in quoted identifier",
+            })
+        } else {
+            char::from_u32(u32::from(hi)).ok_or(Error::InvalidPath {
+                msg: "Invalid Unicode code point",
+            })
+        }
+    }
+
+    fn read_u4_hex(&mut self) -> Result<u16, Error> {
+        let mut v = 0u16;
+        for _ in 0..4 {
+            let c = self.bump().ok_or(Error::InvalidPath {
+                msg: "Incomplete \\u escape",
+            })?;
+            let dig = c.to_digit(16).ok_or(Error::InvalidPath {
+                msg: "Invalid hex in \\u escape",
+            })?;
+            v = (v << 4) | dig as u16;
+        }
+        Ok(v)
     }
 
     fn parse_raw_string_literal(&mut self) -> Result<SelectExpr, Error> {
@@ -672,14 +764,16 @@ impl<'a> Parser<'a> {
         self.eat('\'')?;
         let mut out = String::new();
         while let Some(c) = self.bump() {
-            if c == '\'' {
-                // '' escape
-                if self.peek() == Some('\'') {
-                    self.bump();
-                    out.push('\'');
-                } else {
-                    return Ok(out);
+            // Match jmespath.rs: on `\`, always take the next char into the buffer
+            // (so `\'` keeps both chars, `\\` keeps both). Closing `'` is only when
+            // unescaped. Then replace `\'` → `'`.
+            if c == '\\' {
+                out.push('\\');
+                if let Some(n) = self.bump() {
+                    out.push(n);
                 }
+            } else if c == '\'' {
+                return Ok(out.replace("\\'", "'"));
             } else {
                 out.push(c);
             }
@@ -691,14 +785,38 @@ impl<'a> Parser<'a> {
 
     fn parse_backtick_literal(&mut self) -> Result<SelectExpr, Error> {
         self.eat('`')?;
-        let start = self.i;
-        while self.peek().is_some_and(|c| c != '`') {
-            self.bump();
+        let mut raw = String::new();
+        while let Some(c) = self.peek() {
+            if c == '`' {
+                self.bump();
+                let inner = raw.trim();
+                // JSON fragment on the wire. Only `\`` is a JMESPath escape inside
+                // backticks; other backslashes are JSON escapes and must be preserved.
+                return Ok(SelectExpr::Literal(inner.as_bytes().to_vec()));
+            }
+            if c == '\\' {
+                self.bump();
+                match self.peek() {
+                    Some('`') => {
+                        self.bump();
+                        raw.push('`');
+                    }
+                    Some(e) => {
+                        // Preserve JSON escape sequences (\u, \", \\, …).
+                        raw.push('\\');
+                        raw.push(e);
+                        self.bump();
+                    }
+                    None => raw.push('\\'),
+                }
+            } else {
+                raw.push(c);
+                self.bump();
+            }
         }
-        let inner = self.s[start..self.i].trim();
-        self.eat('`')?;
-        // interpret as JSON fragment
-        Ok(SelectExpr::Literal(inner.as_bytes().to_vec()))
+        Err(Error::InvalidPath {
+            msg: "Unclosed backtick literal",
+        })
     }
 
     fn parse_number_literal(&mut self) -> Result<SelectExpr, Error> {
@@ -747,17 +865,26 @@ fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
+fn is_json_number_lit(b: &[u8]) -> bool {
+    let t = b.trim_ascii();
+    if t.is_empty() {
+        return false;
+    }
+    t.iter()
+        .all(|c| c.is_ascii_digit() || *c == b'-' || *c == b'+' || *c == b'.' || *c == b'e' || *c == b'E')
+        && t.iter().any(|c| c.is_ascii_digit())
+}
+
 fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
 fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
-    // Flatten projection `[]` applied after a value: flatten(prefix) or flatten(prefix|inner).
+    // `expr[]` → Flatten(expr)  (jmespath: Projection(Flatten(expr), Identity))
     if let SelectExpr::Flatten(inner) = &suffix {
         if matches!(inner.as_ref(), SelectExpr::Identity | SelectExpr::Current) {
             return SelectExpr::Flatten(Box::new(prefix));
         }
-        // rare: [] then more — flatten after applying inner to each of prefix
         return SelectExpr::Flatten(Box::new(chain_sub(prefix, *inner.clone())));
     }
     match prefix {
@@ -771,13 +898,12 @@ fn chain_sub(prefix: SelectExpr, suffix: SelectExpr) -> SelectExpr {
             // foo.*.bar → project each object value with .bar
             SelectExpr::ObjectProjection(Box::new(chain_into(*inner, suffix)))
         }
-        SelectExpr::Flatten(inner) => {
-            // people[].name → flatten(people) then project name per element:
-            // re-express as each-name then flatten
-            SelectExpr::Flatten(Box::new(SelectExpr::Array(ArraySelect::Each(Box::new(
-                chain_into(*inner, suffix),
-            )))))
-        }
+        // `foo[].bar` → Sub(Flatten(foo), Each(bar))
+        // (jmespath: Projection(Flatten(foo), bar))
+        SelectExpr::Flatten(inner) => SelectExpr::Sub(
+            Box::new(SelectExpr::Flatten(inner)),
+            Box::new(SelectExpr::Array(ArraySelect::Each(Box::new(suffix)))),
+        ),
         SelectExpr::Array(ArraySelect::Each(inner)) => {
             SelectExpr::Array(ArraySelect::Each(Box::new(chain_into(*inner, suffix))))
         }

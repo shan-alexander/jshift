@@ -397,6 +397,18 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 jshift::project_indexed(doc, &Self::schema_project_plan())
             }
 
+            /// Index arrays from the schema plan (if missing), then project.
+            pub fn project_indexed_prepare(
+                doc: &mut jshift::IndexedDocument<'_>,
+            ) -> Result<Vec<u8>, jshift::Error> {
+                jshift::project_indexed_prepare(doc, &Self::schema_project_plan())
+            }
+
+            /// One-shot: build plan indexes + project (see [`jshift::project_auto_indexed`]).
+            pub fn project_auto_indexed(json: &[u8]) -> Result<Vec<u8>, jshift::Error> {
+                jshift::project_auto_indexed(json, &Self::schema_project_plan())
+            }
+
             pub fn mutator(json: &mut Vec<u8>) -> #mutator_name {
                 #mutator_name { json }
             }

@@ -26,10 +26,17 @@ exclude = [
 default = ["derive"]
 # Proc-macro schemas: JsonMutatorSchema / JsonView derive.
 derive = ["dep:jshift-derive"]
+# Parallel list projections (rayon) for large indexed arrays — still 100% safe Rust.
+parallel = ["dep:rayon"]
+# In-process heap profiling for `examples/alloc_profile` (writes dhat-heap.json).
+# Not for production: replaces the global allocator in that example only.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 memchr = "2.7"
 jshift-derive = { version = "0.4.0", path = "./jshift-derive", optional = true }
+rayon = { version = "1.8", optional = true }
+dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -41,6 +48,10 @@ sonic-rs = "0.5"
 
 [[bench]]
 name = "json_benchmark"
+harness = false
+
+[[bench]]
+name = "project_benchmark"
 harness = false
 
 [workspace]

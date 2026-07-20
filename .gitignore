@@ -10,3 +10,8 @@
 /benches/**/*.json
 /benches/datasets/
 /benches/data/
+
+# Allocator / heap profiling artifacts (examples/alloc_profile, heaptrack)
+/dhat-heap.json
+/heaptrack.*.gz
+/heaptrack.*.raw

@@ -24,15 +24,27 @@
 //! | Feature | Default | Purpose |
 //! | --- | --- | --- |
 //! | `derive` | yes | `JsonMutatorSchema` / `JsonView` proc-macros |
+//! | `parallel` | no | Rayon-backed parallel list projections on large indexed arrays |
+//! | `dhat-heap` | no | dhat global allocator for `examples/alloc_profile` (local profiling only) |
 //!
 //! Core path engine and structural indexing always compile. Indexing is **opt-in at
 //! the call site** (`IndexedDocument`, `read_from_indexed`); never taxed on default finds.
+//! Parallel project is opt-in (`project_parallel` / `project_indexed_parallel`); use
+//! [`project_indexed_auto`] / [`project_parallel_auto`] to enable Rayon only when
+//! [`plan_prefers_parallel`] says the plan is CPU-heavy. Streaming cards:
+//! [`project_each`] / [`project_jsonl_write`] (no giant output array).
 //!
 //! ```toml
 //! jshift = { version = "0.4", features = ["derive"] }
 //! # core only (no proc-macros):
 //! jshift = { version = "0.4", default-features = false }
+//! # bulk array project with rayon:
+//! jshift = { version = "0.4", features = ["parallel"] }
 //! ```
+//!
+//! Measurement: Criterion (`benches/`), RSS (`scripts/measure_rss.sh`), dhat/heaptrack
+//! (`examples/alloc_profile`). Large fixtures: `scripts/fetch_teefury.sh` +
+//! `scripts/build_large_catalog.sh` → gitignored `benches/data/large.json`.
 //!
 //! CI verifies both default and `--no-default-features` builds.
 //!
@@ -42,11 +54,14 @@
 //! * **[`JsonView`] trait:** one protocol surface for typed projections of bytes.
 //! * **Macro-generated schemas:** `#[derive(JsonView)]` / `JsonMutatorSchema`.
 //! * **Shared buffers:** [`SharedDocument`] (`Arc<[u8]>`) for read-heavy fan-out.
-//! * **JSONL helpers:** [`json_lines`], message-at-a-time indexing.
+//! * **JSONL helpers:** [`json_lines`], message-at-a-time indexing; array→NDJSON cards via
+//!   [`project_jsonl_write`] / [`project_object_fields_jsonl_write`].
 //! * **Field projection:** [`project`] / [`project_paths`] / [`project_jmespath`] /
-//!   [`ProjectPlan`] (keep-list + JMESPath subset → new JSON).
+//!   [`ProjectPlan`] (keep-list + JMESPath subset → new JSON); streaming
+//!   [`project_each`] for per-row cards without a giant output array.
 //! * **Projection estimates:** [`estimate_projected_len`] / [`projected_len`].
 //! * **Structural array indexes:** [`IndexedDocument`] side-tables for large arrays.
+//! * **Parallel auto-pick:** [`plan_prefers_parallel`] + [`project_indexed_auto`].
 //!
 //! # Quick Start
 //! ```
@@ -183,12 +198,18 @@ pub use mutate::{
 };
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
-    estimate_projected_len, estimate_values_len, parse_jmespath_expr, parse_project_path, project,
-    project_indexed, project_into, project_jmespath, project_paths, project_write, projected_len,
-    select_from_project_path, ArraySelect, CmpOp, CountingSink, HashField, MissingPolicy,
-    ObjectSelect, ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr, Transform,
-    TransformPipeline, WriteSink,
+    estimate_projected_len, estimate_values_len, parse_jmespath_expr, parse_project_path,
+    plan_object_fields, plan_prefers_parallel, project, project_auto_indexed, project_each,
+    project_each_indexed, project_indexed, project_indexed_auto, project_indexed_prepare,
+    project_into, project_jmespath, project_jsonl_write, project_jsonl_write_indexed,
+    project_object_fields, project_object_fields_each, project_object_fields_each_indexed,
+    project_object_fields_jsonl_write, project_parallel_auto, project_paths, project_write,
+    projected_len, select_from_project_path, ArraySelect, CmpOp, CountingSink, HashField,
+    MissingPolicy, ObjectSelect, ProjectPathSegment, ProjectPlan, ProjectStyle, SelectExpr,
+    Transform, TransformPipeline, WriteSink,
 };
+#[cfg(feature = "parallel")]
+pub use project::{project_indexed_parallel, project_object_fields_parallel, project_parallel};
 pub use scan::find_value;
 pub use view::{read_view, write_view, JsonView};
 

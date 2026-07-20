@@ -193,6 +193,8 @@ impl ArrayIndex {
         self.element_starts.get(i).map(|&o| o as usize)
     }
 
+    /// Offset of the region after element `i` (next start or `]`). Not a precise value end.
+    /// Prefer [`Self::element_value_span`] for a true JSON value range.
     pub fn element_end(&self, i: usize) -> Option<usize> {
         if i >= self.element_starts.len() {
             return None;
@@ -202,6 +204,24 @@ impl ArrayIndex {
         } else {
             Some(self.close as usize)
         }
+    }
+
+    /// Precise on-wire value span for element `i`: `[start, end)` via `skip_value`.
+    ///
+    /// O(1) jump to the element start, then a single value scan for its end.
+    /// Does **not** scan sibling elements — critical for `products[i]` on huge arrays.
+    pub fn element_value_span(&self, json: &[u8], i: usize) -> Result<(usize, usize), Error> {
+        let start = self
+            .element_start(i)
+            .ok_or(Error::IndexOutOfBounds { index: i })?;
+        if start >= json.len() {
+            return Err(Error::InvalidJsonSyntax {
+                pos: start,
+                msg: "Array index points past end of buffer",
+            });
+        }
+        let end = skip_value(json, start)?;
+        Ok((start, end))
     }
 
     pub fn starts(&self) -> &[u32] {
@@ -360,6 +380,39 @@ impl<'a> IndexedDocument<'a> {
         self.index_array(&segs)
     }
 
+    /// Index every array path a [`crate::ProjectPlan`] will walk (idempotent).
+    ///
+    /// Builds Stage-1 structurals when missing (helps large-array table builds), then
+    /// array side-tables for each path from [`crate::ProjectPlan::array_paths_for_index`].
+    /// Already-indexed paths are left unchanged.
+    ///
+    /// ```
+    /// use jshift::{IndexedDocument, ProjectPlan, project_indexed};
+    ///
+    /// let json = br#"{"products":[{"id":1},{"id":2},{"id":3}]}"#;
+    /// let plan = ProjectPlan::from_paths(&["products[2].id"]).unwrap();
+    /// let mut doc = IndexedDocument::empty(json);
+    /// doc.index_for_plan(&plan).unwrap();
+    /// assert_eq!(project_indexed(&doc, &plan).unwrap(), br#"{"products":{"id":3}}"#);
+    /// ```
+    pub fn index_for_plan(&mut self, plan: &crate::ProjectPlan) -> Result<(), Error> {
+        if self.structural.is_none() {
+            self.index_structural()?;
+        }
+        for p in plan.array_paths_for_index() {
+            let segs = crate::path::parse_path(&p);
+            if self.lookup_array(&segs).is_none() {
+                // Path may not exist in this document (soft project); skip quietly.
+                match self.index_array(&segs) {
+                    Ok(()) => {}
+                    Err(Error::PathNotFound) | Err(Error::TypeMismatch { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Index all keys of the object at `path` (value must be `{...}`).
     pub fn index_object(&mut self, path: &[PathSegment]) -> Result<(), Error> {
         let owned = path_to_owned(path);
@@ -384,6 +437,25 @@ impl<'a> IndexedDocument<'a> {
 
     pub fn object_index(&self, path: &[PathSegment]) -> Option<&ObjectKeyIndex> {
         self.lookup_object(path).map(|(_, t)| t)
+    }
+
+    /// Look up an array side-table by the absolute offset of its opening `[`.
+    ///
+    /// Used by the projector to jump elements in O(1) when the array was indexed
+    /// (path-based) and emit visits the same on-wire span.
+    pub fn array_index_at_open(&self, open: usize) -> Option<&ArrayIndex> {
+        self.arrays
+            .iter()
+            .find(|(_, t)| t.open() == open)
+            .map(|(_, t)| t)
+    }
+
+    /// Look up an object key map by the absolute offset of its opening `{`.
+    pub fn object_index_at_open(&self, open: usize) -> Option<&ObjectKeyIndex> {
+        self.objects
+            .iter()
+            .find(|(_, t)| t.open() == open)
+            .map(|(_, t)| t)
     }
 
     /// Find using array / object indexes when applicable; else normal path scan.
