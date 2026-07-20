@@ -7,118 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Streaming cards / JSONL (P3):** `project_each` / `project_each_indexed`,
-  `project_object_fields_each` / `_indexed`, `project_jsonl_write` /
-  `project_jsonl_write_indexed` / `project_object_fields_jsonl_write` — project one
-  list-projection element at a time (callback or NDJSON line) without building a
-  giant `[card,…]` output array. Peak RAM tracks one card + input.
-- **Parallel auto-pick:** `plan_prefers_parallel`, `project_indexed_auto`,
-  `project_parallel_auto` — enable Rayon `[*]` only when the plan looks CPU-heavy
-  (filters, functions, nested list work); thin pure-field multi-select stays
-  sequential (memory-bound). Without feature `parallel`, auto-pick is sequential.
-- **P4 measurement hygiene:** Criterion large groups for index build, first-element
-  after P0, filter cards, flatten variant prices; `scripts/build_large_catalog.sh`
-  (merge Shopify-style pages → `large.json`); `scripts/measure_rss.sh` +
-  `examples/rss_project_profile`; `examples/alloc_profile` with optional feature
-  `dhat-heap` and heaptrack recipe for precise allocator stats.
-- **Hero matrix:** `examples/hero_matrix.rs` multi-size (≈500 KiB / 10 MiB / large)
-  timings vs serde_json / gjson / sonic-rs for find, mutate, sparse access, thin
-  cards; results form the root README hero table above “Why jshift exists.”
-- **JSONL bench + docs:** `examples/jsonl_bench.rs` on `benches/data/3k_lines_4mb.jsonl`;
-  README Quick Start split into API ingest (data engineering) vs JSONL AI data prep;
-  Capabilities rewritten as full 0.4 API map.
+## [0.4.0] - 2026-07-20
 
-### Changed
-- **Dead-code cleanup:** removed unused `emit::resolve_focus` (superseded by
-  index-aware `resolve_focus_idx` / `_start_idx`); dropped unused `EmitCtx.arena`;
-  `allow_parallel` is `cfg(feature = "parallel")` only; `focus.rs` is a design
-  contract module (no parallel unused state machine).
-- **Field projection:** `project`, `project_paths`, `project_jmespath`, `project_into`,
-  `project_write`, `ProjectPlan`, `SelectExpr` AST (`Field`, multi-select hash/list,
-  pipe, flatten, slices, filters, comparisons, `&&`/`||`/`!`, functions, literals),
-  `parse_project_path` / `parse_jmespath_expr`, styles (`Compact`, richer
-  `PreserveSource`, `Pretty`), `MissingPolicy`, `projected_len`.
-  Derive / `JsonView`: `schema_project_plan`, `project_json` / `project_bytes`.
-- **JMESPath surface:** filters `[?…]`, signed indices/slices, object projection
-  (`*` / `foo.*` / `*.bar`), multi-select list/hash, pipe/flatten, comparisons &
-  `&&`/`||`/`!`, expression refs `&expr`, functions including higher-order
-  `map` / `sort_by` / `max_by` / `min_by` / `group_by` plus `length`, `keys`,
-  `values`, `type`, `to_string`, `to_number`, `starts_with`, `ends_with`,
-  `contains`, `not_null`, `reverse`, `sort`, `join`, `max`/`min`/`sum`/`avg`,
-  `abs`/`ceil`/`floor`, `to_array`, `merge`; quoted identifiers; projections omit
-  nulls; missing paths → JSON `null` under default soft policy; `Error::Jmespath`.
-- **Tests:** `tests/jmespath_features.rs`; official suite runner
-  `tests/jmespath_compliance.rs` + vendored `tests/fixtures/jmespath/` (tier A
-  strict; **full suite 0 residuals**, ≥740 value passes). CI job runs compliance.
-- **Fuzz:** `fuzz/fuzz_targets/project_jmespath.rs`, `project_paths.rs`.
-- **Projector product APIs:**
-  - Streaming `project_write` via `WriteSink` (no full-output `Vec`)
-  - Exact `projected_len` via `CountingSink` (no retained output)
-  - **`project_indexed`**: index-wired emit (array/object side-tables by open offset)
-  - **P0 sparse project:** single-index short-circuit, open-ended field descent, no root
-    `skip_value` of whole document; keep-list last-field skip avoidance. On a 338 MiB
-    TeeFury catalog, `products[0].id/title` went from ~1.0 s → **~7 µs**; indexed
-    `products[24999]` keep-list **~50 µs** vs ~0.7 s unindexed.
-  - **P1 index-for-plan:** `ProjectPlan::array_paths_for_index`,
-    `IndexedDocument::index_for_plan`, `project_auto_indexed` /
-    `project_indexed_prepare`; emit Each/Filter iterates side-table starts without
-    pre-collecting all element ends.
-  - **Streaming list projections:** Compact/Pretty `[*]` / filter / slice no longer
-    clone the child AST per element or buffer the full kept list; multi-select hash
-    pure fields copy leaf spans without temporary `Vec`s (bulk-card path).
-  - **One-pass multi-select fields:** pure-field multi-select hashes (`{a: a, b: b}` /
-    renames) scan each object **once** for all requested keys, early-exit when done,
-    style-aware emit; mixed/nested exprs keep per-field eval. Domain-agnostic.
-  - **`project_object_fields(array_path, fields)`:** generic thin-card helper (not
-    catalog-specific).
-  - **Feature `parallel`:** Rayon-backed `project_parallel` /
-    `project_indexed_parallel` / `project_object_fields_parallel` for large indexed
-    `[*]` walks (safe; byte-identical to sequential).
-  - **Heavy parallel fixture + bench:** `examples/gen_heavy_parallel_fixture.rs` and
-    Criterion group `heavy parallel list project` (CPU-heavy nested filters so parallel
-    can shine; ~7× vs sequential on a ~170 MiB generated `records[]` dump).
-  - **README:** competitive large-file Criterion tables (jshift / gjson / sonic-rs /
-    serde_json) on 338 MiB catalog.
-  - Pure projection/pipe paths resolve to document spans (no intermediate tree copies)
-  - Flatten-projection `[]` vs list-projection `[*]` per JMESPath
-  - `Transform` / `TransformPipeline` (KeepPaths, Jmes, Rename, Drop, Inject, Style)
-  - Full `PreserveSource` whitespace replay on kept object/array structure
-  - Derive: `#[json(jmes = "...")]` + `FIELD_JMES` multi-select project plan
-- **Benches:** `benches/project_benchmark.rs` (synthetic 10/50/100 MB + optional
-  `JSHIFT_LARGE_JSON` / `benches/data/large.json` for 100–300 MB files).
-- **Real catalog tests:** `tests/teefury_project.rs` + `scripts/fetch_teefury.sh`
-  (gitignored fixtures under `benches/data/`; skips when absent).
-- **Docs:** expanded `jshift_for_data_engineering.md` (projection + JMESPath + accuracy).
-
-## [0.4.0] - 2026-07-19
-
-API maturity pass (prost product architecture, not Protobuf wire format).
+API maturity pass: open document views, field projection / JMESPath subset, streaming
+cards, parallel list project, and measurement tooling. Still `#![forbid(unsafe_code)]`.
 
 ### Added
-- **`JsonView` trait**: single protocol surface (`read_from`, `read_from_indexed`,
-  `read_from_doc`, `write_into`) for typed projections of JSON bytes; free helpers
-  `read_view` / `write_view`.
+
+#### Views, documents, JSONL
+- **`JsonView` trait**: `read_from` / `read_from_indexed` / `read_from_doc` / `write_into`
+  for typed projections of JSON bytes; free helpers `read_view` / `write_view`.
 - **Derive implements `JsonView`:** `#[derive(JsonView)]` alias of `JsonMutatorSchema`;
-  `FIELD_PATHS`, `prepare()`, `from_indexed_document()`, `write_into_json()`,
-  `estimate_projected_len()` on schema types.
-- **`SharedDocument`**: cheaply cloneable `Arc<[u8]>` buffer for read-heavy fan-out
-  (`read` / `read_indexed` / `indexed`).
+  `FIELD_PATHS`, `FIELD_JMES`, `INDEXED_ARRAY_PATHS`, `prepare()`, mutators,
+  `project_json` / `schema_project_plan`, index-aware project helpers.
+- **`SharedDocument`**: cheaply cloneable `Arc<[u8]>` for read-heavy fan-out.
 - **JSONL helpers:** `json_lines`, `JsonLines`, `read_jsonl`, `read_jsonl_indexed`,
   `read_line_indexed` (message-at-a-time indexing).
-- **Projection estimates:** `estimate_projected_len`, `estimate_values_len`
-  (planning ballpark only; not a stream projector).
 - **Cargo feature `derive`** (default). Core path + index APIs always compile;
   indexing remains **opt-in at call site**.
-- Docs: open-document semantics, explicit non-goals, loud **index goes stale after
-  mutate** contract.
-- CI: `cargo test --no-default-features` (+ doctests) and explicit `--features derive`.
+
+#### Field projection / JMESPath subset
+- **`project` / `project_paths` / `project_jmespath` / `project_into` / `project_write`**,
+  `ProjectPlan`, `SelectExpr` AST (fields, multi-select, pipe, flatten, slices,
+  filters, comparisons, `&&`/`||`/`!`, functions, literals), styles
+  (`Compact` / `PreserveSource` / `Pretty`), `MissingPolicy`, `projected_len` /
+  `estimate_projected_len` / `estimate_values_len`.
+- **JMESPath surface:** filters, slices, object projection (`*` / `foo.*` / `*.bar`),
+  multi-select list/hash, flatten `[]` vs list `[*]`, expression refs, higher-order
+  `map` / `sort_by` / `max_by` / `min_by` / `group_by` plus standard functions;
+  soft null semantics; `Error::Jmespath`.
+- **`project_indexed` / `project_auto_indexed` / `project_indexed_prepare`**,
+  `ProjectPlan::array_paths_for_index`, `IndexedDocument::index_for_plan`.
+- **P0 sparse project:** open-ended descent, no root full-document `skip_value` for
+  non-Identity plans; keep-list last-field skip avoidance.
+- **Streaming list emit** for `[*]` / filter / slice; **one-pass pure-field multi-select**.
+- **`project_object_fields` / `plan_object_fields`:** domain-agnostic thin cards.
+- **Streaming cards / JSONL emit:** `project_each` / `project_object_fields_each`,
+  `project_jsonl_write` / `project_object_fields_jsonl_write` (+ indexed variants).
+- **Feature `parallel`:** Rayon `project_parallel` / `project_indexed_parallel` /
+  `project_object_fields_parallel`; **`plan_prefers_parallel`**, `project_indexed_auto`,
+  `project_parallel_auto`.
+- **`Transform` / `TransformPipeline`** (KeepPaths, Jmes, Rename, Drop, Inject, Style).
+- **Derive:** `#[json(jmes = "...")]` multi-select project plan.
+
+#### Tests, benches, docs tooling
+- JMESPath compliance suite (tier A + full suite gate, zero residuals on vendored fixtures).
+- Fuzz targets for project paths / jmespath.
+- Criterion project benches; optional large-file / heavy-parallel fixtures (gitignored).
+- Examples: `hero_matrix`, `jsonl_bench`, `gen_jsonl_fixture`, `gen_heavy_parallel_fixture`,
+  `rss_project_profile`, `alloc_profile` (optional feature `dhat-heap`).
+- Scripts: `fetch_teefury.sh`, `build_large_catalog.sh`, `measure_rss.sh`.
+- README hero matrix, large-file tables, JSONL Quick Start; CI for core-only + compliance.
 
 ### Notes
-- Unmentioned JSON paths stay unread / byte-preserved on `write_into` (productized).
-- Schema-complete index plan: derive still emits only path-needed array prefixes.
-- Derive-dependent unit/doctests are `cfg(feature = "derive")` so core-only builds
-  are real and verified.
+- Unmentioned JSON paths stay unread / byte-preserved on `write_into`.
+- Indexes bind to a byte snapshot; rebuild or drop after in-place mutate.
+- Derive-dependent tests are `cfg(feature = "derive")` so core-only builds are real.
+- Large fixtures under `benches/data/` are gitignored and not published to crates.io.
 
 ## [0.3.1] - 2026-07-19
 
@@ -235,7 +180,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/shan-alexander/jshift/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/shan-alexander/jshift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/shan-alexander/jshift/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/shan-alexander/jshift/compare/v0.2.1...v0.2.2

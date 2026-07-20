@@ -2,7 +2,10 @@
 
 Procedural macros for [**jshift**](https://crates.io/crates/jshift): schema-guided, **100% safe Rust** JSON path reading, **in-place** mutation, and field projection on raw byte buffers.
 
-You almost never depend on this crate directly. Depend on **`jshift`** (feature `derive` is **on by default**); the macros are re-exported as `jshift::JsonView` / `jshift::JsonMutatorSchema`.
+**`jshift` has blazing fast speeds when working with JSON data, +2x to +20000x speeds compared to `serde`** 🚀
+
+> [!IMPORTANT]
+> You almost never depend on this crate directly. Depend on **`jshift`** (feature `derive` is **on by default**); the macros are re-exported as `jshift::JsonView` / `jshift::JsonMutatorSchema`.
 
 ```toml
 [dependencies]
