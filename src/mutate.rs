@@ -140,6 +140,126 @@ pub fn append_to_array(
     Ok(())
 }
 
+/// Insert `new_element` as the first element of the array at `path`.
+///
+/// Equivalent to [`insert_array_element`] with `index == 0`.
+///
+/// # Examples
+/// ```
+/// use jshift::{prepend_to_array, parse_path};
+///
+/// let mut json = b"{\"list\": [10, 20]}".to_vec();
+/// prepend_to_array(&mut json, &parse_path("list"), b"5").unwrap();
+/// assert_eq!(json, b"{\"list\": [5,10, 20]}".to_vec());
+/// ```
+pub fn prepend_to_array(
+    json: &mut Vec<u8>,
+    path: &[PathSegment],
+    new_element: &[u8],
+) -> Result<(), Error> {
+    insert_array_element(json, path, 0, new_element)
+}
+
+/// Insert `new_element` into the array at `path` so it becomes the element at `index`.
+///
+/// - `index == 0` prepends (same as [`prepend_to_array`]).
+/// - `index == array_len` appends (same as [`append_to_array`]).
+/// - `index > array_len` returns [`Error::PathNotFound`].
+///
+/// # Examples
+/// ```
+/// use jshift::{insert_array_element, parse_path};
+///
+/// let mut json = b"{\"list\": [10, 30]}".to_vec();
+/// insert_array_element(&mut json, &parse_path("list"), 1, b"20").unwrap();
+/// assert_eq!(json, b"{\"list\": [10, 20,30]}".to_vec());
+/// ```
+pub fn insert_array_element(
+    json: &mut Vec<u8>,
+    path: &[PathSegment],
+    index: usize,
+    new_element: &[u8],
+) -> Result<(), Error> {
+    if new_element.is_empty() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "Inserted value must not be empty",
+        });
+    }
+
+    let (start, end) = find_value_offsets(json, path)?;
+    require_container(json, start, end, b'[', b']', "array", "primitive/object")?;
+
+    let is_empty = is_array_empty(json, start, end)?;
+    if is_empty {
+        if index != 0 {
+            return Err(Error::PathNotFound);
+        }
+        // Insert only the value before `]`.
+        let insertion_point = end - 1;
+        grow_and_shift_right(json, insertion_point, new_element.len())?;
+        json[insertion_point..insertion_point + new_element.len()].copy_from_slice(new_element);
+        return Ok(());
+    }
+
+    // Non-empty: walk to find insertion byte offset.
+    let mut pos = skip_whitespace(json, start + 1);
+    let mut i = 0usize;
+    loop {
+        if pos >= end || json[pos] == b']' {
+            // index == len → append before `]`
+            if i == index {
+                let insertion_point = end - 1;
+                let delta = new_element.len().checked_add(1).ok_or(Error::InvalidJsonSyntax {
+                    pos: insertion_point,
+                    msg: "Buffer size overflow",
+                })?;
+                grow_and_shift_right(json, insertion_point, delta)?;
+                json[insertion_point] = b',';
+                json[insertion_point + 1..insertion_point + 1 + new_element.len()]
+                    .copy_from_slice(new_element);
+                return Ok(());
+            }
+            return Err(Error::PathNotFound);
+        }
+
+        if i == index {
+            // Insert `value,` before this element.
+            let insertion_point = pos;
+            let delta = new_element.len().checked_add(1).ok_or(Error::InvalidJsonSyntax {
+                pos: insertion_point,
+                msg: "Buffer size overflow",
+            })?;
+            grow_and_shift_right(json, insertion_point, delta)?;
+            json[insertion_point..insertion_point + new_element.len()].copy_from_slice(new_element);
+            json[insertion_point + new_element.len()] = b',';
+            return Ok(());
+        }
+
+        pos = skip_value(json, pos)?;
+        pos = skip_whitespace(json, pos);
+        if pos < json.len() && json[pos] == b',' {
+            pos += 1;
+            pos = skip_whitespace(json, pos);
+            i = i.checked_add(1).ok_or(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Array length overflow",
+            })?;
+        } else if pos < json.len() && json[pos] == b']' {
+            // last element finished; next loop handles append / OOB
+            i = i.checked_add(1).ok_or(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Array length overflow",
+            })?;
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected comma ',' or closing bracket ']'",
+            });
+        }
+    }
+}
+
 fn is_array_empty(json: &[u8], start: usize, end: usize) -> Result<bool, Error> {
     if start + 1 >= end {
         return Err(Error::InvalidJsonSyntax {

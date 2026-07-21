@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-20
+
+Array insert/prepend primitives and derive mutator helpers. Still no `get_*` / `delete_*`
+on the mutator (use free functions / `read_from_json`).
+
+### Added
+- **`prepend_to_array` / `insert_array_element`:** insert at front or at `index`
+  (`0` = prepend, `len` = append; `index > len` → `PathNotFound`). Nested paths
+  supported (same as `append_to_array`).
+- **Derive mutator (`Vec` fields):** `prepend_<field>` and `insert_<field>(index, val)`
+  wrapping the new free functions.
+- **Example:** `examples/array_insert_bench.rs` — ~50 MiB free-function + open mutator
+  + JMES sparse read vs serde full parse.
+- **CI:** `cargo test --features parallel --lib` job.
+
 ## [0.4.0] - 2026-07-20
 
 API maturity pass: open document views, field projection / JMESPath subset, streaming
@@ -180,7 +195,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/shan-alexander/jshift/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/shan-alexander/jshift/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/shan-alexander/jshift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/shan-alexander/jshift/compare/v0.2.2...v0.3.0

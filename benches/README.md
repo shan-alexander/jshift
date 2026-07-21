@@ -1,6 +1,6 @@
 # jshift benchmarks
 
-## Hero matrix (README “task × size × competitor” table)
+## Hero matrix 
 
 ```bash
 cargo run --release --example hero_matrix

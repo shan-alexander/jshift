@@ -193,8 +193,8 @@ pub use index::{
 };
 pub use jsonl::{json_lines, read_jsonl, read_jsonl_indexed, read_line_indexed, JsonLines};
 pub use mutate::{
-    append_to_array, array_len, delete_index, delete_key, mutate_value, mutate_value_checked,
-    upsert_at_path, upsert_object_key,
+    append_to_array, array_len, delete_index, delete_key, insert_array_element, mutate_value,
+    mutate_value_checked, prepend_to_array, upsert_at_path, upsert_object_key,
 };
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
@@ -307,6 +307,37 @@ mod tests {
     }
 
     #[test]
+    fn test_array_prepend_and_insert() {
+        let mut json = b"{\"list\": []}".to_vec();
+        prepend_to_array(&mut json, &parse_path("list"), b"1").unwrap();
+        assert_eq!(json, b"{\"list\": [1]}");
+        prepend_to_array(&mut json, &parse_path("list"), b"0").unwrap();
+        assert_eq!(json, b"{\"list\": [0,1]}");
+        insert_array_element(&mut json, &parse_path("list"), 1, b"x").unwrap();
+        assert_eq!(json, b"{\"list\": [0,x,1]}");
+        insert_array_element(&mut json, &parse_path("list"), 3, b"9").unwrap(); // append
+        assert_eq!(json, b"{\"list\": [0,x,1,9]}");
+        assert!(matches!(
+            insert_array_element(&mut json, &parse_path("list"), 99, b"z"),
+            Err(Error::PathNotFound)
+        ));
+    }
+
+    #[test]
+    fn test_array_prepend_insert_nested_path() {
+        let mut json = br#"{"a":{"b":[10,30],"c":true}}"#.to_vec();
+        let path = parse_path("a.b");
+        insert_array_element(&mut json, &path, 1, b"20").unwrap();
+        assert_eq!(find_value(&json, &parse_path("a.b[1]")).unwrap(), b"20");
+        assert_eq!(array_len(&json, &path).unwrap(), 3);
+        prepend_to_array(&mut json, &path, b"5").unwrap();
+        assert_eq!(find_value(&json, &parse_path("a.b[0]")).unwrap(), b"5");
+        assert_eq!(array_len(&json, &path).unwrap(), 4);
+        // sibling key preserved
+        assert_eq!(find_value(&json, &parse_path("a.c")).unwrap(), b"true");
+    }
+
+    #[test]
     fn test_array_len() {
         let json = b"{\"empty\": [], \"list\": [1, 2, 3]}";
         assert_eq!(array_len(json, &parse_path("empty")), Ok(0));
@@ -408,6 +439,8 @@ mod tests {
         mutator.set_score(&99.9).unwrap();
         mutator.set_name("new_name").unwrap();
         mutator.append_tags("cool").unwrap();
+        mutator.prepend_tags("first").unwrap();
+        mutator.insert_tags(1, "mid").unwrap();
 
         let updated = Config::read_from_json(&json).unwrap();
         assert_eq!(updated.version, 2);
@@ -416,6 +449,8 @@ mod tests {
         assert_eq!(
             updated.tags,
             vec![
+                "first".to_string(),
+                "mid".to_string(),
                 "rust".to_string(),
                 "fast".to_string(),
                 "cool".to_string()

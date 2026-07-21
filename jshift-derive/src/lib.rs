@@ -263,10 +263,31 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
 
         if is_vec_type(field_type) {
             let append_name = Ident::new(&format!("append_{}", field_name), field_name.span());
+            let prepend_name = Ident::new(&format!("prepend_{}", field_name), field_name.span());
+            let insert_name = Ident::new(&format!("insert_{}", field_name), field_name.span());
             mutator_setters.push(quote! {
                 pub fn #append_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
                     let bytes = jshift::ToJsonBytes::to_json_bytes(val);
                     jshift::append_to_array(self.json, #struct_name::#path_const_name, &bytes)
+                }
+
+                pub fn #prepend_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
+                    let bytes = jshift::ToJsonBytes::to_json_bytes(val);
+                    jshift::prepend_to_array(self.json, #struct_name::#path_const_name, &bytes)
+                }
+
+                pub fn #insert_name(
+                    &mut self,
+                    index: usize,
+                    val: &(impl jshift::ToJsonBytes + ?Sized),
+                ) -> Result<(), jshift::Error> {
+                    let bytes = jshift::ToJsonBytes::to_json_bytes(val);
+                    jshift::insert_array_element(
+                        self.json,
+                        #struct_name::#path_const_name,
+                        index,
+                        &bytes,
+                    )
                 }
             });
         }
