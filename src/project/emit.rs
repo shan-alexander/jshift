@@ -857,6 +857,101 @@ fn collect_array_elems_idx(
     collect_array_elems_scan(json, start, end)
 }
 
+/// Stream each kept list-projection card (`[*]`, `[?pred]`, slice) into `f`.
+///
+/// Applies `each` per source element, omits JSON `null` cards (list-projection
+/// semantics). Peak RAM is one card buffer — same policy as [`emit_array_stream`].
+pub(crate) fn for_each_projected_card<F>(
+    json: &[u8],
+    open: usize,
+    end: usize,
+    sel: &ArraySelect,
+    each: &SelectExpr,
+    ctx: &mut EmitCtx<'_>,
+    mut f: F,
+) -> Result<(), Error>
+where
+    F: FnMut(usize, &[u8]) -> Result<(), Error>,
+{
+    let mut card = Vec::new();
+    let mut out_index = 0usize;
+    let side = ctx.index;
+
+    let mut emit_card = |json: &[u8],
+                         s: usize,
+                         e: usize,
+                         ctx: &mut EmitCtx<'_>|
+     -> Result<(), Error> {
+        card.clear();
+        emit_value(json, s, e, each, ctx, &mut card)?;
+        if is_emitted_null(&card) {
+            return Ok(());
+        }
+        f(out_index, &card)?;
+        out_index += 1;
+        Ok(())
+    };
+
+    match sel {
+        ArraySelect::Each(_) => {
+            for_each_array_element(json, open, end, side, |_, s, e| {
+                emit_card(json, s, e, ctx)
+            })
+        }
+        ArraySelect::Filter { pred, each: _ } => {
+            for_each_array_element(json, open, end, side, |_, s, e| {
+                let pv = eval_buf(json, s, e, pred, ctx)?;
+                if is_truthy(&pv) {
+                    emit_card(json, s, e, ctx)?;
+                }
+                Ok(())
+            })
+        }
+        ArraySelect::Slice {
+            start: st,
+            end: en,
+            step,
+            each: _,
+        } => {
+            if step == &Some(0) {
+                return Err(Error::Jmespath {
+                    msg: "Invalid slice: step cannot be 0",
+                });
+            }
+            if let Some(ai) = array_side_table(json, open, side) {
+                let idxs = resolve_slice(ai.len(), *st, *en, *step);
+                for i in idxs {
+                    let s = ai.element_start(i).unwrap();
+                    let e = skip_value_smart(json, s, side)?;
+                    emit_card(json, s, e, ctx)?;
+                }
+            } else {
+                let starts = array_element_starts_scan(json, open, end)?;
+                let idxs = resolve_slice(starts.len(), *st, *en, *step);
+                for i in idxs {
+                    let s = starts[i] as usize;
+                    let e = skip_value(json, s)?;
+                    emit_card(json, s, e, ctx)?;
+                }
+            }
+            Ok(())
+        }
+        ArraySelect::Indices(_) => Err(Error::Jmespath {
+            msg: "project_each does not support multi-index list projections",
+        }),
+    }
+}
+
+fn is_emitted_null(v: &[u8]) -> bool {
+    let s = skip_whitespace(v, 0);
+    v.get(s..s + 4) == Some(b"null")
+        && (s + 4 >= v.len()
+            || matches!(
+                v[s + 4],
+                b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}'
+            ))
+}
+
 /// Iterate every array element without materializing a full `Vec` of spans first.
 ///
 /// With a side-table: O(1) start per element via [`ArrayIndex::element_start`], then

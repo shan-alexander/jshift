@@ -1,5 +1,5 @@
-//! Bench array splice + derive mutator (`set_*` / `append_*` / `prepend_*` / `insert_*`)
-//! and JMES field read on a ~50 MiB document vs serde_json.
+//! Bench array splice + derive mutator (`set_*` / `append_*` / `prepend_*` / `insert_*` /
+//! `delete_*`) + `project_each` (list / filter / slice) on a ~50 MiB document vs serde_json.
 //!
 //! ```bash
 //! cargo run --release --example array_insert_bench
@@ -10,8 +10,8 @@ use std::env;
 use std::time::{Duration, Instant};
 
 use jshift::{
-    append_to_array, array_len, insert_array_element, parse_path, prepend_to_array, project_jmespath,
-    JsonMutatorSchema,
+    append_to_array, array_len, delete_index, insert_array_element, parse_path, prepend_to_array,
+    project_each, project_jmespath, JsonMutatorSchema, ProjectPlan,
 };
 
 /// Open view over root metadata — does **not** load the huge `items` array.
@@ -76,7 +76,12 @@ fn gen_catalog(target_mib: usize) -> Vec<u8> {
         out.extend_from_slice(i.to_string().as_bytes());
         out.extend_from_slice(br#","t":"item-"#);
         out.extend_from_slice(i.to_string().as_bytes());
-        out.extend_from_slice(br#"-xxxxxxxxxxxxxxxx","n":true}"#);
+        // Alternate `n` so filter `items[?n]` keeps ~half the catalog.
+        if i % 2 == 0 {
+            out.extend_from_slice(br#"-xxxxxxxxxxxxxxxx","n":true}"#);
+        } else {
+            out.extend_from_slice(br#"-xxxxxxxxxxxxxxxx","n":false}"#);
+        }
         i += 1;
     }
     out.extend_from_slice(br#"]}"#);
@@ -219,6 +224,145 @@ fn main() {
         let _ = serde_json::to_vec(&v).unwrap();
     });
 
+    // ── mutator deletes (open view: tags/status; free mid-item delete) ───
+    // Seed with two tags so delete_tags_at(0) is non-empty after.
+    let base_two_tags = {
+        let mut j = base.clone();
+        let mut m = CatalogMeta::mutator(&mut j);
+        m.append_tags("extra").unwrap();
+        drop(m);
+        j
+    };
+
+    let j_del_status = time_it(iters, warm, || {
+        let mut json = base.clone();
+        let mut m = CatalogMeta::mutator(&mut json);
+        m.delete_status().unwrap();
+        drop(m);
+        assert!(CatalogMeta::read_from_json(&json).is_err());
+    });
+    let s_del_status = time_it(iters, 1, || {
+        let mut v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        v.as_object_mut().unwrap().remove("status");
+        let _ = serde_json::to_vec(&v).unwrap();
+    });
+
+    let j_del_tags_at = time_it(iters, warm, || {
+        let mut json = base_two_tags.clone();
+        let mut m = CatalogMeta::mutator(&mut json);
+        m.delete_tags_at(0).unwrap();
+        drop(m);
+        let meta = CatalogMeta::read_from_json(&json).unwrap();
+        assert_eq!(meta.tags, vec!["extra".to_string()]);
+    });
+    let s_del_tags_at = time_it(iters, 1, || {
+        let mut v: serde_json::Value = serde_json::from_slice(&base_two_tags).unwrap();
+        v["tags"].as_array_mut().unwrap().remove(0);
+        let _ = serde_json::to_vec(&v).unwrap();
+    });
+
+    let j_del_mid = time_it(iters, warm, || {
+        let mut json = base.clone();
+        delete_index(&mut json, &items_path, mid).unwrap();
+        assert_eq!(array_len(&json, &items_path).unwrap(), n - 1);
+    });
+    let s_del_mid = time_it(iters, 1, || {
+        let mut v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        v["items"].as_array_mut().unwrap().remove(mid);
+        let _ = serde_json::to_vec(&v).unwrap();
+    });
+
+    // ── project_each: full list / filter / slice vs serde rebuild ────────
+    let plan_each = ProjectPlan::from_jmespath("items[*].{id: id, t: t}").unwrap();
+    let plan_filt = ProjectPlan::from_jmespath("items[?n].{id: id, t: t}").unwrap();
+    let plan_slice = ProjectPlan::from_jmespath("items[0:1000].{id: id, t: t}").unwrap();
+
+    let j_each = time_it(iters, warm, || {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        project_each(&base, &plan_each, |_, card| {
+            count += 1;
+            bytes = bytes.wrapping_add(card.len());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, n);
+        assert!(bytes > 0);
+    });
+    let s_each = time_it(iters, 1, || {
+        let v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        let cards: Vec<serde_json::Value> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| {
+                serde_json::json!({
+                    "id": it["id"].clone(),
+                    "t": it["t"].clone(),
+                })
+            })
+            .collect();
+        assert_eq!(cards.len(), n);
+        let _ = serde_json::to_vec(&cards).unwrap();
+    });
+
+    let j_filt = time_it(iters, warm, || {
+        let mut count = 0usize;
+        project_each(&base, &plan_filt, |_, card| {
+            count += 1;
+            assert!(card.starts_with(b"{"));
+            Ok(())
+        })
+        .unwrap();
+        // ~half of items have n:true
+        assert!(count > n / 3 && count < (2 * n) / 3 + 1);
+    });
+    let s_filt = time_it(iters, 1, || {
+        let v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        let cards: Vec<serde_json::Value> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|it| it["n"].as_bool() == Some(true))
+            .map(|it| {
+                serde_json::json!({
+                    "id": it["id"].clone(),
+                    "t": it["t"].clone(),
+                })
+            })
+            .collect();
+        assert!(cards.len() > n / 3);
+        let _ = serde_json::to_vec(&cards).unwrap();
+    });
+
+    let j_slice = time_it(iters, warm, || {
+        let mut count = 0usize;
+        project_each(&base, &plan_slice, |_, card| {
+            count += 1;
+            assert!(card.starts_with(b"{"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 1000.min(n));
+    });
+    let s_slice = time_it(iters, 1, || {
+        let v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        let cards: Vec<serde_json::Value> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(1000)
+            .map(|it| {
+                serde_json::json!({
+                    "id": it["id"].clone(),
+                    "t": it["t"].clone(),
+                })
+            })
+            .collect();
+        assert_eq!(cards.len(), 1000.min(n));
+        let _ = serde_json::to_vec(&cards).unwrap();
+    });
+
     // ── JMES sparse read of items[0] via derive + free project_jmespath ──
     let j_jmes_view = time_it(iters, warm, || {
         let first = FirstItem::read_from_json(&base).unwrap();
@@ -237,7 +381,7 @@ fn main() {
         assert!(t.starts_with("item-0"));
     });
 
-    println!("=== Array + mutator + JMES bench (~{mib} MiB, {n} items) ===\n");
+    println!("=== Array + mutator + project_each + JMES bench (~{mib} MiB, {n} items) ===\n");
     println!("| Workload | jshift | serde parse+edit+to_vec* | **jshift vs serde** |");
     println!("| :--- | ---: | ---: | ---: |");
     println!(
@@ -259,6 +403,12 @@ fn main() {
         fmt(s_end),
         ratio(j_end, s_end),
         ratio(j_app, s_end)
+    );
+    println!(
+        "| Free **delete mid** `items[{mid}]` | {} | {} | {} |",
+        fmt(j_del_mid),
+        fmt(s_del_mid),
+        ratio(j_del_mid, s_del_mid)
     );
     println!(
         "| Mutator **`set_status`** (open view) | {} | {} | {} |",
@@ -285,6 +435,36 @@ fn main() {
         ratio(j_m_ins, s_m_ins)
     );
     println!(
+        "| Mutator **`delete_status`** | {} | {} | {} |",
+        fmt(j_del_status),
+        fmt(s_del_status),
+        ratio(j_del_status, s_del_status)
+    );
+    println!(
+        "| Mutator **`delete_tags_at(0)`** | {} | {} | {} |",
+        fmt(j_del_tags_at),
+        fmt(s_del_tags_at),
+        ratio(j_del_tags_at, s_del_tags_at)
+    );
+    println!(
+        "| **`project_each`** `items[*].{{id,t}}` | {} | {} | {} |",
+        fmt(j_each),
+        fmt(s_each),
+        ratio(j_each, s_each)
+    );
+    println!(
+        "| **`project_each`** `items[?n].{{id,t}}` | {} | {} | {} |",
+        fmt(j_filt),
+        fmt(s_filt),
+        ratio(j_filt, s_filt)
+    );
+    println!(
+        "| **`project_each`** `items[0:1000].{{id,t}}` | {} | {} | {} |",
+        fmt(j_slice),
+        fmt(s_slice),
+        ratio(j_slice, s_slice)
+    );
+    println!(
         "| Derive **JMES** `items[0].id`/`t` read | {} | {} | {} |",
         fmt(j_jmes_view),
         fmt(s_jmes),
@@ -298,8 +478,10 @@ fn main() {
     );
 
     eprintln!(
-        "\n*Serde column is full-document parse + edit + `to_vec` (except JMES rows: parse + index).\n\
+        "\n*Serde column is full-document parse + edit + `to_vec` \
+         (JMES rows: parse + index only; `project_each` rows: parse + thin-array rebuild).\n\
          Mutator/JMES views never load `items` into a Rust `Vec`.\n\
-         Clone/memmove of ~{mib} MiB still appears in splice-heavy free-function rows."
+         `project_each` holds **one card** at a time; serde rebuilds a full projected array.\n\
+         Clone/memmove of ~{mib} MiB still appears in splice/delete-mid free-function rows."
     );
 }

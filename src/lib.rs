@@ -434,13 +434,15 @@ mod tests {
             vec!["rust".to_string(), "fast".to_string()]
         );
 
-        let mut mutator = Config::mutator(&mut json);
-        mutator.set_version(&2).unwrap();
-        mutator.set_score(&99.9).unwrap();
-        mutator.set_name("new_name").unwrap();
-        mutator.append_tags("cool").unwrap();
-        mutator.prepend_tags("first").unwrap();
-        mutator.insert_tags(1, "mid").unwrap();
+        {
+            let mut mutator = Config::mutator(&mut json);
+            mutator.set_version(&2).unwrap();
+            mutator.set_score(&99.9).unwrap();
+            mutator.set_name("new_name").unwrap();
+            mutator.append_tags("cool").unwrap();
+            mutator.prepend_tags("first").unwrap();
+            mutator.insert_tags(1, "mid").unwrap();
+        }
 
         let updated = Config::read_from_json(&json).unwrap();
         assert_eq!(updated.version, 2);
@@ -455,6 +457,48 @@ mod tests {
                 "fast".to_string(),
                 "cool".to_string()
             ]
+        );
+
+        // delete_<field>_at on Vec; delete_<field> removes object member
+        {
+            let mut mutator = Config::mutator(&mut json);
+            mutator.delete_tags_at(1).unwrap(); // drop "mid"
+            mutator.delete_name().unwrap();
+        }
+        // name is required → PathNotFound after delete
+        assert!(Config::read_from_json(&json).is_err());
+        let tags_slice = find_value(&json, &parse_path("user.tags")).unwrap();
+        let tags: Vec<String> = FromJsonSlice::from_json_slice(tags_slice).unwrap();
+        assert_eq!(
+            tags,
+            vec![
+                "first".to_string(),
+                "rust".to_string(),
+                "fast".to_string(),
+                "cool".to_string()
+            ]
+        );
+        assert!(find_value(&json, &parse_path("user.name")).is_err());
+    }
+
+    #[cfg(feature = "derive")]
+    #[test]
+    fn test_mutator_delete_nested_and_vec_at() {
+        #[derive(JsonMutatorSchema)]
+        struct Nested {
+            #[json(path = "meta.status")]
+            status: String,
+            #[json(path = "meta.labels")]
+            labels: Vec<String>,
+        }
+
+        let mut json = br#"{"meta":{"status":"live","labels":["a","b","c"],"keep":1}}"#.to_vec();
+        let mut m = Nested::mutator(&mut json);
+        m.delete_labels_at(0).unwrap();
+        m.delete_status().unwrap();
+        assert_eq!(
+            &json[..],
+            br#"{"meta":{"labels":["b","c"],"keep":1}}"#
         );
     }
 

@@ -37,7 +37,7 @@ assert_eq!(card.title, "Hat");
 
 ---
 
-## Mutator surface: `set_*`, `append_*`, `prepend_*`, `insert_*`
+## Mutator surface: `set_*`, `append_*`, `prepend_*`, `insert_*`, `delete_*`
 
 Besides shared view helpers (`read_from_json`, `project_json`, …), the derive’s **unique
 field-level mutator API** is intentionally small.
@@ -48,16 +48,18 @@ field-level mutator API** is intentionally small.
 | :--- | :--- | :--- |
 | **`Type::mutator(&mut buf)`** | always | Returns `{Type}Mutator { json: &mut Vec<u8> }` |
 | **`m.set_<field>(val)`** | **every** field | `ToJsonBytes(val)` → `mutate_value` (replace whole value) |
+| **`m.delete_<field>()`** | path ends in a **key** | `delete_key` (parent path + last key; removes object member) |
 | **`m.append_<field>(val)`** | field type is **`Vec<_>`** | `append_to_array` (push at **end**) |
 | **`m.prepend_<field>(val)`** | field type is **`Vec<_>`** | `prepend_to_array` (push at **start**) |
 | **`m.insert_<field>(index, val)`** | field type is **`Vec<_>`** | `insert_array_element` (`0` = prepend, `len` = append) |
+| **`m.delete_<field>_at(i)`** | field type is **`Vec<_>`** | `delete_index` at `i` |
 
 Naming uses the **Rust field identifier**, not a mangled path:
 
 ```text
-status: String     →  set_status
-tags: Vec<String>  →  set_tags + append_tags + prepend_tags + insert_tags
-tokens: usize      →  set_tokens   (no array helpers)
+status: String     →  set_status + delete_status
+tags: Vec<String>  →  set/append/prepend/insert_tags + delete_tags + delete_tags_at
+tokens: usize      →  set_tokens + delete_tokens  (no array helpers)
 ```
 
 Path override does **not** rename the method:
@@ -65,16 +67,20 @@ Path override does **not** rename the method:
 ```rust
 #[json(path = "meta.status")]
 status: String,
-// still set_status(...); mutates path "meta.status"
+// still set_status / delete_status; mutates path "meta.status"
 ```
 
-There are no `get_*` or `delete_*` methods on the mutator (read via `read_from_json`. You can delete via free functions `delete_key` / `delete_index`).
+There are no `get_*` methods on the mutator (read via `read_from_json` / `JsonView`).
 
 ### Bench (~50 MiB catalog, ~900k `items`, vs serde)
 
-Fixture shape: `{"status":"ok","tags":["seed"],"items":[…huge…]}`.  
+Fixture shape: `{"status":"ok","tags":["seed"],"items":[…huge…]}` (`items[i].n` alternates
+so filter `items[?n]` keeps ~half).  
 Open mutator view only names `status` + `tags` (never loads `items`).  
-Free prepend/insert target the large `items` array. Serde = full `from_slice` + edit + `to_vec` (JMES rows: parse + index only).
+Free splice/delete-mid target the large `items` array.  
+Serde = full `from_slice` + edit + `to_vec` (JMES rows: parse + index only;
+`project_each` rows: parse + rebuild a thin projected array).  
+`project_each` holds **one card** at a time.
 
 Reproduce:
 
@@ -85,17 +91,31 @@ cargo run --release --example array_insert_bench
 
 | Workload | jshift | serde | **jshift vs serde** |
 | :--- | ---: | ---: | ---: |
-| Free **prepend** on `items` | ~222 ms | ~787 ms | **~3.6×** |
-| Free **insert mid** on `items` | ~213 ms | ~786 ms | **~3.7×** |
-| Free **append** on `items` | ~187 ms | ~789 ms | **~4.2×** |
-| Mutator **`set_status`** | **~19 ms** | ~837 ms | **~45×** |
-| Mutator **`append_tags`** | **~21 ms** | ~793 ms | **~37×** |
-| Mutator **`prepend_tags`** | **~19 ms** | ~798 ms | **~43×** |
-| Mutator **`insert_tags(1, …)`** | **~19 ms** | ~796 ms | **~43×** |
-| Derive **JMES** read `items[0].id` / `t` | **~2.4 µs** | ~639 ms | **~260 000×** |
-| Free **JMES** project `items[0].{id,t}` | **~2.3 µs** | ~639 ms | **~270 000×** |
+| Free **prepend** on `items` | ~247 ms | ~736 ms | **~3.0×** |
+| Free **insert mid** on `items` | ~239 ms | ~728 ms | **~3.0×** |
+| Free **append** on `items` | ~274 ms | ~759 ms | **~2.8×** |
+| Free **delete mid** on `items` | ~167 ms | ~731 ms | **~4.4×** |
+| Mutator **`set_status`** | **~21 ms** | ~886 ms | **~42×** |
+| Mutator **`append_tags`** | **~23 ms** | ~727 ms | **~32×** |
+| Mutator **`prepend_tags`** | **~19 ms** | ~727 ms | **~38×** |
+| Mutator **`insert_tags(1, …)`** | **~19 ms** | ~724 ms | **~39×** |
+| Mutator **`delete_status`** | ~72 ms | ~814 ms | **~11×** |
+| Mutator **`delete_tags_at(0)`** | **~8.0 ms** | ~722 ms | **~91×** |
+| **`project_each`** `items[*].{id,t}` | ~524 ms | ~1.7 s | **~3.2×** |
+| **`project_each`** `items[?n].{id,t}` | ~563 ms | ~1.2 s | **~2.1×** |
+| **`project_each`** `items[0:1000].{id,t}` | ~132 ms | ~587 ms | **~4.4×** |
+| Derive **JMES** read `items[0].id` / `t` | **~3.7 µs** | ~581 ms | **~160 000×** |
+| Free **JMES** project `items[0].{id,t}` | **~2.3 µs** | ~581 ms | **~260 000×** |
 
-**How to read it:** splicing a **huge** `items` array is still multi-hundred-ms (clone + memmove) but beats a full DOM rebuild by a few×. The derive mutator shines when the schema is **open**: stamp `status` / push a tag without materializing ~900k products (**~40×**). Sparse JMES / first-item project stays **microseconds** vs serde’s full parse.
+**How to read it:** splicing / mid-deleting a **huge** `items` array is still multi-hundred-ms
+(clone + memmove) but beats a full DOM rebuild by a few×. The derive mutator shines when the
+schema is **open**: stamp tags without materializing ~900k products (**~30–40×**);
+`delete_tags_at` is especially cheap (**~91×**). `delete_status` is slower (~72 ms) because
+`status` sits at the front of the document — removing it still memmoves the rest of the
+~50 MiB buffer (no full parse, but a big shift). Streaming **`project_each`** over all /
+filtered / sliced cards stays **one-card** peak RAM and is a few× faster than serde’s parse
++ rebuild of a full thin array; a short head slice (`[0:1000]`) is **~4.4×**. Sparse JMES /
+first-item project stays **microseconds** vs serde’s full parse.
 
 ```rust
 #[derive(JsonMutatorSchema)]
@@ -110,6 +130,8 @@ m.set_status("skipped")?;
 m.prepend_tags("hot")?;
 m.insert_tags(1, "mid")?;
 m.append_tags("tail")?;
+m.delete_tags_at(0)?; // drop first tag
+// m.delete_status()?;  // remove the key entirely
 ```
 
 ---

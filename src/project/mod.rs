@@ -30,9 +30,9 @@
 //!
 //! [`project_each`] / [`project_object_fields_each`] project **one element at a time**
 //! into a reusable card buffer and invoke a callback — peak RAM tracks one card, not
-//! the full `[card,card,…]` result. [`project_jsonl_write`] /
-//! [`project_object_fields_jsonl_write`] write NDJSON (one JSON object per line) to any
-//! [`std::io::Write`].
+//! the full `[card,card,…]` result. List shapes include `[*]`, filters (`[?…]`), and
+//! slices. [`project_jsonl_write`] / [`project_object_fields_jsonl_write`] write NDJSON
+//! (one JSON object per line) to any [`std::io::Write`].
 //!
 //! ## Parallel auto-pick
 //!
@@ -240,10 +240,15 @@ pub fn project_object_fields_parallel(
 
 /// Project each element of a **list projection** plan as a separate card.
 ///
-/// `plan` must be a `[*]` list projection (optionally under a field path), e.g.
-/// `items[*].{id: id, title: title}` or root `[*].{a: a}`. Each card is evaluated
-/// into a reusable buffer; **`f(index, card_bytes)`** is called once per kept
-/// element. Null results are omitted (JMESPath list-projection semantics).
+/// `plan` must be a list projection (optionally under a field path):
+/// - `[*]` — every element (`items[*].{id: id, title: title}`, root `[*].{a: a}`)
+/// - filter — e.g. `items[?ok].{id: id}`
+/// - slice — e.g. `items[0:10].{id: id}`
+///
+/// Each card is evaluated into a reusable buffer; **`f(index, card_bytes)`** is
+/// called once per kept element. Null results are omitted (JMESPath list-projection
+/// semantics). Multi-index projections (e.g. `items[0, 2]`) are not supported here —
+/// use [`project`] / [`project_jmespath`].
 ///
 /// Peak memory is **one card** plus the input document — not a giant
 /// `[card,card,…]` output array. For NDJSON files see [`project_jsonl_write`].
@@ -392,31 +397,21 @@ fn project_each_inner<F>(
     json: &[u8],
     plan: &ProjectPlan,
     index: Option<&IndexedDocument<'_>>,
-    mut f: F,
+    f: F,
 ) -> Result<(), Error>
 where
     F: FnMut(usize, &[u8]) -> Result<(), Error>,
 {
-    let (array_path, each) = peel_list_each(plan.select()).ok_or(Error::Jmespath {
-        msg: "project_each requires a list projection plan (e.g. items[*].{…} or [*].…)",
+    let (array_path, list_sel) = peel_list_proj(plan.select()).ok_or(Error::Jmespath {
+        msg: "project_each requires a list projection plan (e.g. items[*].{…}, items[?…], items[0:n], or [*].…)",
+    })?;
+    let each = list_each_expr(list_sel).ok_or(Error::Jmespath {
+        msg: "project_each does not support multi-index list projections",
     })?;
 
     let (open, end) = resolve_array_open_end(json, &array_path, index)?;
-    let omit_nulls = true;
     let mut ctx = emit::EmitCtx::new(plan, index);
-    let mut card = Vec::new();
-    let mut out_index = 0usize;
-
-    emit::for_each_array_element(json, open, end, index, |_, s, e| {
-        card.clear();
-        emit::emit_value(json, s, e, each, &mut ctx, &mut card)?;
-        if omit_nulls && is_json_null_value(&card) {
-            return Ok(());
-        }
-        f(out_index, &card)?;
-        out_index += 1;
-        Ok(())
-    })
+    emit::for_each_projected_card(json, open, end, list_sel, each, &mut ctx, f)
 }
 
 fn resolve_array_open_end(
@@ -456,28 +451,44 @@ fn resolve_array_open_end(
     Ok((open, end))
 }
 
-/// Peel `path[*].card` / `[*].card` into `(array_path, each_expr)`.
+/// Peel `path[*|?|slice].card` into `(array_path, list ArraySelect)`.
 ///
-/// Supports nested field chains (`meta.rows[*].…`). Returns `None` for filters,
-/// slices, flatten `[]`, multi-select lists, or non-list roots.
-fn peel_list_each(expr: &SelectExpr) -> Option<(String, &SelectExpr)> {
+/// Supports nested field chains (`meta.rows[*].…`). Returns `None` for flatten `[]`,
+/// multi-select lists, pure multi-index roots, or non-list roots.
+fn peel_list_proj(expr: &SelectExpr) -> Option<(String, &ArraySelect)> {
     match expr {
-        SelectExpr::Paren(inner) => peel_list_each(inner),
-        SelectExpr::Array(ArraySelect::Each(child)) => Some((String::new(), child.as_ref())),
+        SelectExpr::Paren(inner) => peel_list_proj(inner),
+        SelectExpr::Array(sel) if is_streamable_list(sel) => Some((String::new(), sel)),
         SelectExpr::Sub(left, right) => match right.as_ref() {
-            SelectExpr::Array(ArraySelect::Each(child)) => {
+            SelectExpr::Array(sel) if is_streamable_list(sel) => {
                 let path = field_chain_path(left)?;
-                Some((path, child.as_ref()))
+                Some((path, sel))
             }
             SelectExpr::Sub(_, _) | SelectExpr::Paren(_) | SelectExpr::Array(_) => {
-                let (suffix, child) = peel_list_each(right)?;
+                let (suffix, sel) = peel_list_proj(right)?;
                 let prefix = field_chain_path(left)?;
                 let full = join_dot_path(&prefix, &suffix);
-                Some((full, child))
+                Some((full, sel))
             }
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn is_streamable_list(sel: &ArraySelect) -> bool {
+    matches!(
+        sel,
+        ArraySelect::Each(_) | ArraySelect::Filter { .. } | ArraySelect::Slice { .. }
+    )
+}
+
+fn list_each_expr(sel: &ArraySelect) -> Option<&SelectExpr> {
+    match sel {
+        ArraySelect::Each(each)
+        | ArraySelect::Filter { each, .. }
+        | ArraySelect::Slice { each, .. } => Some(each.as_ref()),
+        ArraySelect::Indices(_) => None,
     }
 }
 
@@ -503,16 +514,6 @@ fn join_dot_path(prefix: &str, suffix: &str) -> String {
     } else {
         format!("{prefix}.{suffix}")
     }
-}
-
-fn is_json_null_value(v: &[u8]) -> bool {
-    let s = skip_whitespace(v, 0);
-    v.get(s..s + 4) == Some(b"null")
-        && (s + 4 >= v.len()
-            || matches!(
-                v[s + 4],
-                b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}'
-            ))
 }
 
 // ── Parallel auto-pick ───────────────────────────────────────────────────────
@@ -1013,6 +1014,79 @@ mod tests {
         })
         .unwrap();
         assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn project_each_filter_and_slice_match_array_project() {
+        let json = br#"{"items":[
+            {"id":1,"ok":true,"t":"a"},
+            {"id":2,"ok":false,"t":"b"},
+            {"id":3,"ok":true,"t":"c"},
+            {"id":4,"ok":true,"t":"d"}
+        ]}"#;
+
+        // Filter: keep truthy ok, project thin card
+        let plan_f = ProjectPlan::from_jmespath("items[?ok].{id: id, t: t}").unwrap();
+        let as_array = project(json, &plan_f).unwrap();
+        let mut cards = Vec::new();
+        project_each(json, &plan_f, |i, card| {
+            cards.push((i, card.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0].1, br#"{"id":1,"t":"a"}"#);
+        assert_eq!(cards[1].1, br#"{"id":3,"t":"c"}"#);
+        assert_eq!(cards[2].1, br#"{"id":4,"t":"d"}"#);
+        let mut rebuilt = Vec::from(b"[".as_slice());
+        for (i, (_, c)) in cards.iter().enumerate() {
+            if i > 0 {
+                rebuilt.push(b',');
+            }
+            rebuilt.extend_from_slice(c);
+        }
+        rebuilt.push(b']');
+        assert_eq!(rebuilt, as_array);
+
+        // Slice [1:3]
+        let plan_s = ProjectPlan::from_jmespath("items[1:3].{id: id}").unwrap();
+        let as_array = project(json, &plan_s).unwrap();
+        let mut cards = Vec::new();
+        project_each(json, &plan_s, |_, card| {
+            cards.push(card.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(cards, vec![br#"{"id":2}"#.to_vec(), br#"{"id":3}"#.to_vec()]);
+        let mut rebuilt = Vec::from(b"[".as_slice());
+        for (i, c) in cards.iter().enumerate() {
+            if i > 0 {
+                rebuilt.push(b',');
+            }
+            rebuilt.extend_from_slice(c);
+        }
+        rebuilt.push(b']');
+        assert_eq!(rebuilt, as_array);
+
+        // Root slice
+        let root = br#"[10,20,30,40]"#;
+        let plan_r = ProjectPlan::from_jmespath("[1:3]").unwrap();
+        let mut got = Vec::new();
+        project_each(root, &plan_r, |_, card| {
+            got.push(card.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, vec![b"20".to_vec(), b"30".to_vec()]);
+        assert_eq!(project(root, &plan_r).unwrap(), br#"[20,30]"#);
+
+        // JSONL via filter plan
+        let mut jsonl = Vec::new();
+        project_jsonl_write(json, &plan_f, &mut jsonl).unwrap();
+        assert_eq!(
+            &jsonl[..],
+            b"{\"id\":1,\"t\":\"a\"}\n{\"id\":3,\"t\":\"c\"}\n{\"id\":4,\"t\":\"d\"}\n"
+        );
     }
 
     #[test]

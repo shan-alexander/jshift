@@ -7,10 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-21
+
+Mutator deletes and streaming list cards for filter/slice. Still no `get_*`
+(read via `read_from_json` / views).
+
+### Added
+- **Derive mutator:** `delete_<field>()` (object member via parent path + last key →
+  `delete_key`) and `delete_<field>_at(i)` for `Vec` fields (`delete_index`).
+- **`project_each` / JSONL:** list peel supports **filter** (`[?…]`) and **slice**
+  projections in addition to `[*]` — same null-omit and one-card peak RAM as full
+  `project`. Multi-index projections still use bulk `project` / `project_jmespath`.
+- **Example / docs:** `array_insert_bench` extended with delete + `project_each`
+  workloads; derive README ~50 MiB vs-serde table updated.
+
 ## [0.4.1] - 2026-07-20
 
-Array insert/prepend primitives and derive mutator helpers. Still no `get_*` / `delete_*`
-on the mutator (use free functions / `read_from_json`).
+Array insert/prepend primitives and derive mutator helpers.
 
 ### Added
 - **`prepend_to_array` / `insert_array_element`:** insert at front or at `index`
@@ -195,7 +208,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/shan-alexander/jshift/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/shan-alexander/jshift/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/shan-alexander/jshift/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/shan-alexander/jshift/compare/v0.3.0...v0.3.1

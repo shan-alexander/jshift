@@ -261,10 +261,30 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             }
         });
 
+        // delete_<field>: remove object member at path (parent + last key).
+        if let Some((parent_segs, last_key)) = parent_and_last_key(&path_segments) {
+            let delete_name = Ident::new(&format!("delete_{}", field_name), field_name.span());
+            let parent_tokens: Vec<_> = parent_segs
+                .iter()
+                .map(|s| match s {
+                    DerSegment::Key(k) => quote! { jshift::PathSegment::Key(#k) },
+                    DerSegment::Index(i) => quote! { jshift::PathSegment::Index(#i) },
+                })
+                .collect();
+            mutator_setters.push(quote! {
+                pub fn #delete_name(&mut self) -> Result<(), jshift::Error> {
+                    const PARENT: &[jshift::PathSegment<'static>] = &[#(#parent_tokens),*];
+                    jshift::delete_key(self.json, PARENT, #last_key)
+                }
+            });
+        }
+
         if is_vec_type(field_type) {
             let append_name = Ident::new(&format!("append_{}", field_name), field_name.span());
             let prepend_name = Ident::new(&format!("prepend_{}", field_name), field_name.span());
             let insert_name = Ident::new(&format!("insert_{}", field_name), field_name.span());
+            let delete_at_name =
+                Ident::new(&format!("delete_{}_at", field_name), field_name.span());
             mutator_setters.push(quote! {
                 pub fn #append_name(&mut self, val: &(impl jshift::ToJsonBytes + ?Sized)) -> Result<(), jshift::Error> {
                     let bytes = jshift::ToJsonBytes::to_json_bytes(val);
@@ -288,6 +308,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                         index,
                         &bytes,
                     )
+                }
+
+                pub fn #delete_at_name(&mut self, index: usize) -> Result<(), jshift::Error> {
+                    jshift::delete_index(self.json, #struct_name::#path_const_name, index)
                 }
             });
         }
@@ -587,4 +611,14 @@ fn static_array_prefixes_from_segments(segs: &[DerSegment]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Split `a.b.c` → parent `[a, b]` + key `"c"` for [`jshift::delete_key`].
+/// Returns `None` when the path is empty or does not end in a key segment.
+fn parent_and_last_key(segs: &[DerSegment]) -> Option<(Vec<&DerSegment>, String)> {
+    let last = segs.last()?;
+    let DerSegment::Key(key) = last else {
+        return None;
+    };
+    Some((segs[..segs.len() - 1].iter().collect(), key.clone()))
 }
