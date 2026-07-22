@@ -106,6 +106,83 @@ pub trait JsonView: Sized {
     fn project_bytes(json: &[u8]) -> Result<Vec<u8>, Error> {
         project(json, &Self::project_plan())
     }
+
+    /// Build a **new** document containing only this schema’s fields (0.6).
+    ///
+    /// Default implementation:
+    /// 1. open-upsert onto a fresh `{}` via [`write_into`](Self::write_into);
+    /// 2. [`project_bytes`](Self::project_bytes) to strip accidental parents /
+    ///    keep only the schema plan.
+    ///
+    /// That is two passes but correct for nested paths. Derive can override with
+    /// a single-pass field-order writer for flat schemas. Prefer this when you
+    /// need a closed card without `serde_json::Value`.
+    fn to_schema_bytes(&self) -> Result<Vec<u8>, Error> {
+        // Small seed; write_into grows via upsert. Avoid double-zero of large bufs.
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(br#"{"#);
+        buf.push(b'}');
+        self.write_into(&mut buf)?;
+        Self::project_bytes(&buf)
+    }
+
+    /// [`to_schema_bytes`](Self::to_schema_bytes) into a [`crate::TypedDoc`].
+    fn to_schema_doc(&self) -> Result<crate::typed_doc::TypedDoc, Error> {
+        Ok(crate::typed_doc::TypedDoc::from_vec(self.to_schema_bytes()?))
+    }
+}
+
+/// Build schema-only bytes from any [`JsonView`] (roadmap build-from-schema).
+#[inline]
+pub fn build_schema_bytes<T: JsonView>(view: &T) -> Result<Vec<u8>, Error> {
+    view.to_schema_bytes()
+}
+
+/// Stream each element of the array at `array_path` as `T: JsonView`.
+///
+/// Single-pass, no intermediate `Vec<T>`. Prefer over full deserialize when
+/// processing rows one at a time.
+///
+/// ```
+/// use jshift::{project_view_each, FromJsonSlice, JsonView, find_value, parse_path};
+///
+/// struct Id { n: u64 }
+/// impl JsonView for Id {
+///     fn read_from(json: &[u8]) -> Result<Self, jshift::Error> {
+///         let s = find_value(json, &parse_path("id"))?;
+///         Ok(Self { n: u64::from_json_slice(s).unwrap() })
+///     }
+///     fn write_into(&self, _: &mut Vec<u8>) -> Result<(), jshift::Error> { Ok(()) }
+/// }
+///
+/// let json = br#"{"items":[{"id":1},{"id":2}]}"#;
+/// let mut sum = 0u64;
+/// project_view_each::<Id, _>(json, "items", |c| {
+///     sum += c.n;
+///     Ok(())
+/// }).unwrap();
+/// assert_eq!(sum, 3);
+/// ```
+pub fn project_view_each<T, F>(json: &[u8], array_path: &str, mut f: F) -> Result<(), Error>
+where
+    T: JsonView,
+    F: FnMut(T) -> Result<(), Error>,
+{
+    use crate::view_list::ViewList;
+    let doc = crate::typed_doc::TypedDocRef::from_slice(json);
+    let list = ViewList::<T>::from_doc(&doc, array_path)?;
+    list.each(|v| f(v))
+}
+
+/// Collect array elements as `Vec<T: JsonView>` (explicit owned collect).
+#[inline]
+pub fn project_view_collect<T: JsonView>(json: &[u8], array_path: &str) -> Result<Vec<T>, Error> {
+    let mut out = Vec::new();
+    project_view_each(json, array_path, |v| {
+        out.push(v);
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// Shared helper: read any [`JsonView`] from bytes.

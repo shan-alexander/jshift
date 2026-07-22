@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-22
+
+Typed-bytes epic: collections without a DOM, schema emit, merge patch, limits.
+
+### Added
+- **`NestedView`**: subtree as relative root (`nest`, `view_list`, `value_list`,
+  `map`, `as_view` / `as_map`); `TypedDoc::nest`.
+- **`MapView<T>` / `IndexedMapView`**: string-key object cursors; zero-alloc get
+  for unescaped keys; `index()` for O(1) multi-get.
+- **`CollectPolicy` / `Collected`**: stream | owned | projected; `ViewList::collect`,
+  `collect_projected`, `each_field` / `collect_field`, `each_filtered`,
+  `each_nested` / `each_nested_field` / `sum_*_u64`, `for_each_raw`.
+- **`JsonView::to_schema_bytes` / `to_schema_doc` / `build_schema_bytes`**:
+  schema-only emit; derive `to_schema_json()`; flat paths use single-pass
+  `ObjectBuilder`.
+- **`project_view_each` / `project_view_collect`**: stream array → `T: JsonView`.
+- **RFC 7396 `merge_patch` / `merge_patch_at`**: null-deletes + recursive object
+  merge; `TypedDoc::merge_patch`; `MutateOp::MergePatch`.
+- **`Limits` / `check_document` / `check_depth` / `measure_depth`**: DoS depth/size
+  guards (`Error::LimitExceeded`).
+- **`JsonWriter::pretty(indent)`**: pretty emit without a `Value` tree.
+- **Docs / benches:** README “Typed bytes epic” tables; `typed_doc_bench`,
+  `v06_collections_bench`.
+
+### Changed
+- Collect paths are single-pass (`ArrayElems`); no intermediate span tables unless
+  `index()` is requested.
+- Nested schema emit still upserts then projects (correct for nested paths).
+
+### Notes
+- Lists stay streams by default; materialize only with an explicit collect policy.
+- Full-card / full-catalog typed load can still lose to serde — sparse, open mutate,
+  and indexed multi-get are the wins (see README tables).
+
 ## [0.5.0] - 2026-07-22
 
 Typed document spine: hold bytes, decode paths on demand, stream arrays, mutate
@@ -260,7 +294,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/shan-alexander/jshift/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/shan-alexander/jshift/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/shan-alexander/jshift/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/shan-alexander/jshift/compare/v0.4.0...v0.4.1

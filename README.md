@@ -56,13 +56,93 @@ doc.mutate().set("status", "accepted").unwrap();
 assert!(doc.contains("extra").unwrap()); // unknowns preserved
 ```
 
-**Also in 0.5:** `ViewList` / `ValueList` (+ `index()` for O(1) gets), `RootKind` +
-`get_nullable`, `RawJson`, **`ObjectBuilder` / `JsonWriter`** (in-place nest, no
-`Value`), `TypedDoc::from_view`, and typed JSONL (`jsonl_docs`, `write_jsonl_views`).
+**0.5–0.6 typed stack:** `ViewList` / `ValueList` (+ `index()`), **`NestedView`** /
+**`MapView`** / **`IndexedMapView`**, **`CollectPolicy`** (stream|owned|projected),
+`ObjectBuilder` / `JsonWriter`, **`to_schema_bytes`**, batch mutate, validate, typed JSONL.
 
 ---
 
-## Benchmarks on JSON tasks
+## Typed bytes epic (v0.5–v0.6)
+
+Goal: **typed JSON on raw buffers** so most production work never needs
+`serde_json::Value` — sparse path decode, open in-place mutate, streamable
+collections, schema emit, and honest “when serde still wins” boundaries.
+
+Repro:
+
+```bash
+cargo run --release --example typed_doc_bench      # v0.5 spine
+cargo run --release --example v06_collections_bench # v0.6 collections
+```
+
+Numbers below are **release** timings on a typical developer machine (Linux);
+ratios will move with CPU and payload shape. Prefer ratios over absolute ns.
+
+### v0.5 — TypedDoc spine vs `serde_json`
+
+| Workload | jshift | serde | serde/jshift |
+| :--- | ---: | ---: | ---: |
+| Small sparse `get` id (~100 B) | ~100–170 ns | ~1.3–2.6 µs | **~13–15×** |
+| Med sparse `products[0].id` (~111 KB) | ~150–270 ns | ~2.4–4.7 ms | **~15 000–17 000×** |
+| Large sparse first product (~2 MB) | ~160–280 ns | ~39–72 ms | **~240 000–260 000×** |
+| Large key-last `status` (after bulk) | ~4–7 ms | ~70–92 ms | **~13–18×** |
+| Stream `each_get` sum ids (2k) | ~370–430 µs | ~1.3 ms | **~3–4×** |
+| Stream `each_get` sum ids (50k) | ~10–12 ms | ~70–75 ms | **~6–7×** |
+| Sparse id stream (500 cards) | ~87–100 µs | ~97–130 µs | **~1.0–1.3×** |
+| Full Card `each_view` (500) | ~180–190 µs | ~100–130 µs | **~0.5–0.7×** *(serde wins)* |
+| Open mutate `status` (med ~111 KB) | ~8 µs | ~1.5–1.6 ms | **~180–200×** |
+| Open mutate `status` (large ~2 MB) | ~280 µs | ~46 ms | **~160×** |
+| `ViewList::index` mid get (5k, after index) | ~80 ns | ~760 µs full parse | **~9 000×** |
+| 64× indexed multi-get (5k) | ~5 µs | ~760 µs | **~150×** |
+| `JsonWriter` build (2k ids + nest) | ~26 µs | ~35 µs | **~1.3×** |
+| `RawJson` pocket `products[0]`→`id` | ~260 ns | ~1.3 ms | **~5 000×** |
+| `object_entries` sum 200 keys | ~10 µs | ~42 µs | **~4×** |
+| `get_nullable` (tiny doc) | ~parity | ~parity | **~1×** |
+
+### v0.6 — Nested / Map / collect policies vs `serde_json`
+
+Payloads used in `v06_collections_bench`: **~450 KB** catalog (5k products),
+**~31 KB** score map (2k string keys).
+
+| Workload | jshift | serde | serde/jshift |
+| :--- | ---: | ---: | ---: |
+| `NestedView` / path `products[0].meta.rank` | ~300–370 ns | ~6.4 ms | **~17 000–21 000×** |
+| `MapView` get mid-key (2k keys) | ~23–26 µs | ~575 µs | **~22–25×** |
+| `MapView` each sum 2k keys | ~160–240 µs | ~560 µs | **~2–4×** |
+| Map `collect_owned` vs `HashMap` deserialize | ~230–250 µs | ~340 µs | **~1.4–1.5×** |
+| `each_field` / `collect_field` ids (5k) | ~0.82–1.0 ms | ~1.2 ms | **~1.2–1.4×** |
+| `collect_owned` IdCard (5k) | ~1.1 ms | ~1.2 ms | **~1.1×** |
+| `collect_projected` thin cards (5k) | ~3.1 ms | ~1.2 ms | **~0.4×** *(serde wins full typed)* |
+| Nested `meta.rank` sum — manual nest | ~2.2 ms | ~1.3 ms | **~0.6×** |
+| Nested `meta.rank` sum — `sum_nested_field_u64` | ~1.5–1.7 ms | ~1.3 ms | **~0.8–0.9×** |
+| 64× map get **linear** | ~1.5–1.6 ms | ~335–350 µs\* | **~0.2×** |
+| 64× map get after **`IndexedMapView`** | **~2.6–3.4 µs** | ~335–350 µs\* | **~100–130×** |
+| Flat `to_schema_bytes` (2 fields) | **~97–104 ns** | ~65–70 ns | **~0.6–0.7×** (near parity) |
+| 64× `ViewList` indexed random get | **~5–6 µs** | ~1.2 ms | **~210–250×** |
+| RFC 7396 `merge_patch` (tiny) | ~1.5 µs | ~1.1 µs† | **~0.8×** |
+| `check_document` depth+size (~450 KB) | **~690 µs** | ~7 ms full parse | **~10×** |
+| `project_view_each` IdCard sum (5k) | ~1.8 ms | ~1.2 ms | **~0.7×** |
+| `JsonWriter::pretty` tiny object | **~115 ns** | ~176 ns | **~1.5×** |
+
+\*serde multi-get includes **full `HashMap` deserialize each iteration** (fair “cold”
+cost). After you already hold a map, pure HashMap get is faster — use
+`IndexedMapView` when you keep the buffer and probe often.
+
+†serde merge_patch column is a hand-rolled `Value` merge (no std RFC 7396 API).
+
+### How to read the epic tables
+
+| Prefer jshift when… | Prefer serde when… |
+| :--- | :--- |
+| Sparse path / first-card / key-first on large buffers | You need **every** field of **every** element |
+| Open mutate / batch patch without rebuild | Tiny closed structs, pure encode firehose |
+| Stream one field (`each_field` / `each_get`) | Full `Vec<Struct>` is the product |
+| Multi-get after `index()` / `IndexedMapView` | You already built a DOM / HashMap for other reasons |
+| Safe Rust + same buffer | Multi-format (bincode, etc.) |
+
+---
+
+## Benchmarks on JSON tasks (path engine matrix)
 
 The bench is designed to provide a fair comparison between jshift, serde, gjson, and sonic-rs.
 
@@ -653,36 +733,39 @@ We **do** absorb a few *ideas* that transfer cleanly to safe Rust:
 
 ## Capabilities (full API map)
 
-Public surface as of **0.5.0** (`#![forbid(unsafe_code)]`). Convenience map for agentic workflows and humans reading crates.io / GitHub.
+Public surface as of **0.6.0** (`#![forbid(unsafe_code)]`). Convenience map for agentic workflows and humans reading crates.io / GitHub.
 
-### Typed documents (0.5 — center of gravity)
+### Typed documents (0.5–0.6 — center of gravity)
 
 | API | Role |
 | :--- | :--- |
 | `TypedDoc` / `TypedDocRef` | Owned / borrowed buffer; exclusive `mutate()` |
 | `JsonDoc` | Shared read trait: `get` / `get_opt` / `get_nullable` / `get_str` / `contains` / `presence` / `view_at` / `each_*` / `each_get` / … |
-| `TypedMutator` | Exclusive splice: `set` / `upsert` / `delete` / `rename_key` / `merge_shallow` / `apply_ops` |
+| `TypedMutator` | Exclusive splice: `set` / `upsert` / `delete` / `rename_key` / `merge_shallow` / `merge_patch` / `apply_ops` |
 | `ViewList` / `ValueList` | Array cursors (`len` / `get` / `iter` / `collect_owned`) |
 | `IndexedViewList` / `IndexedValueList` | `list.index()` → O(1) `get(i)` after one walk |
+| `NestedView` / `MapView` / `IndexedMapView` | Subtree cursors; string-key maps; O(1) multi-get |
+| `CollectPolicy` / `project_view_each` | Stream\|owned\|projected; typed array stream |
 | `ArrayElems` / `ObjectEntries` / `ObjectEntry` | Raw element / DynObject key-value cursors |
 | `RootKind` / `Presence` | Root type + missing vs null vs value |
 | `RawJson` | Dynamic pocket (owned subtree bytes) |
-| `from_jshift_bytes` / `project_as_view` | View decode; project keep-list then decode as `T` |
+| `from_jshift_bytes` / `project_as_view` / `to_schema_bytes` | View decode; project keep-list; schema emit |
 | `TypedDoc::from_view` | Emit from `JsonView` onto `{}` |
+| `merge_patch` / `Limits` / `check_document` | RFC 7396; DoS depth/size guards |
 
-### Build without `Value` (0.5)
+### Build without `Value` (0.5–0.6)
 
 | API | Role |
 | :--- | :--- |
 | `ObjectBuilder` / `ArrayBuilder` | Fluent emit; **in-place** nesting (single buffer) |
-| `JsonWriter` | Imperative encoder (`key` / `value` / `begin_*` / auto-close `finish`) |
+| `JsonWriter` | Imperative encoder (`key` / `value` / `begin_*` / auto-close `finish` / **`pretty`**) |
 | `object_from_iter` / `array_from_iter` / `build_object` / `build_array` | Helpers |
 
-### Batch mutate & validate (0.5)
+### Batch mutate & validate (0.5–0.6)
 
 | API | Role |
 | :--- | :--- |
-| `MutateOp` / `BatchPlan` / `apply_ops` | Ordered multi-op plans (set/upsert/delete/rename/merge) |
+| `MutateOp` / `BatchPlan` / `apply_ops` | Ordered multi-op plans (set/upsert/delete/rename/merge/merge_patch) |
 | `rename_key` / `merge_object_shallow` | Key rename; shallow object merge |
 | `require_paths` / `require_paths_non_null` | Required fields present |
 | `deny_unknown_keys` / `validate_open` / `validate_closed` | Open vs closed (no DOM) |

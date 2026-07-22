@@ -190,6 +190,7 @@ mod tests {
     use crate::convert::{FromJsonSlice, ToJsonBytes};
     use crate::path::parse_path;
     use crate::scan::find_value;
+    use crate::typed_doc::JsonDoc;
     use crate::upsert_at_path;
 
     struct IdOnly {

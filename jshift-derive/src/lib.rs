@@ -61,6 +61,9 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     let mut field_jmes_lits = Vec::new();
     let mut has_any_jmes = false;
     let mut array_prefixes: BTreeSet<String> = BTreeSet::new();
+    // Single-key paths for one-pass ObjectBuilder schema emit (0.6).
+    let mut flat_schema_fields: Vec<(String, Ident)> = Vec::new();
+    let mut all_paths_flat = true;
 
     for field in fields {
         let field_name = field.ident.as_ref().ok_or_else(|| {
@@ -81,6 +84,15 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 format!("invalid #[json(path = ...)] value `{raw_path}`: {msg}"),
             )
         })?;
+
+        match path_segments.as_slice() {
+            [DerSegment::Key(k)] => {
+                flat_schema_fields.push((k.clone(), field_name.clone()));
+            }
+            _ => {
+                all_paths_flat = false;
+            }
+        }
 
         for pref in static_array_prefixes_from_segments(&path_segments) {
             array_prefixes.insert(pref);
@@ -410,6 +422,24 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
         }
     };
 
+    // One-pass ObjectBuilder when every field path is a single object key.
+    let schema_bytes_override = if all_paths_flat && !flat_schema_fields.is_empty() {
+        let builder_fields = flat_schema_fields.iter().map(|(key, fname)| {
+            quote! { b = b.field(#key, &self.#fname); }
+        });
+        quote! {
+            /// Single-pass schema emit (flat top-level keys only).
+            #[inline]
+            fn to_schema_bytes(&self) -> Result<Vec<u8>, jshift::Error> {
+                let mut b = jshift::ObjectBuilder::new();
+                #(#builder_fields)*
+                Ok(b.finish())
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         impl #struct_name {
             #(#path_statics)*
@@ -483,6 +513,15 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 Ok(())
             }
 
+            /// Build a new buffer with only this schema’s fields (0.6 schema writer).
+            ///
+            /// Flat top-level paths: single-pass [`jshift::ObjectBuilder`]. Nested paths:
+            /// upsert onto `{}` + project keep-list.
+            #[inline]
+            pub fn to_schema_json(&self) -> Result<Vec<u8>, jshift::Error> {
+                jshift::JsonView::to_schema_bytes(self)
+            }
+
             /// Rough projected size if only this schema's fields were kept.
             pub fn estimate_projected_len(json: &[u8]) -> Result<usize, jshift::Error> {
                 jshift::estimate_projected_len(json, Self::FIELD_PATHS)
@@ -551,6 +590,8 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             fn project_bytes(json: &[u8]) -> Result<Vec<u8>, jshift::Error> {
                 Self::project_json(json)
             }
+
+            #schema_bytes_override
         }
 
         pub struct #mutator_name<'a> {

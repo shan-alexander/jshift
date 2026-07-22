@@ -55,6 +55,11 @@ pub enum MutateOp {
         path: String,
         patch: Vec<u8>,
     },
+    /// RFC 7396 merge patch at `path` (`""` = root).
+    MergePatch {
+        path: String,
+        patch: Vec<u8>,
+    },
 }
 
 impl MutateOp {
@@ -95,6 +100,14 @@ impl MutateOp {
     /// [`MergeShallow`](Self::MergeShallow) patch object into path.
     pub fn merge_shallow(path: impl Into<String>, patch: impl Into<Vec<u8>>) -> Self {
         Self::MergeShallow {
+            path: path.into(),
+            patch: patch.into(),
+        }
+    }
+
+    /// [`MergePatch`](Self::MergePatch) RFC 7396 at path.
+    pub fn merge_patch(path: impl Into<String>, patch: impl Into<Vec<u8>>) -> Self {
+        Self::MergePatch {
             path: path.into(),
             patch: patch.into(),
         }
@@ -142,6 +155,14 @@ fn apply_one(json: &mut Vec<u8>, op: &MutateOp) -> Result<(), Error> {
                 try_parse_path(path)?
             };
             merge_object_shallow(json, &segs, patch)
+        }
+        MutateOp::MergePatch { path, patch } => {
+            let segs = if path.is_empty() {
+                Vec::new()
+            } else {
+                try_parse_path(path)?
+            };
+            crate::merge_patch::merge_patch_at(json, &segs, patch)
         }
     }
 }
@@ -194,6 +215,11 @@ impl BatchPlan {
 
     pub fn merge_shallow(mut self, path: impl Into<String>, patch: impl Into<Vec<u8>>) -> Self {
         self.ops.push(MutateOp::merge_shallow(path, patch));
+        self
+    }
+
+    pub fn merge_patch(mut self, path: impl Into<String>, patch: impl Into<Vec<u8>>) -> Self {
+        self.ops.push(MutateOp::merge_patch(path, patch));
         self
     }
 

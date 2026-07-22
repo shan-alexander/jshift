@@ -1,6 +1,6 @@
 [package]
 name = "jshift"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
@@ -35,7 +35,7 @@ dhat-heap = ["dep:dhat"]
 
 [dependencies]
 memchr = "2.7"
-jshift-derive = { version = "0.5.0", path = "./jshift-derive", optional = true }
+jshift-derive = { version = "0.6.0", path = "./jshift-derive", optional = true }
 rayon = { version = "1.8", optional = true }
 dhat = { version = "0.3", optional = true }
 

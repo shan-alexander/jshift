@@ -775,6 +775,21 @@ impl TypedDoc {
         view.write_into(&mut self.bytes)
     }
 
+    /// Nested subtree cursor at `path` (0.6).
+    #[inline]
+    pub fn nest(&self, path: &str) -> Result<crate::nested::NestedView<'_>, Error> {
+        crate::nested::NestedView::from_doc(self, path)
+    }
+
+    /// Object-as-map cursor at `path` (0.6).
+    #[inline]
+    pub fn map_view<T: FromJsonSlice>(
+        &self,
+        path: &str,
+    ) -> Result<crate::map_view::MapView<'_, T>, Error> {
+        crate::map_view::MapView::from_doc(self, path)
+    }
+
     /// Apply a batch of [`crate::MutateOp`]s (see [`crate::apply_ops`]).
     #[inline]
     pub fn apply_ops(&mut self, ops: &[crate::MutateOp]) -> Result<(), Error> {
@@ -789,6 +804,28 @@ impl TypedDoc {
             try_parse_path(path)?
         };
         crate::mutate::merge_object_shallow(&mut self.bytes, &segs, patch)
+    }
+
+    /// RFC 7396 JSON Merge Patch at document root.
+    #[inline]
+    pub fn merge_patch(&mut self, patch: &[u8]) -> Result<(), Error> {
+        crate::merge_patch::merge_patch(&mut self.bytes, patch)
+    }
+
+    /// RFC 7396 merge patch at `path` (`""` = root).
+    pub fn merge_patch_at(&mut self, path: &str, patch: &[u8]) -> Result<(), Error> {
+        let segs = if path.is_empty() {
+            Vec::new()
+        } else {
+            try_parse_path(path)?
+        };
+        crate::merge_patch::merge_patch_at(&mut self.bytes, &segs, patch)
+    }
+
+    /// Reject oversized / over-deep documents ([`crate::Limits`]).
+    #[inline]
+    pub fn check_limits(&self, limits: &crate::limits::Limits) -> Result<(), Error> {
+        crate::limits::check_document(self.as_bytes(), limits)
     }
 
     /// Build a new document by open-upserting `view` onto `{}`.

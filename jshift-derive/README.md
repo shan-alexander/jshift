@@ -9,7 +9,7 @@ Procedural macros for [**jshift**](https://crates.io/crates/jshift): schema-guid
 
 ```toml
 [dependencies]
-jshift = "0.5"
+jshift = "0.6"
 ```
 
 ## Default: field name = JSON path

@@ -61,6 +61,15 @@ pub enum Error {
         /// Key or path that was not allowed.
         path: String,
     },
+    /// Document exceeded a configured depth or size limit ([`crate::Limits`]).
+    LimitExceeded {
+        /// `"depth"` or `"bytes"`.
+        kind: &'static str,
+        /// Configured limit.
+        limit: usize,
+        /// Observed value.
+        found: usize,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -102,6 +111,11 @@ impl std::fmt::Display for Error {
             }
             Error::MissingField { path } => write!(f, "Missing required field '{path}'"),
             Error::UnknownField { path } => write!(f, "Unknown field '{path}'"),
+            Error::LimitExceeded {
+                kind,
+                limit,
+                found,
+            } => write!(f, "Limit exceeded ({kind}): limit {limit}, found {found}"),
         }
     }
 }

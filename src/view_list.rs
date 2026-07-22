@@ -207,9 +207,19 @@ impl<'a, T: JsonView> ViewList<'a, T> {
         Ok(out)
     }
 
+    /// Fallible raw-element iterator (zero-copy spans; no intermediate table).
+    ///
+    /// Prefer this (or [`crate::collect`] helpers) over collecting all spans into
+    /// a `Vec` unless you need random access — then use [`index`](Self::index).
+    #[inline]
+    pub fn raw_elems(&self) -> ArrayElems<'a> {
+        self.span.elems()
+    }
+
     /// Build a side-table of element spans (one array walk) for O(1) [`IndexedViewList::get`].
     ///
     /// Allocates `Vec` of borrowed spans only — still no `Vec<T>` until you decode.
+    /// **Cost:** O(n) walk + O(n) pointer storage; pay once for multi-get workloads.
     pub fn index(&self) -> Result<IndexedViewList<'a, T>, Error> {
         Ok(IndexedViewList {
             elems: self.span.index_elems()?,

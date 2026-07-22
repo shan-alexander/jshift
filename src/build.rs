@@ -79,6 +79,8 @@ enum Frame {
 pub struct JsonWriter {
     buf: Vec<u8>,
     stack: Vec<Frame>,
+    /// When set, emit `\n` + spaces after `{`/`[`/`,` and before `}`/`]`.
+    pretty_indent: Option<u8>,
 }
 
 impl JsonWriter {
@@ -88,6 +90,7 @@ impl JsonWriter {
         Self {
             buf: Vec::with_capacity(64),
             stack: Vec::with_capacity(4),
+            pretty_indent: None,
         }
     }
 
@@ -111,6 +114,21 @@ impl JsonWriter {
         Self {
             buf: Vec::with_capacity(cap),
             stack: Vec::with_capacity(4),
+            pretty_indent: None,
+        }
+    }
+
+    /// Pretty-print with `indent` spaces per nesting level (compact if 0).
+    pub fn pretty(mut self, indent: u8) -> Self {
+        self.pretty_indent = if indent == 0 { None } else { Some(indent) };
+        self
+    }
+
+    fn pretty_nl(&mut self) {
+        if let Some(ind) = self.pretty_indent {
+            self.buf.push(b'\n');
+            let n = self.stack.len().saturating_mul(ind as usize);
+            self.buf.resize(self.buf.len() + n, b' ');
         }
     }
 
@@ -151,10 +169,15 @@ impl JsonWriter {
                 Ok(())
             }
             Some(Frame::Array { first }) => {
-                if !*first {
+                let need_comma = !*first;
+                let need_nl = self.pretty_indent.is_some();
+                *first = false;
+                if need_comma {
                     self.buf.push(b',');
                 }
-                *first = false;
+                if need_nl {
+                    self.pretty_nl();
+                }
                 Ok(())
             }
             Some(Frame::Object {
@@ -172,23 +195,34 @@ impl JsonWriter {
 
     /// Write an object key (`"k":`). Must be inside an object.
     pub fn key(&mut self, key: &str) -> Result<(), Error> {
-        match self.stack.last_mut() {
+        let (need_comma, need_nl, pretty_space) = match self.stack.last_mut() {
             Some(Frame::Object { first, need_value }) => {
                 if *need_value {
                     return Err(Self::err("Cannot write key while value is pending"));
                 }
-                if !*first {
-                    self.buf.push(b',');
-                }
+                let need_comma = !*first;
+                let need_nl = self.pretty_indent.is_some();
                 *first = false;
                 *need_value = true;
-                write_json_string(&mut self.buf, key);
-                self.buf.push(b':');
-                Ok(())
+                (need_comma, need_nl, self.pretty_indent.is_some())
             }
-            Some(Frame::Array { .. }) => Err(Self::err("key() is only valid inside an object")),
-            None => Err(Self::err("key() with no open object")),
+            Some(Frame::Array { .. }) => {
+                return Err(Self::err("key() is only valid inside an object"));
+            }
+            None => return Err(Self::err("key() with no open object")),
+        };
+        if need_comma {
+            self.buf.push(b',');
         }
+        if need_nl {
+            self.pretty_nl();
+        }
+        write_json_string(&mut self.buf, key);
+        self.buf.push(b':');
+        if pretty_space {
+            self.buf.push(b' ');
+        }
+        Ok(())
     }
 
     /// Write a typed value at the current position.
@@ -269,9 +303,12 @@ impl JsonWriter {
     /// Close the innermost `{`.
     pub fn end_object(&mut self) -> Result<(), Error> {
         match self.stack.pop() {
-            Some(Frame::Object { need_value, .. }) => {
+            Some(Frame::Object { need_value, first }) => {
                 if need_value {
                     return Err(Self::err("Unfinished object field (value missing)"));
+                }
+                if self.pretty_indent.is_some() && !first {
+                    self.pretty_nl();
                 }
                 self.buf.push(b'}');
                 Ok(())
@@ -284,7 +321,10 @@ impl JsonWriter {
     /// Close the innermost `[`.
     pub fn end_array(&mut self) -> Result<(), Error> {
         match self.stack.pop() {
-            Some(Frame::Array { .. }) => {
+            Some(Frame::Array { first }) => {
+                if self.pretty_indent.is_some() && !first {
+                    self.pretty_nl();
+                }
                 self.buf.push(b']');
                 Ok(())
             }
@@ -828,5 +868,19 @@ mod tests {
     fn escaped_keys() {
         let v = ObjectBuilder::new().field("a\"b", &1u64).finish();
         assert_eq!(v, br#"{"a\"b":1}"#);
+    }
+
+    #[test]
+    fn json_writer_pretty() {
+        let mut w = JsonWriter::new_object().pretty(2);
+        w.field("a", &1u64).unwrap();
+        w.key("b").unwrap();
+        w.begin_array().unwrap();
+        w.value(&2u64).unwrap();
+        w.value(&3u64).unwrap();
+        w.end_array().unwrap();
+        let s = String::from_utf8(w.finish().unwrap()).unwrap();
+        assert!(s.contains('\n'));
+        assert!(s.contains("  \"a\": 1"));
     }
 }

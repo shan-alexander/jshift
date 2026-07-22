@@ -35,11 +35,11 @@
 //! [`project_each`] / [`project_jsonl_write`] (no giant output array).
 //!
 //! ```toml
-//! jshift = { version = "0.5", features = ["derive"] }
+//! jshift = { version = "0.6", features = ["derive"] }
 //! # core only (no proc-macros):
-//! jshift = { version = "0.5", default-features = false }
+//! jshift = { version = "0.6", default-features = false }
 //! # bulk array project with rayon:
-//! jshift = { version = "0.5", features = ["parallel"] }
+//! jshift = { version = "0.6", features = ["parallel"] }
 //! ```
 //!
 //! Measurement: Criterion (`benches/`), RSS (`scripts/measure_rss.sh`), dhat/heaptrack
@@ -54,9 +54,9 @@
 //! * **[`JsonView`] trait:** one protocol surface for typed projections of bytes.
 //! * **Macro-generated schemas:** `#[derive(JsonView)]` / `JsonMutatorSchema`.
 //! * **Typed documents:** [`JsonDoc`] + [`TypedDoc`] / [`TypedDocRef`], [`ViewList`] /
-//!   [`ValueList`], [`RawJson`], exclusive [`TypedMutator`].
-//! * **Build without Value:** [`ObjectBuilder`] / [`ArrayBuilder`] / [`JsonWriter`]
-//!   (in-place nest); [`TypedDoc::from_view`].
+//!   [`ValueList`], [`NestedView`], [`MapView`], [`RawJson`], exclusive [`TypedMutator`].
+//! * **Collect policies:** [`CollectPolicy`] / [`Collected`] (stream / owned / projected).
+//! * **Build without Value:** [`ObjectBuilder`] / [`JsonWriter`]; [`JsonView::to_schema_bytes`].
 //! * **Batch mutate:** [`MutateOp`] / [`BatchPlan`] / [`apply_ops`]; [`rename_key`],
 //!   [`merge_object_shallow`].
 //! * **Validate:** [`require_paths`], [`deny_unknown_keys`], [`validate_closed`] /
@@ -195,12 +195,17 @@
 
 mod batch;
 mod build;
+mod collect;
 mod convert;
 mod document;
 mod error;
 mod index;
 mod jsonl;
+mod limits;
+mod map_view;
+mod merge_patch;
 mod mutate;
+mod nested;
 mod path;
 mod project;
 mod raw;
@@ -215,6 +220,11 @@ pub use build::{
     array_from_iter, build_array, build_object, object_from_iter, ArrayBuilder, JsonWriter,
     ObjectBuilder,
 };
+pub use collect::{CollectPolicy, Collected};
+pub use limits::{check_depth, check_document, measure_depth, Limits};
+pub use map_view::{IndexedMapView, MapView};
+pub use merge_patch::{merge_patch, merge_patch_at};
+pub use nested::NestedView;
 pub use convert::{
     escape_json_key, escape_json_string, from_json_string, write_json_string,
     write_json_string_content, FromJsonSlice, ToJsonBytes,
@@ -262,7 +272,10 @@ pub use project::{
 #[cfg(feature = "parallel")]
 pub use project::{project_indexed_parallel, project_object_fields_parallel, project_parallel};
 pub use scan::find_value;
-pub use view::{from_jshift_bytes, project_as_view, read_view, write_view, JsonView};
+pub use view::{
+    build_schema_bytes, from_jshift_bytes, project_as_view, project_view_collect, project_view_each,
+    read_view, write_view, JsonView,
+};
 
 #[cfg(feature = "derive")]
 pub use jshift_derive::JsonMutatorSchema;
@@ -976,6 +989,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "derive")]
     fn test_json_default_attr_derive() {
         #[derive(JsonMutatorSchema)]
         struct WithDefault {
@@ -1003,6 +1017,58 @@ mod tests {
         require_paths(&json, &["new", "keep", "extra"]).unwrap();
         validate_closed(&json, &["new", "keep", "extra"]).unwrap();
         assert!(validate_closed(&json, &["new", "keep"]).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "derive")]
+    fn test_v06_nested_map_collect_schema() {
+        #[derive(JsonView)]
+        struct Card {
+            #[json(path = "id")]
+            id: u64,
+            #[json(path = "title")]
+            title: String,
+        }
+
+        let doc = TypedDoc::from_slice(
+            br#"{"user":{"id":1,"scores":{"a":10,"b":20}},"items":[{"id":1,"title":"x","blob":9},{"id":2,"title":"y","blob":8}]}"#,
+        );
+
+        // NestedView
+        let user = doc.nest("user").unwrap();
+        assert_eq!(user.get::<u64>("id").unwrap(), 1);
+        assert_eq!(user.map::<u64>("scores").unwrap().get("b").unwrap(), 20);
+
+        // Collect policies
+        let list = doc.view_list::<Card>("items").unwrap();
+        assert!(matches!(
+            list.collect(CollectPolicy::Stream).unwrap(),
+            Collected::Stream
+        ));
+        let owned = match list.collect(CollectPolicy::Owned).unwrap() {
+            Collected::Owned(v) => v,
+            _ => panic!(),
+        };
+        assert_eq!(owned.len(), 2);
+        assert_eq!(owned[0].id, 1);
+        let projected = list.collect_projected().unwrap();
+        assert_eq!(projected.len(), 2);
+        // thin cards drop blob
+        assert!(!projected[0].windows(4).any(|w| w == b"blob"));
+
+        // each_field / collect_field
+        assert_eq!(list.collect_field::<u64>("id").unwrap(), vec![1, 2]);
+
+        // schema build strips unknowns from open write
+        let card = Card {
+            id: 9,
+            title: "z".into(),
+        };
+        let schema = card.to_schema_json().unwrap();
+        let round: Card = Card::read_from_json(&schema).unwrap();
+        assert_eq!(round.id, 9);
+        assert_eq!(round.title, "z");
+        assert!(!schema.is_empty());
     }
 
     #[test]

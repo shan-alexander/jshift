@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "jshift"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "dhat",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "jshift-derive"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "proc-macro2",
  "quote",
