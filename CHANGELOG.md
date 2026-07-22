@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-22
+
+Typed document spine: hold bytes, decode paths on demand, stream arrays, mutate
+exclusively — without `serde_json::Value`.
+
+### Added
+- **`JsonDoc` trait**: shared read surface (`get` / `get_opt` / `get_nullable` /
+  `contains` / `presence` / `is_null` / `get_str` / `get_raw` / `get_at` /
+  `get_pointer` / `view_at` / `root_kind` / `root_elems` / `elems` / `each_*` /
+  `each_get` / `collect_each*`) for `TypedDoc`, `TypedDocRef`, `SharedDocument`,
+  and `Vec<u8>`.
+- **`TypedDoc` / `TypedMutator`**: owned buffer + exclusive mutate (`set` /
+  `upsert` / `delete` / `set_at` / fluent `and_set` / `write_view`).
+- **`TypedDocRef`**: borrowed read-only view.
+- **`ViewList<T: JsonView>` / `ValueList<T>`**: array cursors with `len` / `get` /
+  `iter` / `each` / `collect_owned` (lists are streams; `Vec` is explicit).
+- **`IndexedViewList` / `IndexedValueList`**: `list.index()` — one array walk,
+  then O(1) `get(i)` (span table only; still no `Vec<T>` until decode).
+- **`ObjectEntries` / `ObjectEntry`**: DynObject cursor over key/value spans
+  (`object_entries` / `object_entries_at`).
+- **`ArrayElems`**: fallible raw element iterator.
+- **`RootKind` / `Presence`**: root array|object|… and missing vs null vs value.
+- **`RawJson`**: dynamic pocket (owned subtree bytes; `JsonDoc` + `FromJsonSlice`).
+- **`ObjectBuilder` / `ArrayBuilder`**: build JSON without a `Value` tree;
+  **in-place nesting** (single buffer, no nested alloc+copy); `field_opt` /
+  `field_if` / `null_field` / `extend` / `finish_into`.
+- **`JsonWriter`**: imperative encoder with fallible `key`/`value`/`begin_*`/
+  `end_*` (loops, streaming records).
+- **`object_from_iter` / `array_from_iter` / `build_object` / `build_array`**.
+- **`TypedDoc::from_view`**: closed-ish emit from `JsonView` onto `{}`.
+- **JSONL typed I/O:** `jsonl_docs` / `jsonl_docs_owned`, `write_jsonl_line` /
+  `write_jsonl_views` / `write_jsonl_docs`, `for_each_jsonl_*`.
+- **Batch mutate:** `MutateOp` / `BatchPlan` / `apply_ops` (set, upsert, delete,
+  rename, merge-shallow); `TypedDoc::apply_ops`.
+- **`rename_key` / `merge_object_shallow`**: splice-friendly mutation completeness.
+- **Validate (no DOM):** `require_paths` / `require_paths_non_null`,
+  `deny_unknown_keys`, `validate_open` / `validate_closed`, `type_at` /
+  `require_type`.
+- **Richer errors:** `Error::Decode`, `MissingField`, `UnknownField`.
+- **`project_as_view`**: project keep-list then decode as `T: JsonView`.
+- **Derive:** `#[json(default)]` — missing path → `Default::default()`.
+- **`from_jshift_bytes`**: `T: JsonView` happy path (migration naming).
+- **`ToJsonBytes::write_json_bytes`**: stack itoa for integers; lower-alloc emit.
+- **Example:** `examples/typed_doc_bench.rs` — TypedDoc vs serde_json matrix.
+
+### Notes
+- Bring `JsonDoc` into scope for path methods (`use jshift::JsonDoc`).
+- `get_str` is zero-copy only for unescaped strings; use `get::<String>` for escapes.
+- Prefer `each_get` / `ValueList` / sparse `ViewList` over full-card materialize
+  when competing with serde typed decode.
+- Batch ops run **in order**; each delete still memmoves the buffer tail.
+
 ## [0.4.2] - 2026-07-21
 
 Mutator deletes and streaming list cards for filter/slice. Still no `get_*`
@@ -208,7 +260,8 @@ are intentionally not patch-compatible.
 - Initial release: path-selective find/mutate on raw JSON bytes, object/array CRUD,
   `ToJsonBytes` / `FromJsonSlice`, and `#[derive(JsonMutatorSchema)]`.
 
-[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/shan-alexander/jshift/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/shan-alexander/jshift/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/shan-alexander/jshift/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/shan-alexander/jshift/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/shan-alexander/jshift/compare/v0.3.1...v0.4.0

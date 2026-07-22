@@ -15,3 +15,5 @@
 /dhat-heap.json
 /heaptrack.*.gz
 /heaptrack.*.raw
+
+/.archive

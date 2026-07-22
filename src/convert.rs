@@ -125,6 +125,12 @@ pub trait ToJsonBytes {
     /// String implementations produce a JSON string literal with required escapes
     /// (`"`, `\`, and control characters).
     fn to_json_bytes(&self) -> Vec<u8>;
+
+    /// Append the JSON encoding of `self` into `out` (avoids an intermediate `Vec`
+    /// when the implementor overrides this; default uses [`to_json_bytes`](Self::to_json_bytes)).
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_json_bytes());
+    }
 }
 
 /// Append the escaped form of `s` (content only, no surrounding quotes) into `out`.
@@ -279,11 +285,19 @@ impl ToJsonBytes for String {
     fn to_json_bytes(&self) -> Vec<u8> {
         escape_json_string(self)
     }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        write_json_string(out, self);
+    }
 }
 
 impl ToJsonBytes for str {
     fn to_json_bytes(&self) -> Vec<u8> {
         escape_json_string(self)
+    }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        write_json_string(out, self);
     }
 }
 
@@ -295,6 +309,10 @@ impl ToJsonBytes for bool {
             b"false".to_vec()
         }
     }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(if *self { b"true" } else { b"false" });
+    }
 }
 
 impl<T: ToJsonBytes> ToJsonBytes for Option<T> {
@@ -305,48 +323,150 @@ impl<T: ToJsonBytes> ToJsonBytes for Option<T> {
             None => b"null".to_vec(),
         }
     }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        match self {
+            Some(v) => v.write_json_bytes(out),
+            None => out.extend_from_slice(b"null"),
+        }
+    }
 }
 
-macro_rules! impl_to_json_numeric {
+fn write_u64_decimal(out: &mut Vec<u8>, mut n: u64) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend_from_slice(&buf[i..]);
+}
+
+fn write_i64_decimal(out: &mut Vec<u8>, n: i64) {
+    if n == i64::MIN {
+        out.extend_from_slice(b"-9223372036854775808");
+        return;
+    }
+    if n < 0 {
+        out.push(b'-');
+        write_u64_decimal(out, (-n) as u64);
+    } else {
+        write_u64_decimal(out, n as u64);
+    }
+}
+
+macro_rules! impl_to_json_unsigned {
     ($($t:ty),*) => {
         $(
             impl ToJsonBytes for $t {
                 fn to_json_bytes(&self) -> Vec<u8> {
-                    self.to_string().into_bytes()
+                    let mut v = Vec::with_capacity(20);
+                    write_u64_decimal(&mut v, u64::from(*self));
+                    v
+                }
+
+                fn write_json_bytes(&self, out: &mut Vec<u8>) {
+                    write_u64_decimal(out, u64::from(*self));
                 }
             }
         )*
     };
 }
 
-impl_to_json_numeric!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
+macro_rules! impl_to_json_signed {
+    ($($t:ty),*) => {
+        $(
+            impl ToJsonBytes for $t {
+                fn to_json_bytes(&self) -> Vec<u8> {
+                    let mut v = Vec::with_capacity(24);
+                    write_i64_decimal(&mut v, i64::from(*self));
+                    v
+                }
+
+                fn write_json_bytes(&self, out: &mut Vec<u8>) {
+                    write_i64_decimal(out, i64::from(*self));
+                }
+            }
+        )*
+    };
+}
+
+impl_to_json_unsigned!(u8, u16, u32, u64);
+impl_to_json_signed!(i8, i16, i32, i64);
+
+impl ToJsonBytes for usize {
+    fn to_json_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(20);
+        write_u64_decimal(&mut v, *self as u64);
+        v
+    }
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        write_u64_decimal(out, *self as u64);
+    }
+}
+
+impl ToJsonBytes for isize {
+    fn to_json_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(24);
+        write_i64_decimal(&mut v, *self as i64);
+        v
+    }
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        write_i64_decimal(out, *self as i64);
+    }
+}
+
+impl ToJsonBytes for f32 {
+    fn to_json_bytes(&self) -> Vec<u8> {
+        self.to_string().into_bytes()
+    }
+}
+
+impl ToJsonBytes for f64 {
+    fn to_json_bytes(&self) -> Vec<u8> {
+        self.to_string().into_bytes()
+    }
+}
 
 impl<T: ToJsonBytes> ToJsonBytes for Vec<T> {
     fn to_json_bytes(&self) -> Vec<u8> {
         let mut v = Vec::new();
-        v.push(b'[');
+        self.write_json_bytes(&mut v);
+        v
+    }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        out.push(b'[');
         for (i, item) in self.iter().enumerate() {
             if i > 0 {
-                v.push(b',');
+                out.push(b',');
             }
-            v.extend_from_slice(&item.to_json_bytes());
+            item.write_json_bytes(out);
         }
-        v.push(b']');
-        v
+        out.push(b']');
     }
 }
 
 impl<T: ToJsonBytes> ToJsonBytes for [T] {
     fn to_json_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(self.len() * 10 + 2);
-        v.push(b'[');
+        self.write_json_bytes(&mut v);
+        v
+    }
+
+    fn write_json_bytes(&self, out: &mut Vec<u8>) {
+        out.push(b'[');
         for (i, item) in self.iter().enumerate() {
             if i > 0 {
-                v.push(b',');
+                out.push(b',');
             }
-            v.extend_from_slice(&item.to_json_bytes());
+            item.write_json_bytes(out);
         }
-        v.push(b']');
-        v
+        out.push(b']');
     }
 }

@@ -39,6 +39,28 @@ pub enum Error {
         /// Informative message.
         msg: &'static str,
     },
+    /// Typed decode / validation failed at a known path (richer than bare
+    /// [`TypeMismatch`](Self::TypeMismatch)).
+    Decode {
+        /// Dot/bracket path where the failure was detected.
+        path: String,
+        /// Expected type or shape description.
+        expected: &'static str,
+        /// Encountered type or shape description.
+        found: &'static str,
+        /// Optional byte offset in the buffer.
+        pos: Option<usize>,
+    },
+    /// Required field / path was absent ([`crate::validate::require_paths`]).
+    MissingField {
+        /// Path that was required.
+        path: String,
+    },
+    /// Closed schema rejected an unknown object key.
+    UnknownField {
+        /// Key or path that was not allowed.
+        path: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -60,6 +82,26 @@ impl std::fmt::Display for Error {
                 )
             }
             Error::Jmespath { msg } => write!(f, "JMESPath error: {}", msg),
+            Error::Decode {
+                path,
+                expected,
+                found,
+                pos,
+            } => {
+                if let Some(p) = pos {
+                    write!(
+                        f,
+                        "Decode error at '{path}' (pos {p}): expected '{expected}', found '{found}'"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Decode error at '{path}': expected '{expected}', found '{found}'"
+                    )
+                }
+            }
+            Error::MissingField { path } => write!(f, "Missing required field '{path}'"),
+            Error::UnknownField { path } => write!(f, "Unknown field '{path}'"),
         }
     }
 }

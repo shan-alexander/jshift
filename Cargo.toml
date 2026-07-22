@@ -1,21 +1,22 @@
 [package]
 name = "jshift"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
-description = "Schema-guided, safe in-place JSON path reader and mutator for raw byte buffers."
+description = "Schema-guided typed JSON on raw bytes: path get/mutate, open views, project — without a Value tree."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shan-alexander/jshift"
 homepage = "https://github.com/shan-alexander/jshift"
 documentation = "https://docs.rs/jshift"
 readme = "README.md"
-keywords = ["json", "in-place", "mutator", "parser", "zero-copy"]
+keywords = ["json", "typed", "in-place", "mutator", "zero-copy"]
 categories = ["parser-implementations", "data-structures"]
 exclude = [
     "/docs/",
     "/target/",
     "/fuzz/",
+    "/.archive/",
     # Large real-world fixtures stay local / in a separate bench repo — never crates.io.
     "/benches/**/*.json",
     "/benches/datasets/",
@@ -34,7 +35,7 @@ dhat-heap = ["dep:dhat"]
 
 [dependencies]
 memchr = "2.7"
-jshift-derive = { version = "0.4.2", path = "./jshift-derive", optional = true }
+jshift-derive = { version = "0.5.0", path = "./jshift-derive", optional = true }
 rayon = { version = "1.8", optional = true }
 dhat = { version = "0.3", optional = true }
 

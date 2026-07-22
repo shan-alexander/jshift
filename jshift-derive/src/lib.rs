@@ -67,7 +67,7 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
             syn::Error::new_spanned(field, "JsonMutatorSchema requires named fields")
         })?;
         let field_type = &field.ty;
-        let (raw_path, jmes_opt) = get_json_attrs(field)?;
+        let (raw_path, jmes_opt, use_default) = get_json_attrs(field)?;
         field_path_lits.push(raw_path.clone());
         let jmes_expr = jmes_opt.clone().unwrap_or_else(|| raw_path.clone());
         field_jmes_lits.push(jmes_expr.clone());
@@ -214,6 +214,59 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                         })?
                 }
             });
+        } else if use_default {
+            // #[json(default)] — PathNotFound → Default::default(); still errors on bad type.
+            field_reads.push(quote! {
+                #field_name: {
+                    match jshift::find_value(json, Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => {
+                            <#field_type as core::default::Default>::default()
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
+            field_reads_indexed.push(quote! {
+                #field_name: {
+                    match doc.find(Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => {
+                            <#field_type as core::default::Default>::default()
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
+            field_reads_doc.push(quote! {
+                #field_name: {
+                    match doc.find(Self::#path_const_name) {
+                        Ok(slice) => {
+                            jshift::FromJsonSlice::from_json_slice(slice)
+                                .ok_or(jshift::Error::TypeMismatch {
+                                    expected: stringify!(#field_type),
+                                    found: "invalid format",
+                                })?
+                        }
+                        Err(jshift::Error::PathNotFound) => {
+                            <#field_type as core::default::Default>::default()
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
         } else {
             field_reads.push(quote! {
                 #field_name: {
@@ -272,6 +325,11 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                 })
                 .collect();
             mutator_setters.push(quote! {
+                /// Remove this field’s object member (`delete_key` on parent + last key).
+                ///
+                /// Early keys in a large document still **memmove the buffer tail** —
+                /// prefer trailing keys / sparse open-view edits when possible.
+                /// See [`jshift::delete_key`].
                 pub fn #delete_name(&mut self) -> Result<(), jshift::Error> {
                     const PARENT: &[jshift::PathSegment<'static>] = &[#(#parent_tokens),*];
                     jshift::delete_key(self.json, PARENT, #last_key)
@@ -310,6 +368,10 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
                     )
                 }
 
+                /// Remove element `index` from this `Vec` field’s JSON array.
+                ///
+                /// Shifts the buffer tail after the removed span (cheaper near the
+                /// array end). See [`jshift::delete_index`].
                 pub fn #delete_at_name(&mut self, index: usize) -> Result<(), jshift::Error> {
                     jshift::delete_index(self.json, #struct_name::#path_const_name, index)
                 }
@@ -501,10 +563,15 @@ fn expand_derive(input: &DeriveInput) -> Result<proc_macro2::TokenStream, syn::E
     })
 }
 
-/// Returns `(path, optional jmes)`. Path defaults to the field name.
-fn get_json_attrs(field: &syn::Field) -> Result<(String, Option<String>), syn::Error> {
+/// Returns `(path, optional jmes, use_default)`. Path defaults to the field name.
+///
+/// `#[json(default)]` — on `PathNotFound`, use `Default::default()` (field type
+/// must implement `Default`). Prefer `Option<T>` when absent should be `None`
+/// without requiring `Default`.
+fn get_json_attrs(field: &syn::Field) -> Result<(String, Option<String>, bool), syn::Error> {
     let mut path_str = None;
     let mut jmes_str = None;
+    let mut use_default = false;
     for attr in &field.attrs {
         if attr.path().is_ident("json") {
             attr.parse_nested_meta(|meta| {
@@ -518,9 +585,13 @@ fn get_json_attrs(field: &syn::Field) -> Result<(String, Option<String>), syn::E
                     let lit: syn::LitStr = value.parse()?;
                     jmes_str = Some(lit.value());
                     Ok(())
+                } else if meta.path.is_ident("default") {
+                    // bare `default` flag (no value)
+                    use_default = true;
+                    Ok(())
                 } else {
                     Err(meta.error(
-                        "unsupported json attribute; expected `path = \"...\"` or `jmes = \"...\"`",
+                        "unsupported json attribute; expected `path`, `jmes`, or `default`",
                     ))
                 }
             })?;
@@ -534,7 +605,7 @@ fn get_json_attrs(field: &syn::Field) -> Result<(String, Option<String>), syn::E
             .expect("named field")
             .to_string()
     });
-    Ok((path, jmes_str))
+    Ok((path, jmes_str, use_default))
 }
 
 fn is_vec_type(ty: &Type) -> bool {

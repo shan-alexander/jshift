@@ -1,10 +1,10 @@
 [package]
 name = "jshift-derive"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Shan Alexander Newton"]
-description = "Procedural derive macros for the jshift crate."
+description = "Procedural derive macros for jshift: JsonView / JsonMutatorSchema on raw JSON bytes."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shan-alexander/jshift"
 homepage = "https://github.com/shan-alexander/jshift"

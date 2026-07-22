@@ -9,13 +9,21 @@ Procedural macros for [**jshift**](https://crates.io/crates/jshift): schema-guid
 
 ```toml
 [dependencies]
-jshift = "0.4"
+jshift = "0.5"
 ```
 
 ## Default: field name = JSON path
 
 **You do not need `#[json(path = "...")]` on every field.**  
 If you omit it, the path is the **Rust field name** (top-level key) in the struct. Only write the fields you care about in the struct, everything else in the JSON is left unread and byte-preserved on write (**open projection**).
+
+### Attributes
+
+| Attribute | Role |
+| :--- | :--- |
+| `#[json(path = "a.b[0].c")]` | Explicit path (default: field name) |
+| `#[json(jmes = "...")]` | JMES multi-select for schema project |
+| `#[json(default)]` | On `PathNotFound`, use `Default::default()` (0.5; type must implement `Default`). Prefer `Option<T>` when absent → `None`. |
 
 ```rust
 use jshift::JsonView;

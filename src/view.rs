@@ -4,7 +4,7 @@
 //! written. Everything else in the buffer is ignored on read and preserved on write
 //! (open-document / "unknown fields" semantics).
 //!
-//! This is **not** a full JSON DOM and **not** a serde replacement. It is the single
+//! This is **not** a full JSON DOM. Together with [`crate::TypedDoc`], it is the
 //! protocol surface for "this Rust type talks to JSON bytes," enabling generic
 //! pipelines:
 //!
@@ -112,6 +112,41 @@ pub trait JsonView: Sized {
 #[inline]
 pub fn read_view<T: JsonView>(json: &[u8]) -> Result<T, Error> {
     T::read_from(json)
+}
+
+/// Happy-path alias: bytes → `T: JsonView` (roadmap adoption surface).
+///
+/// Same as [`read_view`] / [`JsonView::read_from`]. Prefer this name in
+/// migration guides (`from_jshift_bytes` vs `serde_json::from_slice`).
+#[inline]
+pub fn from_jshift_bytes<T: JsonView>(json: &[u8]) -> Result<T, Error> {
+    T::read_from(json)
+}
+
+/// Project `json` down to `T`'s keep-list, then decode as `T`.
+///
+/// Typed project → T (roadmap query/transform): thin bytes intermediate, no
+/// `Value` tree. Useful when the source is huge but the view is sparse.
+///
+/// ```
+/// # #[cfg(feature = "derive")] {
+/// use jshift::{project_as_view, JsonView};
+///
+/// #[derive(JsonView)]
+/// struct Card {
+///     #[json(path = "id")]
+///     id: u64,
+/// }
+///
+/// let json = br#"{"id":7,"blob":[1,2,3],"title":"x"}"#;
+/// let card: Card = project_as_view(json).unwrap();
+/// assert_eq!(card.id, 7);
+/// # }
+/// ```
+#[inline]
+pub fn project_as_view<T: JsonView>(json: &[u8]) -> Result<T, Error> {
+    let thin = T::project_bytes(json)?;
+    T::read_from(&thin)
 }
 
 /// Shared helper: write any [`JsonView`] into a buffer.

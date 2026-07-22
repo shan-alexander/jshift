@@ -520,6 +520,20 @@ fn is_object_empty(json: &[u8], start: usize, end: usize) -> Result<bool, Error>
 /// trims adjacent whitespace so results stay tidy (e.g. `{}` instead of `{ }`,
 /// no leading space after `{` / before `}`).
 ///
+/// # Cost on large buffers
+///
+/// Deletion is an in-place **byte shift** of everything after the removed span.
+/// Removing a key **near the front** of a multi‑megabyte document still
+/// memmoves most of the buffer (no full parse, but a large `copy` of the tail).
+/// Prefer:
+/// - **trailing / late keys** when you control key order,
+/// - **sparse open-view edits** (derive mutator on a small schema — only paths
+///   you name; unknown fields stay unread),
+/// - or leave metadata at the end of the object when delete-heavy.
+///
+/// Derive wrappers: `delete_<field>()` on `{Type}Mutator` call this with the
+/// field’s parent path + last key segment.
+///
 /// # Examples
 /// ```
 /// use jshift::{delete_key, parse_path};
@@ -566,6 +580,16 @@ pub fn delete_key(json: &mut Vec<u8>, path: &[PathSegment], key: &str) -> Result
 ///
 /// Automatically adjusts commas surrounding the deleted array element, then
 /// trims adjacent whitespace (pretty delete — same policy as [`delete_key`]).
+///
+/// # Cost on large buffers
+///
+/// Like [`delete_key`], this **shifts the tail** of the buffer after the removed
+/// element. Deleting near the **start** of a huge array memmoves almost the whole
+/// array; deleting near the **end** is cheaper. Prefer sparse open-view edits
+/// (e.g. mutator `delete_<field>_at` on a small `Vec` metadata field) over
+/// mid-array deletes on multi‑megabyte catalogs when you can.
+///
+/// Derive wrappers: `delete_<field>_at(i)` on `{Type}Mutator` for `Vec` fields.
 ///
 /// # Examples
 /// ```
@@ -723,4 +747,172 @@ fn delete_range(json: &mut Vec<u8>, delete_start: usize, delete_end: usize) -> R
     json[delete_start..].rotate_left(delta);
     json.truncate(old_total_len - delta);
     Ok(())
+}
+
+/// Rename an object member key in place (value bytes unchanged).
+///
+/// `object_path` locates the parent object (`[]` = document root). Logical keys
+/// are escaped the same way as [`delete_key`] / [`upsert_object_key`].
+///
+/// If `new_key` already exists on the object, returns [`Error::InvalidJsonSyntax`]
+/// (refuse to create a duplicate key).
+///
+/// # Examples
+/// ```
+/// use jshift::rename_key;
+///
+/// let mut json = br#"{"old":1,"keep":true}"#.to_vec();
+/// rename_key(&mut json, &[], "old", "new").unwrap();
+/// assert_eq!(json, br#"{"new":1,"keep":true}"#);
+/// ```
+pub fn rename_key(
+    json: &mut Vec<u8>,
+    object_path: &[PathSegment],
+    old_key: &str,
+    new_key: &str,
+) -> Result<(), Error> {
+    if old_key == new_key {
+        return Ok(());
+    }
+    let escaped_new = escape_json_key(new_key);
+    // Refuse duplicate destination key.
+    if find_object_member_offsets(json, object_path, escaped_new.as_bytes()).is_ok() {
+        return Err(Error::InvalidJsonSyntax {
+            pos: 0,
+            msg: "rename_key: destination key already exists",
+        });
+    }
+    let escaped_old = escape_json_key(old_key);
+    let (key_start, _val_start, _val_end) =
+        find_object_member_offsets(json, object_path, escaped_old.as_bytes())?;
+    // key_start is opening quote of the key string.
+    let key_content_start = key_start + 1;
+    let key_end_quote = crate::scan::find_string_end(json, key_content_start)?;
+    // Replace `"old"` with `"new"` (including quotes).
+    let mut new_lit = Vec::with_capacity(new_key.len() + 2);
+    write_json_string(&mut new_lit, new_key);
+    splice_range(json, key_start, key_end_quote + 1, &new_lit)
+}
+
+/// Shallow-merge `patch` object members into the object at `path`.
+///
+/// For each key in `patch`, upserts that key/value onto the target object
+/// (overwrites if present). Nested objects in `patch` replace the whole value
+/// at that key — this is **shallow**, not deep merge.
+///
+/// `path` empty = merge into the document root (must be an object).
+///
+/// # Examples
+/// ```
+/// use jshift::merge_object_shallow;
+///
+/// let mut json = br#"{"a":1,"b":2}"#.to_vec();
+/// merge_object_shallow(&mut json, &[], br#"{"b":9,"c":3}"#).unwrap();
+/// assert_eq!(json, br#"{"a":1,"b":9,"c":3}"#);
+/// ```
+pub fn merge_object_shallow(
+    json: &mut Vec<u8>,
+    path: &[PathSegment],
+    patch: &[u8],
+) -> Result<(), Error> {
+    let (obj_start, _obj_end) = find_value_offsets(json, path)?;
+    if obj_start >= json.len() || json[obj_start] != b'{' {
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: "primitive/array",
+        });
+    }
+
+    // Collect patch entries first (patch is immutable; target may reallocate).
+    let entries = collect_object_entries(patch)?;
+    for (key, value) in entries {
+        upsert_object_key(json, path, &key, &value)?;
+    }
+    Ok(())
+}
+
+/// Walk a JSON object buffer into owned (logical key, value bytes) pairs.
+fn collect_object_entries(patch: &[u8]) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    use crate::scan::find_string_end;
+
+    let start = skip_whitespace(patch, 0);
+    if start >= patch.len() || patch[start] != b'{' {
+        return Err(Error::TypeMismatch {
+            expected: "object",
+            found: "primitive/array",
+        });
+    }
+    let end = skip_value(patch, start)?;
+    let mut pos = skip_whitespace(patch, start + 1);
+    let mut entries = Vec::new();
+    if pos < end && patch[pos] == b'}' {
+        return Ok(entries);
+    }
+    loop {
+        pos = skip_whitespace(patch, pos);
+        if pos >= end {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF in merge patch object",
+            });
+        }
+        if patch[pos] == b'}' {
+            break;
+        }
+        if patch[pos] != b'"' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected object key in merge patch",
+            });
+        }
+        let key_content_start = pos + 1;
+        let key_end = find_string_end(patch, key_content_start)?;
+        let key_raw = &patch[key_content_start..key_end];
+        let key = if !key_raw.contains(&b'\\') {
+            std::str::from_utf8(key_raw)
+                .map_err(|_| Error::TypeMismatch {
+                    expected: "utf-8 key",
+                    found: "invalid utf-8",
+                })?
+                .to_string()
+        } else {
+            let mut lit = Vec::with_capacity(key_raw.len() + 2);
+            lit.push(b'"');
+            lit.extend_from_slice(key_raw);
+            lit.push(b'"');
+            crate::convert::from_json_string(&lit).ok_or(Error::TypeMismatch {
+                expected: "string key",
+                found: "invalid escape",
+            })?
+        };
+        pos = skip_whitespace(patch, key_end + 1);
+        if pos >= end || patch[pos] != b':' {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected colon in merge patch",
+            });
+        }
+        pos = skip_whitespace(patch, pos + 1);
+        let val_start = pos;
+        let val_end = skip_value(patch, val_start)?;
+        entries.push((key, patch[val_start..val_end].to_vec()));
+        pos = skip_whitespace(patch, val_end);
+        if pos >= end {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Unexpected EOF after merge patch value",
+            });
+        }
+        if patch[pos] == b',' {
+            pos += 1;
+        } else if patch[pos] == b'}' {
+            break;
+        } else {
+            return Err(Error::InvalidJsonSyntax {
+                pos,
+                msg: "Expected comma or '}' in merge patch",
+            });
+        }
+    }
+    Ok(entries)
 }

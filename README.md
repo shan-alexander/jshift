@@ -29,8 +29,36 @@ Simple mental model:
 - **Find**: Extract the value(s) you're looking for, via a slice of the original bytes 
 - **Mutate**: Edit the same Vec<u8> of raw bytes without making a copy or reading into memory 
 - **Project** (as in field projection): Output new smaller JSON document (or NDJSON lines) efficiently
+- **TypedDoc** (0.5+): hold the buffer, `get::<T>(path)`, stream arrays with `each_*`, exclusive `mutate()` — typed fields without `serde_json::Value`
 
 That’s the whole product: peek, patch same buffer, and/or project thinner JSON, without unpacking and reading the whole filing cabinet.
+
+### TypedDoc (typed without Value)
+
+Bring the [`JsonDoc`](https://docs.rs/jshift/latest/jshift/trait.JsonDoc.html) trait into scope for path `get` / `each_*` methods (implemented for `TypedDoc`, `TypedDocRef`, `SharedDocument`, and `Vec<u8>`).
+
+```rust
+use jshift::{JsonDoc, TypedDoc};
+
+let mut doc = TypedDoc::from_slice(
+    br#"{"status":"ok","items":[{"id":1},{"id":2}],"extra":true}"#,
+);
+
+assert_eq!(doc.get::<u64>("items[0].id").unwrap(), 1);
+assert_eq!(doc.get_str("status").unwrap(), "ok");
+
+// sparse array field stream — relative path parsed once (beats full-card views)
+let ids: Vec<u64> = doc.collect_each_get("items", "id").unwrap();
+assert_eq!(ids, vec![1, 2]);
+
+// exclusive mutate: zero-copy borrows cannot coexist (Rust borrow law)
+doc.mutate().set("status", "accepted").unwrap();
+assert!(doc.contains("extra").unwrap()); // unknowns preserved
+```
+
+**Also in 0.5:** `ViewList` / `ValueList` (+ `index()` for O(1) gets), `RootKind` +
+`get_nullable`, `RawJson`, **`ObjectBuilder` / `JsonWriter`** (in-place nest, no
+`Value`), `TypedDoc::from_view`, and typed JSONL (`jsonl_docs`, `write_jsonl_views`).
 
 ---
 
@@ -625,7 +653,40 @@ We **do** absorb a few *ideas* that transfer cleanly to safe Rust:
 
 ## Capabilities (full API map)
 
-Public surface as of **0.4** (`#![forbid(unsafe_code)]`). Providing here as a convenience to support agentic workflows, AI Agents reading the README on crates.io or github.
+Public surface as of **0.5.0** (`#![forbid(unsafe_code)]`). Convenience map for agentic workflows and humans reading crates.io / GitHub.
+
+### Typed documents (0.5 — center of gravity)
+
+| API | Role |
+| :--- | :--- |
+| `TypedDoc` / `TypedDocRef` | Owned / borrowed buffer; exclusive `mutate()` |
+| `JsonDoc` | Shared read trait: `get` / `get_opt` / `get_nullable` / `get_str` / `contains` / `presence` / `view_at` / `each_*` / `each_get` / … |
+| `TypedMutator` | Exclusive splice: `set` / `upsert` / `delete` / `rename_key` / `merge_shallow` / `apply_ops` |
+| `ViewList` / `ValueList` | Array cursors (`len` / `get` / `iter` / `collect_owned`) |
+| `IndexedViewList` / `IndexedValueList` | `list.index()` → O(1) `get(i)` after one walk |
+| `ArrayElems` / `ObjectEntries` / `ObjectEntry` | Raw element / DynObject key-value cursors |
+| `RootKind` / `Presence` | Root type + missing vs null vs value |
+| `RawJson` | Dynamic pocket (owned subtree bytes) |
+| `from_jshift_bytes` / `project_as_view` | View decode; project keep-list then decode as `T` |
+| `TypedDoc::from_view` | Emit from `JsonView` onto `{}` |
+
+### Build without `Value` (0.5)
+
+| API | Role |
+| :--- | :--- |
+| `ObjectBuilder` / `ArrayBuilder` | Fluent emit; **in-place** nesting (single buffer) |
+| `JsonWriter` | Imperative encoder (`key` / `value` / `begin_*` / auto-close `finish`) |
+| `object_from_iter` / `array_from_iter` / `build_object` / `build_array` | Helpers |
+
+### Batch mutate & validate (0.5)
+
+| API | Role |
+| :--- | :--- |
+| `MutateOp` / `BatchPlan` / `apply_ops` | Ordered multi-op plans (set/upsert/delete/rename/merge) |
+| `rename_key` / `merge_object_shallow` | Key rename; shallow object merge |
+| `require_paths` / `require_paths_non_null` | Required fields present |
+| `deny_unknown_keys` / `validate_open` / `validate_closed` | Open vs closed (no DOM) |
+| `type_at` / `require_type` / `JsonType` | Span type sniff |
 
 ### Find (zero-copy path scan)
 
@@ -644,10 +705,13 @@ Public surface as of **0.4** (`#![forbid(unsafe_code)]`). Providing here as a co
 | `mutate_value_checked` | Same + validates the replacement span |
 | `upsert_object_key` | Insert or update a key under an object path |
 | `upsert_at_path` | Upsert leaf; create missing **object** parents as `{}` |
-| `delete_key` | Remove key/value; fix commas / whitespace |
+| `delete_key` | Remove key/value; fix commas / whitespace. Early keys **memmove the buffer tail** — prefer trailing keys / sparse open-view edits on large docs |
 | `append_to_array` | Append element with comma injection |
-| `delete_index` | Remove array element; fix commas |
+| `prepend_to_array` | Insert at index `0` |
+| `insert_array_element` | Insert at `index` (`0` = prepend, `len` = append) |
+| `delete_index` | Remove array element; fix commas. Mid/front deletes shift the **array tail** |
 | `array_len` | Count array elements without allocating a `Vec` of them |
+| `rename_key` / `merge_object_shallow` | See batch/validate section |
 
 ### Project (emit smaller JSON)
 
@@ -669,9 +733,9 @@ Public surface as of **0.4** (`#![forbid(unsafe_code)]`). Providing here as a co
 | API | Role |
 | :--- | :--- |
 | `project_object_fields` / `plan_object_fields` | Array path + field list → card array (any schema) |
-| `project_each` / `project_each_indexed` | Callback per list-projection element |
+| `project_each` / `project_each_indexed` | Callback per list-projection element: `[*]`, **filter** `[?…]`, and **slice**; one-card peak RAM |
 | `project_object_fields_each` / `_indexed` | Thin-field each-callback |
-| `project_jsonl_write` / `project_jsonl_write_indexed` | NDJSON lines to `Write` |
+| `project_jsonl_write` / `project_jsonl_write_indexed` | NDJSON lines to `Write` (inherits filter/slice peel from `project_each`) |
 | `project_object_fields_jsonl_write` | Thin-field NDJSON |
 
 ### Index-wired project & parallel
@@ -701,24 +765,27 @@ Public surface as of **0.4** (`#![forbid(unsafe_code)]`). Providing here as a co
 | API | Role |
 | :--- | :--- |
 | `json_lines` / `JsonLines` | Zero-copy iterator over non-empty lines |
+| `jsonl_docs` / `jsonl_docs_owned` | `TypedDocRef` / `TypedDoc` per line |
 | `read_jsonl` | Map each line through `JsonView` |
 | `read_jsonl_indexed` / `read_line_indexed` | Per-line index + view |
+| `write_jsonl_line` / `write_jsonl_views` / `write_jsonl_docs` | NDJSON out without `Value` |
+| `for_each_jsonl_line` / `for_each_jsonl_doc` | Stream callbacks |
 
 ### Views, documents, derive
 
 | API | Role |
 | :--- | :--- |
 | `JsonView` | Trait: `read_from` / `read_from_indexed` / `write_into` / project helpers |
-| `read_view` / `write_view` | Free helpers |
-| `SharedDocument` | `Arc<[u8]>` shared buffer |
-| `#[derive(JsonView)]` / `JsonMutatorSchema` | Feature **`derive`** (default): `FIELD_PATHS`, mutators, `project_json`, optional `jmes` |
-| `Error` | Path / syntax / JMES / type errors (`non_exhaustive`) |
+| `read_view` / `write_view` / `from_jshift_bytes` / `project_as_view` | Free helpers |
+| `SharedDocument` | `Arc<[u8]>` shared buffer; `typed_ref` / `to_typed_doc` |
+| `#[derive(JsonView)]` / `JsonMutatorSchema` | Feature **`derive`** (default): `FIELD_PATHS`, mutators (`set_*`, array insert/delete), `project_json`, `#[json(jmes)]`, **`#[json(default)]`** (0.5) |
+| `Error` | Path / syntax / JMES / type / `Decode` / `MissingField` / `UnknownField` (`non_exhaustive`) |
 
 ### Convert / escape
 
 | API | Role |
 | :--- | :--- |
-| `FromJsonSlice` / `ToJsonBytes` | Numbers, bool, `String`, `Vec`, `Option`, … |
+| `FromJsonSlice` / `ToJsonBytes` | Numbers, bool, `String`, `Vec`, `Option`, …; `write_json_bytes` (stack itoa for integers) |
 | `from_json_string` / `escape_json_string` / `escape_json_key` | String helpers |
 | `write_json_string` / `write_json_string_content` | Append escaped strings into a buffer |
 

@@ -11,8 +11,8 @@
 //!
 //! | Do | Don't |
 //! | --- | --- |
-//! | Path index + mutate | Full JSON DOM |
-//! | Schema-guided projection ([`JsonView`]) | Replace serde for fully typed apps |
+//! | Path index + mutate | Full JSON DOM as the eval spine |
+//! | Schema-guided projection ([`JsonView`]) / [`TypedDoc`] | Multi-format serde (bincode, …) |
 //! | Safe structural side-tables | Promise simdjson Stage-1 crowns |
 //! | Preserve unmentioned fields | Full RFC validator (unless you add one) |
 //!
@@ -35,11 +35,11 @@
 //! [`project_each`] / [`project_jsonl_write`] (no giant output array).
 //!
 //! ```toml
-//! jshift = { version = "0.4", features = ["derive"] }
+//! jshift = { version = "0.5", features = ["derive"] }
 //! # core only (no proc-macros):
-//! jshift = { version = "0.4", default-features = false }
+//! jshift = { version = "0.5", default-features = false }
 //! # bulk array project with rayon:
-//! jshift = { version = "0.4", features = ["parallel"] }
+//! jshift = { version = "0.5", features = ["parallel"] }
 //! ```
 //!
 //! Measurement: Criterion (`benches/`), RSS (`scripts/measure_rss.sh`), dhat/heaptrack
@@ -53,9 +53,17 @@
 //! * **In-place mutations:** Safe byte-shifting (including resize) via slice rotations.
 //! * **[`JsonView`] trait:** one protocol surface for typed projections of bytes.
 //! * **Macro-generated schemas:** `#[derive(JsonView)]` / `JsonMutatorSchema`.
+//! * **Typed documents:** [`JsonDoc`] + [`TypedDoc`] / [`TypedDocRef`], [`ViewList`] /
+//!   [`ValueList`], [`RawJson`], exclusive [`TypedMutator`].
+//! * **Build without Value:** [`ObjectBuilder`] / [`ArrayBuilder`] / [`JsonWriter`]
+//!   (in-place nest); [`TypedDoc::from_view`].
+//! * **Batch mutate:** [`MutateOp`] / [`BatchPlan`] / [`apply_ops`]; [`rename_key`],
+//!   [`merge_object_shallow`].
+//! * **Validate:** [`require_paths`], [`deny_unknown_keys`], [`validate_closed`] /
+//!   [`validate_open`] (no DOM).
 //! * **Shared buffers:** [`SharedDocument`] (`Arc<[u8]>`) for read-heavy fan-out.
-//! * **JSONL helpers:** [`json_lines`], message-at-a-time indexing; array→NDJSON cards via
-//!   [`project_jsonl_write`] / [`project_object_fields_jsonl_write`].
+//! * **JSONL helpers:** [`json_lines`], [`jsonl_docs`], [`read_jsonl`],
+//!   [`write_jsonl_views`]; array→NDJSON cards via [`project_jsonl_write`].
 //! * **Field projection:** [`project`] / [`project_paths`] / [`project_jmespath`] /
 //!   [`ProjectPlan`] (keep-list + JMESPath subset → new JSON); streaming
 //!   [`project_each`] for per-row cards without a giant output array.
@@ -77,6 +85,21 @@
 //! // Mutate in-place
 //! mutate_value(&mut json, &path, b"10.0").unwrap();
 //! assert_eq!(json, b"{\"user\": \"farmer\", \"score\": 10.0}".to_vec());
+//! ```
+//!
+//! # TypedDoc: typed fields without `Value`
+//! ```
+//! use jshift::{JsonDoc, TypedDoc};
+//!
+//! let mut doc = TypedDoc::from_slice(br#"{"status":"ok","id":7,"items":[{"n":1}],"extra":true}"#);
+//! assert_eq!(doc.get::<u64>("id").unwrap(), 7);
+//! assert_eq!(doc.get_str("status").unwrap(), "ok");
+//! // sparse array field stream (relative path parsed once)
+//! assert_eq!(doc.collect_each_get::<u64>("items", "n").unwrap(), vec![1]);
+//!
+//! doc.mutate().set("status", "accepted").unwrap();
+//! assert_eq!(doc.get_str("status").unwrap(), "accepted");
+//! assert!(doc.contains("extra").unwrap());
 //! ```
 //!
 //! # JsonView: typed projections (open partial structs)
@@ -170,6 +193,8 @@
 //! # }
 //! ```
 
+mod batch;
+mod build;
 mod convert;
 mod document;
 mod error;
@@ -178,23 +203,49 @@ mod jsonl;
 mod mutate;
 mod path;
 mod project;
+mod raw;
 mod scan;
+mod typed_doc;
+mod validate;
 mod view;
+mod view_list;
 
+pub use batch::{apply_ops, set_at, upsert_at, BatchPlan, MutateOp};
+pub use build::{
+    array_from_iter, build_array, build_object, object_from_iter, ArrayBuilder, JsonWriter,
+    ObjectBuilder,
+};
 pub use convert::{
     escape_json_key, escape_json_string, from_json_string, write_json_string,
     write_json_string_content, FromJsonSlice, ToJsonBytes,
 };
 pub use document::SharedDocument;
 pub use error::Error;
+pub use raw::RawJson;
+pub use typed_doc::{
+    ArrayElems, JsonDoc, ObjectEntries, ObjectEntry, Presence, RootKind, TypedDoc, TypedDocRef,
+    TypedMutator,
+};
+pub use validate::{
+    deny_unknown_keys, deny_unknown_keys_at, require_paths, require_paths_non_null, require_type,
+    type_at, validate_closed, validate_open, JsonType,
+};
+pub use view_list::{
+    IndexedValueList, IndexedViewList, ValueList, ValueListIter, ViewList, ViewListIter,
+};
 pub use index::{
     build_array_index, build_object_key_index, build_structural_index, static_array_prefixes_from_path,
     ArrayIndex, IndexedDocument, ObjectKeyIndex, StructuralIndex,
 };
-pub use jsonl::{json_lines, read_jsonl, read_jsonl_indexed, read_line_indexed, JsonLines};
+pub use jsonl::{
+    for_each_jsonl_doc, for_each_jsonl_line, json_lines, jsonl_docs, jsonl_docs_owned, read_jsonl,
+    read_jsonl_indexed, read_line_indexed, write_jsonl_docs, write_jsonl_line, write_jsonl_views,
+    JsonLines,
+};
 pub use mutate::{
-    append_to_array, array_len, delete_index, delete_key, insert_array_element, mutate_value,
-    mutate_value_checked, prepend_to_array, upsert_at_path, upsert_object_key,
+    append_to_array, array_len, delete_index, delete_key, insert_array_element, merge_object_shallow,
+    mutate_value, mutate_value_checked, prepend_to_array, rename_key, upsert_at_path,
+    upsert_object_key,
 };
 pub use path::{parse_path, try_parse_path, OwnedPathSegment, Path, PathSegment};
 pub use project::{
@@ -211,7 +262,7 @@ pub use project::{
 #[cfg(feature = "parallel")]
 pub use project::{project_indexed_parallel, project_object_fields_parallel, project_parallel};
 pub use scan::find_value;
-pub use view::{read_view, write_view, JsonView};
+pub use view::{from_jshift_bytes, project_as_view, read_view, write_view, JsonView};
 
 #[cfg(feature = "derive")]
 pub use jshift_derive::JsonMutatorSchema;
@@ -922,6 +973,36 @@ mod tests {
         let mut m = Row::mutator(&mut json);
         m.set_a(&None::<u32>).unwrap();
         assert_eq!(find_value(&json, &parse_path("a")).unwrap(), b"null");
+    }
+
+    #[test]
+    fn test_json_default_attr_derive() {
+        #[derive(JsonMutatorSchema)]
+        struct WithDefault {
+            #[json(path = "id")]
+            id: u64,
+            #[json(path = "score", default)]
+            score: u64,
+        }
+
+        let row = WithDefault::read_from_json(br#"{"id":7}"#).unwrap();
+        assert_eq!(row.id, 7);
+        assert_eq!(row.score, 0); // Default::default()
+
+        let row = WithDefault::read_from_json(br#"{"id":1,"score":42}"#).unwrap();
+        assert_eq!(row.score, 42);
+    }
+
+    #[test]
+    fn test_rename_merge_validate() {
+        let mut json = br#"{"old":1,"keep":true}"#.to_vec();
+        rename_key(&mut json, &[], "old", "new").unwrap();
+        merge_object_shallow(&mut json, &[], br#"{"extra":9}"#).unwrap();
+        assert_eq!(find_value(&json, &parse_path("new")).unwrap(), b"1");
+        assert_eq!(find_value(&json, &parse_path("extra")).unwrap(), b"9");
+        require_paths(&json, &["new", "keep", "extra"]).unwrap();
+        validate_closed(&json, &["new", "keep", "extra"]).unwrap();
+        assert!(validate_closed(&json, &["new", "keep"]).is_err());
     }
 
     #[test]

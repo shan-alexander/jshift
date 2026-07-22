@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::error::Error;
 use crate::index::IndexedDocument;
+use crate::typed_doc::{JsonDoc, TypedDoc, TypedDocRef};
 use crate::view::JsonView;
 
 /// Cheaply cloneable, read-only JSON buffer.
@@ -110,6 +111,25 @@ impl SharedDocument {
         object_paths: &[&str],
     ) -> Result<IndexedDocument<'_>, Error> {
         IndexedDocument::build_full(self.as_bytes(), array_paths, object_paths)
+    }
+
+    /// Borrowed typed view ([`TypedDocRef`]) over the shared buffer.
+    #[inline]
+    pub fn typed_ref(&self) -> TypedDocRef<'_> {
+        TypedDocRef::from_slice(self.as_bytes())
+    }
+
+    /// Copy into an owned [`TypedDoc`] for mutation.
+    #[inline]
+    pub fn to_typed_doc(&self) -> TypedDoc {
+        TypedDoc::from_slice(self.as_bytes())
+    }
+}
+
+impl JsonDoc for SharedDocument {
+    #[inline]
+    fn as_json_bytes(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
